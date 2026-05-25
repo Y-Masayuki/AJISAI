@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ajisai"
+version = "0.1.0"
+description = "Automated Justification-based Imaging and Self-calibration for ALMA continuum data"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Masayuki Yamaguchi", email = "masayuki.yamaguchi.astro@gmail.com"},
+]
+keywords = [
+    "astronomy",
+    "radio-astronomy",
+    "ALMA",
+    "interferometry",
+    "self-calibration",
+    "CASA",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+# NOTE on dependencies:
+#   AJISAI requires CASA (casatools + casatasks) at runtime. These are large
+#   binary packages distributed by NRAO/AOC and have specific Python version
+#   constraints. They are NOT listed here as hard requirements so that the
+#   package can be installed inside a CASA monolithic distribution without
+#   a duplicate install. Users should ensure CASA is available; the package
+#   will raise a clear RuntimeError at import-time if it is not.
+#
+#   Other dependencies (numpy, pandas, matplotlib, astropy) are typically
+#   already present in any CASA-compatible Python environment but are listed
+#   here for the modular-CASA / pure-Python install path.
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+    "matplotlib>=3.5",
+    "astropy>=5.0",
+]
+
+[project.optional-dependencies]
+casa = [
+    # Modular CASA (alternative to monolithic CASA distribution).
+    # Install via 'pip install ajisai[casa]' to get a self-contained env.
+    "casatools>=6.5",
+    "casatasks>=6.5",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+]
+docs = [
+    "sphinx>=5.0",
+    "sphinx-rtd-theme>=1.0",
+    "myst-parser>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/masayuki-yamaguchi/AJISAI"
+Repository = "https://github.com/masayuki-yamaguchi/AJISAI"
+Issues = "https://github.com/masayuki-yamaguchi/AJISAI/issues"
+
+# Tools script — sigma_clip_rms_test.py is provided as a standalone diagnostic.
+# It is not a console_script entry point because it operates on FITS files
+# directly with argparse, and users typically run it as
+#   python tools/sigma_clip_rms_test.py path/to/image.fits
+
+[tool.setuptools]
+packages = ["ajisai"]
+
+[tool.setuptools.package-data]
+ajisai = ["py.typed"]

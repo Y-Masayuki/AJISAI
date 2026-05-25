@@ -1,0 +1,73 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Sphinx documentation
+docs/_build/
+docs/_autosummary/
+
+# AJISAI outputs (user data; should not be committed)
+ajisai_*/
+*.ms/
+*.image/
+*.mask/
+*.pcal/
+*.last
+*.log
+
+# Demo / tutorial downloads (large; users regenerate)
+twhya_demo_data/
+*_demo_data/
+*.tar
+*.fits
+casa-*.log
+ipython-*.log
+
+# Legacy/reference materials (kept locally for development, not for release)
+legacy/
+analysis_scripts/
+imdata.py

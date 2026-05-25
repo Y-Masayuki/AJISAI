@@ -1,0 +1,26 @@
+# Configuration for hosting the AJISAI documentation on Read the Docs.
+# https://docs.readthedocs.io/en/stable/config-file/v2.html
+
+version: 2
+
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.11"
+
+sphinx:
+  configuration: docs/conf.py
+  builder: html
+  # Treat Sphinx warnings as errors so broken cross-references are caught early.
+  fail_on_warning: false
+
+python:
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs
+
+# Build PDF + EPUB in addition to HTML when the build succeeds.
+formats:
+  - htmlzip
