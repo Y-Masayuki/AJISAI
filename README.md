@@ -6,6 +6,7 @@ AJISAI is a fully automated, reproducible, and explainable self-calibration
 pipeline for ALMA continuum data, built on top of CASA.
 
 [![CI](https://github.com/Y-Masayuki/AJISAI/actions/workflows/ci.yml/badge.svg)](https://github.com/Y-Masayuki/AJISAI/actions/workflows/ci.yml)
+[![Documentation Status](https://app.readthedocs.org/projects/ajisai/badge/?version=latest)](https://ajisai.readthedocs.io/en/latest/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
@@ -38,10 +39,13 @@ pip install "ajisai[casa]"
 For development:
 
 ```bash
-git clone https://github.com/masayuki-yamaguchi/AJISAI.git
+git clone https://github.com/Y-Masayuki/AJISAI.git
 cd AJISAI
 pip install -e ".[dev]"
 ```
+
+Full documentation is hosted on Read the Docs:
+**https://ajisai.readthedocs.io**
 
 ## Quick start
 
@@ -132,9 +136,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Citation
 
-If AJISAI helps your work, please cite [`Yamaguchi et al. 2026`](https://arxiv.org/abs/2605.11486)  and the
-software itself via the Zenodo DOI (to be assigned at first GitHub release).
+If AJISAI helps your work, please cite [`Yamaguchi et al. 2026`](https://arxiv.org/abs/2605.11486)  and the software itself via the Zenodo DOI (to be assigned at first GitHub release).
 
 ## Author
 
 Masayuki Yamaguchi (Kyushu Univ. / NAOJ)
+
