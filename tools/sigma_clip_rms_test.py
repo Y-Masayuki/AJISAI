@@ -73,7 +73,8 @@ def load_image(fitsfile):
     while data.ndim > 2:
         data = data[0]
     cdelt_x = abs(hdr["CDELT1"]) * 3600.0  # arcsec/pix
-    cdelt_y = abs(hdr["CDELT2"]) * 3600.0
+    # CDELT2 is read for symmetry but not used downstream (image is assumed
+    # to be square in pixel scale).
     bmaj = hdr.get("BMAJ", None)
     bmin = hdr.get("BMIN", None)
     bmaj_as = bmaj * 3600.0 if bmaj is not None else None
@@ -284,7 +285,7 @@ def main():
     data = img["data"]
 
     print("\n" + "=" * 70)
-    print(f"  AJISAI sigma-clip RMS test")
+    print("  AJISAI sigma-clip RMS test")
     print("=" * 70)
     print(f"  File         : {args.fitsfile}")
     print(f"  Shape        : {img['shape']}")
@@ -330,7 +331,7 @@ def main():
     # Print comparison table
     print()
     print("=" * 70)
-    print(f"  RMS estimates (lower = more conservative; larger = more contamination)")
+    print("  RMS estimates (lower = more conservative; larger = more contamination)")
     print("=" * 70)
     ref = results["sigma_clip"]
     rows = [
@@ -356,7 +357,7 @@ def main():
     n_kept = masks["sigma_clip_kept"].sum()
     print()
     print("=" * 70)
-    print(f"  Diagnostics")
+    print("  Diagnostics")
     print("=" * 70)
     print(f"  Finite pixels        : {n_finite:,} / {data.size:,} "
           f"({100*n_finite/data.size:.1f}%)")
@@ -371,25 +372,25 @@ def main():
     # Interpretation
     print()
     print("=" * 70)
-    print(f"  Interpretation")
+    print("  Interpretation")
     print("=" * 70)
     if results["annulus"] is not None:
         delta = abs(results["sigma_clip"] - results["annulus"]) / results["annulus"] * 100
         print(f"  sigma-clip (2) vs AJISAI annulus (4): differ by {delta:.1f}%")
         if delta < 10:
-            print(f"  -> sigma-clip adoption is SAFE (within 10%)")
+            print("  -> sigma-clip adoption is SAFE (within 10%)")
         elif delta < 25:
-            print(f"  -> sigma-clip adoption is acceptable (within 25%); "
-                  f"worth considering")
+            print("  -> sigma-clip adoption is acceptable (within 25%); "
+                  "worth considering")
         else:
-            print(f"  -> sigma-clip and annulus differ significantly. "
-                  f"Inspect image character.")
+            print("  -> sigma-clip and annulus differ significantly. "
+                  "Inspect image character.")
             if results["sigma_clip"] < results["annulus"]:
-                print(f"     sigma-clip smaller: extended emission may bias "
-                      f"sigma-clip downward")
+                print("     sigma-clip smaller: extended emission may bias "
+                      "sigma-clip downward")
             else:
-                print(f"     sigma-clip larger: source flux leaking into the "
-                      f"annulus may bias annulus downward")
+                print("     sigma-clip larger: source flux leaking into the "
+                      "annulus may bias annulus downward")
 
     # Save plot
     out_png = os.path.splitext(args.fitsfile)[0] + "_rms_methods.png"

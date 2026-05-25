@@ -16,7 +16,6 @@ Fixtures here are CASA-free helpers used by the unit tests.
 """
 from __future__ import annotations
 
-import os
 
 import numpy as np
 import pytest

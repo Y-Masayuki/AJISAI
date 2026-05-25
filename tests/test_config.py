@@ -7,7 +7,6 @@ AJISAI objects and call ``_validate_inputs``, never ``run()``.
 """
 from __future__ import annotations
 
-import os
 import warnings
 from dataclasses import FrozenInstanceError
 
@@ -19,7 +18,6 @@ from ajisai import (
     GainCalConfig,
     ImagingConfig,
     SelfcalSchedule,
-    SelfcalStep,
 )
 
 

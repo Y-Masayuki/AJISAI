@@ -39,6 +39,8 @@ For measurement sets containing multiple target fields::
 License: MIT
 Author:  Masayuki Yamaguchi (Kyushu Univ./NAOJ) and the AJISAI development team
 """
+# Re-exports from the implementation modules. Names live here in __init__.py
+# so that ``from ajisai import X`` works regardless of the underlying file.
 from .core import (
     # Main class and config
     AJISAI,
@@ -47,8 +49,20 @@ from .core import (
     GainCalConfig,
     SelfcalStep,
     SelfcalSchedule,
-    # MS helpers (re-exported for advanced use)
+    # MS helpers that the orchestrator uses internally
     list_target_fields,
+    # Image / RMS helpers
+    load_fits_image,
+    compute_rms,
+    compute_image_stats,
+    # Refant selection
+    select_refant,
+    plot_refant_selection,
+    # Coordinate frame utility
+    relabel_J2000_to_ICRS,
+)
+# Helpers re-exported directly from ms_utils for advanced use.
+from .ms_utils import (
     get_array_info,
     get_on_source_time,
     get_median_frequency,
@@ -59,15 +73,6 @@ from .core import (
     pick_cell_imsize,
     rad_to_radec_from_imfit,
     icrs_to_j2000,
-    # Image / RMS helpers
-    load_fits_image,
-    compute_rms,
-    compute_image_stats,
-    # Refant selection
-    select_refant,
-    plot_refant_selection,
-    # Coordinate frame utility
-    relabel_J2000_to_ICRS,
 )
 
 __version__ = "0.1.0"

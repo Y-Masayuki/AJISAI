@@ -134,3 +134,31 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "if TYPE_CHECKING:",
 ]
+
+
+# ---------------------------------------------------------------------------
+# ruff (linter)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+# Match Python compatibility floor declared in [project]
+target-version = "py38"
+line-length = 100
+extend-exclude = [
+    "legacy",
+    "analysis_scripts",
+    "docs/_build",
+]
+
+[tool.ruff.lint]
+# Start with pyflakes (F) for v0.1; expand to pycodestyle (E) and isort (I)
+# in a future cleanup pass.
+select = ["F"]
+# Allow common conveniences:
+#   F401 in __init__.py: re-exports are intentional unused-imports
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports in the public API surface are not "unused" imports.
+"ajisai/__init__.py" = ["F401"]
+# Tests sometimes assign to a variable for clarity even if not asserted on.
+"tests/*" = ["F841"]

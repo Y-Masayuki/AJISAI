@@ -44,9 +44,8 @@ import math
 import os
 import re
 import shutil
-import sys
 import warnings
-from dataclasses import asdict, dataclass, field as _dc_field, replace
+from dataclasses import asdict, dataclass, field as _dc_field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,15 +70,12 @@ except ImportError:  # pragma: no cover
 
 # AJISAI MS query helpers (native casatools-based replacement for analysisUtils).
 from .ms_utils import (
-    get_array_info,
     get_on_source_time,
     get_median_frequency,
     get_baseline_at_percentile,
-    get_baseline_lengths,
     get_antenna_positions,
     get_antenna_flag_stats,
     pick_cell_imsize,
-    rad_to_radec_from_imfit,
     icrs_to_j2000,
 )
 _HAS_MS_UTILS = True
@@ -539,7 +535,7 @@ def relabel_J2000_to_ICRS(msfile: str, verbose: bool = False) -> None:
                 keys["MEASINFO"]["Ref"] = "ICRS"
                 tb.putcolkeywords("DIRECTION", keys)
                 if verbose:
-                    print(f"[AJISAI] SOURCE.DIRECTION: J2000→ICRS")
+                    print("[AJISAI] SOURCE.DIRECTION: J2000→ICRS")
         except Exception:
             pass
     finally:
@@ -789,7 +785,7 @@ def plot_refant_selection(
         s=120, edgecolors="black", linewidth=0.5,
         vmin=0.0, vmax=max(0.5, float(flags.max())),
     )
-    cbar = plt.colorbar(sc, ax=ax, label="flagged fraction", shrink=0.7)
+    plt.colorbar(sc, ax=ax, label="flagged fraction", shrink=0.7)
 
     # Mark excluded antennas (above threshold)
     excluded = flags >= threshold
@@ -1346,7 +1342,7 @@ Infrastructure
                 "reason": "phase_shift=False (default; no correction applied)",
             }
             if cfg.verbose:
-                print(f"[AJISAI] phase shift           : skipped (phase_shift=False)")
+                print("[AJISAI] phase shift           : skipped (phase_shift=False)")
             return
 
         # === Resolve the target coordinates ===
@@ -1878,7 +1874,7 @@ Infrastructure
         needs_rerun = model_amp is None or np.isclose(model_amp, 1.0) or np.isclose(model_amp, 0.0)
         if needs_rerun:
             if cfg.verbose:
-                print(f"[AJISAI]   model column not populated; rerunning tclean(niter=0)")
+                print("[AJISAI]   model column not populated; rerunning tclean(niter=0)")
             casatasks.tclean(
                 vis=vis,
                 imagename=str(imagebase),

@@ -35,8 +35,7 @@ License: MIT
 from __future__ import annotations
 
 import math
-import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -308,7 +307,6 @@ def get_array_info(vis: str) -> Dict[str, Any]:
     tb.open(vis + "/SPECTRAL_WINDOW")
     try:
         bw = tb.getcol("TOTAL_BANDWIDTH")
-        chan_freq = tb.getcell("CHAN_FREQ", 0)  # for inspection only
         info["spw_bandwidths_hz"] = [float(x) for x in bw]
         info["spw_total_bandwidth_hz"] = float(np.sum(bw))
         # Mean freq per spw
@@ -772,7 +770,7 @@ def test_pick_cell_imsize(vis: str, verbose: bool = True) -> Dict[str, Any]:
         print(f"  baseline (90%ile): {result['baseline_m']:.2f} m")
         print(f"  median freq      : {result['freq_hz']/1e9:.3f} GHz")
         print()
-        print(f"  Expected (AU)    : cellsize=0.0081, imsize=[4800,4800]")
+        print("  Expected (AU)    : cellsize=0.0081, imsize=[4800,4800]")
         # Pass/fail
         cell_ok = abs(result['cell_arcsec'] - 0.0081) < 1e-4
         imsize_ok = result['imsize_xy'] == [4800, 4800]
@@ -840,10 +838,10 @@ def _self_check_math() -> bool:
     # 7. uvtaper parser
     # 7a. Empty input -> 0
     if _parse_uvtaper_to_image_fwhm([], wavelength_m) != 0.0:
-        print(f"  FAIL: _parse_uvtaper_to_image_fwhm([]) != 0.0")
+        print("  FAIL: _parse_uvtaper_to_image_fwhm([]) != 0.0")
         ok = False
     if _parse_uvtaper_to_image_fwhm(None, wavelength_m) != 0.0:
-        print(f"  FAIL: _parse_uvtaper_to_image_fwhm(None) != 0.0")
+        print("  FAIL: _parse_uvtaper_to_image_fwhm(None) != 0.0")
         ok = False
     # 7b. Direct image-domain FWHM
     v = _parse_uvtaper_to_image_fwhm(["1arcsec"], wavelength_m)

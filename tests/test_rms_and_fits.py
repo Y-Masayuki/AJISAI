@@ -96,7 +96,6 @@ def test_rms_mad_on_noise_only(synthetic_fits_no_source):
 # ---------------------------------------------------------------------------
 def test_rms_naive_overestimates_with_source(synthetic_fits):
     """The naive whole-image method is heavily biased upward by the source."""
-    info = compute_rms(synthetic_fits, method="annulus", target_radius_arcsec=10)
     naive_std = np.nanstd(load_fits_image(synthetic_fits)["data2d"])
     # The naive std should be MUCH larger than the true noise on a source image
     assert naive_std > 5 * TRUE_NOISE_JY
