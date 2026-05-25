@@ -6,6 +6,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- pytest test suite under `tests/` with 78 unit tests covering:
+  - `ms_utils` pure-math helpers (`_smallest_5_smooth_at_least`,
+    `_round_to_sig_figs`, `_baars_taper_factor`,
+    `_parse_uvtaper_to_image_fwhm`, etc.)
+  - `pick_cell_imsize` math reproducing the V883 Ori golden output
+  - `AJISAIConfig` validation (defaults, immutability, phase_center
+    3-tuple semantics, mask_mode validation, rms_method warnings)
+  - FITS loader (`load_fits_image`) on a synthetic CASA-style image
+  - RMS estimators (`compute_rms`) on noise-only and source+noise
+    synthetic FITS images
+- `tests/conftest.py` with reusable synthetic FITS fixtures and a
+  `@pytest.mark.casa` marker that auto-skips when CASA is unavailable.
+- GitHub Actions CI workflow (`.github/workflows/ci.yml`):
+  - pytest matrix across Python 3.10, 3.11, 3.12
+  - Sphinx HTML build sanity check
+  - ruff lint job (advisory only in v0.1)
+- pyproject.toml `[tool.pytest.ini_options]` and `[tool.coverage]`
+  configuration.
+- CI status badge in README.
+
 ## [0.1.0] - 2026-05-25
 
 Initial public release.
