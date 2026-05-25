@@ -1,7 +1,8 @@
 # Installation
 
-AJISAI requires CASA at runtime. There are two supported installation paths
-depending on whether you already have a CASA distribution.
+AJISAI requires CASA at runtime. The current install method is **from the
+GitHub source**; a PyPI release is planned for a future version (see the
+section at the bottom of this page).
 
 ## Requirements
 
@@ -22,19 +23,26 @@ removed in **CASA 6.7+**, so `mask_mode="interactive"` only works on
 details.
 :::
 
-## Option A: Install into an existing CASA Python environment
+## Install from GitHub (current method)
 
-If you already have CASA (monolithic or modular), install AJISAI directly:
+Install the latest released tag directly with `pip`, which fetches the
+package from the GitHub repository:
 
 ```bash
-pip install ajisai
+pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.1.0"
+```
+
+Or to track the `main` branch (latest development snapshot):
+
+```bash
+pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main"
 ```
 
 If you are using a monolithic CASA distribution, you may need to point at
 its internal `pip`:
 
 ```bash
-/path/to/casa/lib/py/bin/pip install ajisai
+/path/to/casa/lib/py/bin/pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.1.0"
 ```
 
 After installation, verify that AJISAI imports cleanly from inside CASA:
@@ -45,23 +53,9 @@ import ajisai
 print(ajisai.__version__)
 ```
 
-## Option B: Self-contained install with modular CASA
+## Development install (editable, with tests and docs)
 
-If you do not have CASA, you can install both AJISAI and modular CASA in
-one go:
-
-```bash
-pip install "ajisai[casa]"
-```
-
-This pulls in `casatools` and `casatasks`. Note that modular CASA has
-specific Python version constraints; see the
-[CASA documentation](https://casadocs.readthedocs.io/) for the current
-compatibility matrix.
-
-## Option C: Development install from source
-
-For contributors or users who want to track the latest changes:
+For contributors or users who want to modify AJISAI:
 
 ```bash
 git clone https://github.com/Y-Masayuki/AJISAI.git
@@ -97,6 +91,13 @@ python examples/run_twhya_demo.py
 ```
 
 See the [TW Hya tutorial](tutorials/twhya.md) for a full walkthrough.
+
+## Coming soon: PyPI release
+
+`pip install ajisai` and `pip install "ajisai[casa]"` are **not yet supported**
+because AJISAI has not been uploaded to PyPI. A PyPI release is planned for
+a future version once the end-to-end behaviour has been validated against
+real ALMA data. Until then, please use the GitHub install method above.
 
 ## Troubleshooting
 

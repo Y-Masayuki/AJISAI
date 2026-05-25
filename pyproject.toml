@@ -57,7 +57,9 @@ dependencies = [
 [project.optional-dependencies]
 casa = [
     # Modular CASA (alternative to monolithic CASA distribution).
-    # Install via 'pip install ajisai[casa]' to get a self-contained env.
+    # Once AJISAI is published to PyPI, this extra can be installed via
+    # 'pip install ajisai[casa]'. For now, install from GitHub:
+    # 'pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.1.0#egg=ajisai[casa]"'
     "casatools>=6.5",
     "casatasks>=6.5",
 ]
