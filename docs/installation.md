@@ -64,7 +64,7 @@ compatibility matrix.
 For contributors or users who want to track the latest changes:
 
 ```bash
-git clone https://github.com/masayuki-yamaguchi/AJISAI.git
+git clone https://github.com/Y-Masayuki/AJISAI.git
 cd AJISAI
 pip install -e ".[dev]"
 ```

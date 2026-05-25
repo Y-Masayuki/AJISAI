@@ -73,9 +73,9 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/masayuki-yamaguchi/AJISAI"
-Repository = "https://github.com/masayuki-yamaguchi/AJISAI"
-Issues = "https://github.com/masayuki-yamaguchi/AJISAI/issues"
+Homepage = "https://github.com/Y-Masayuki/AJISAI"
+Repository = "https://github.com/Y-Masayuki/AJISAI"
+Issues = "https://github.com/Y-Masayuki/AJISAI/issues"
 
 # Tools script — sigma_clip_rms_test.py is provided as a standalone diagnostic.
 # It is not a console_script entry point because it operates on FITS files

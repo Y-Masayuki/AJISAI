@@ -139,7 +139,7 @@ html_theme_options = {
 # Show "Edit on GitHub" link
 html_context = {
     "display_github": True,
-    "github_user": "masayuki-yamaguchi",
+    "github_user": "Y-Masayuki",
     "github_repo": "AJISAI",
     "github_version": "main",
     "conf_py_path": "/docs/",

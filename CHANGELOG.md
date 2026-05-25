@@ -91,5 +91,5 @@ Initial public release.
 - `imdata` runtime dependency. FITS image loading is implemented
   directly on top of astropy.
 
-[Unreleased]: https://github.com/masayuki-yamaguchi/AJISAI/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/masayuki-yamaguchi/AJISAI/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Y-Masayuki/AJISAI/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Y-Masayuki/AJISAI/releases/tag/v0.1.0
