@@ -28,16 +28,7 @@ pipeline for ALMA continuum data, built on top of CASA.
 AJISAI requires CASA at runtime (either a monolithic CASA distribution or
 modular CASA installed via pip).
 
-```bash
-# Inside a CASA-compatible Python environment:
-pip install ajisai
-
-# Or, for users who do not have a system CASA, install modular CASA together:
-pip install "ajisai[casa]"
-```
-
 For development:
-
 ```bash
 git clone https://github.com/Y-Masayuki/AJISAI.git
 cd AJISAI
