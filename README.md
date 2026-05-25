@@ -132,7 +132,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Citation
 
-If AJISAI helps your work, please cite (Yamaguchi et al., in prep.) [`Yamaguchi et al. 2026`](https://arxiv.org/abs/2605.11486)  and the
+If AJISAI helps your work, please cite [`Yamaguchi et al. 2026`](https://arxiv.org/abs/2605.11486)  and the
 software itself via the Zenodo DOI (to be assigned at first GitHub release).
 
 ## Author
