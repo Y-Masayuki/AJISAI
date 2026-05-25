@@ -126,26 +126,13 @@ The `tools/` directory contains standalone diagnostic utilities:
   CASA-exported FITS image to validate the sigma-clipping-based default
   used in AJISAI.
 
-## Relation to auto_selfcal
-
-[`auto_selfcal`](https://github.com/jjtobin/auto_selfcal) (NRAO/SRDP) is an
-adaptive, rollback-based self-calibration pipeline that has been integrated
-into the ALMA Pipeline as `hif_selfcal`. AJISAI takes a different design
-position. AJISAI emphasizes determinism (fixed schedule, no rollback),
-explainability (justification log), and ALMA continuum specialization, where
-auto_selfcal emphasizes adaptive optimization and ALMA + VLA + mosaic +
-spectral-line scope. The two tools are complementary; AJISAI can be used to
-independently verify auto_selfcal results, as a teaching/reference
-implementation, and for studies where the parameter choices need to be
-audited explicitly in publications.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
 ## Citation
 
-If AJISAI helps your work, please cite (Yamaguchi et al., in prep.) and the
+If AJISAI helps your work, please cite (Yamaguchi et al., in prep.) [`Yamaguchi et al. 2026`](https://arxiv.org/abs/2605.11486)  and the
 software itself via the Zenodo DOI (to be assigned at first GitHub release).
 
 ## Author
