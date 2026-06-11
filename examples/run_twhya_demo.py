@@ -45,6 +45,13 @@ import os
 import sys
 import tarfile
 import urllib.request
+import ssl
+try:
+    import certifi
+    _CERTIFI_AVAILABLE = True
+except ImportError:
+    _CERTIFI_AVAILABLE = False
+
 
 # ============================================================================
 # User-tweakable configuration
@@ -99,51 +106,40 @@ def _ensure_ajisai_on_path():
 # Step 1-2: Download and extract the calibrated MS
 # ============================================================================
 def _download_with_progress(url: str, dst: str) -> None:
-    """Download ``url`` to ``dst`` with a simple percentage progress bar."""
+    """Download ``url`` to ``dst`` with a simple percentage progress bar.
 
-    def hook(blocks_done, block_size, total_size):
-        if total_size <= 0:
-            return
-        downloaded = blocks_done * block_size
-        pct = min(100.0, 100.0 * downloaded / total_size)
-        bar = "#" * int(pct / 2) + "-" * (50 - int(pct / 2))
-        mb_done = downloaded / (1024 ** 2)
-        mb_total = total_size / (1024 ** 2)
-        msg = f"\r  [{bar}] {pct:5.1f}%  ({mb_done:7.1f} / {mb_total:.1f} MB)"
-        sys.stdout.write(msg)
-        sys.stdout.flush()
+    Uses certifi's CA bundle when available. Some monolithic CASA
+    distributions ship a Python whose default certificate path points to a
+    non-existent build-time location (e.g. /root/local/cert.pem), which makes
+    SSL verification fail with CERTIFICATE_VERIFY_FAILED. Pointing explicitly
+    at certifi's bundle avoids this.
+    """
+    if _CERTIFI_AVAILABLE:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    else:
+        ctx = ssl.create_default_context()
 
-    urllib.request.urlretrieve(url, dst, reporthook=hook)
+    block_size = 1024 * 256
+    with urllib.request.urlopen(url, timeout=60, context=ctx) as resp:
+        total_size = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        with open(dst, "wb") as out:
+            while True:
+                chunk = resp.read(block_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    pct = min(100.0, 100.0 * downloaded / total_size)
+                    bar = "#" * int(pct / 2) + "-" * (50 - int(pct / 2))
+                    mb_done = downloaded / (1024 ** 2)
+                    mb_total = total_size / (1024 ** 2)
+                    msg = f"\r  [{bar}] {pct:5.1f}%  ({mb_done:7.1f} / {mb_total:.1f} MB)"
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
     print()  # newline after the progress bar
 
-
-def prepare_data() -> str:
-    """Download the tarball if absent, extract the MS, and return its path."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tar_path = os.path.join(DATA_DIR, TAR_NAME)
-    ms_path = os.path.join(DATA_DIR, RAW_MS_NAME)
-
-    if os.path.isdir(ms_path):
-        print(f"[twhya_demo] Found existing {ms_path} - skipping download/extract.")
-        return ms_path
-
-    if not os.path.exists(tar_path):
-        print(f"[twhya_demo] Downloading {TAR_URL}")
-        print(f"[twhya_demo]   into {tar_path}")
-        _download_with_progress(TAR_URL, tar_path)
-    else:
-        print(f"[twhya_demo] Found cached tarball {tar_path}.")
-
-    print(f"[twhya_demo] Extracting {tar_path}")
-    with tarfile.open(tar_path, "r") as tf:
-        tf.extractall(DATA_DIR)
-    if not os.path.isdir(ms_path):
-        raise RuntimeError(
-            f"After extraction, expected MS at {ms_path}, but it was not found. "
-            f"The tarball may have a different internal layout than expected."
-        )
-    print(f"[twhya_demo] MS available at {ms_path}")
-    return ms_path
 
 
 # ============================================================================
