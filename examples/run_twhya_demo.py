@@ -141,6 +141,33 @@ def _download_with_progress(url: str, dst: str) -> None:
     print()  # newline after the progress bar
 
 
+def prepare_data() -> str:
+    """Download the tarball if absent, extract the MS, and return its path."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tar_path = os.path.join(DATA_DIR, TAR_NAME)
+    ms_path = os.path.join(DATA_DIR, RAW_MS_NAME)
+
+    if os.path.isdir(ms_path):
+        print(f"[twhya_demo] Found existing {ms_path} - skipping download/extract.")
+        return ms_path
+
+    if not os.path.exists(tar_path):
+        print(f"[twhya_demo] Downloading {TAR_URL}")
+        print(f"[twhya_demo]   into {tar_path}")
+        _download_with_progress(TAR_URL, tar_path)
+    else:
+        print(f"[twhya_demo] Found cached tarball {tar_path}.")
+
+    print(f"[twhya_demo] Extracting {tar_path}")
+    with tarfile.open(tar_path, "r") as tf:
+        tf.extractall(DATA_DIR)
+    if not os.path.isdir(ms_path):
+        raise RuntimeError(
+            f"After extraction, expected MS at {ms_path}, but it was not found. "
+            f"The tarball may have a different internal layout than expected."
+        )
+    print(f"[twhya_demo] MS available at {ms_path}")
+    return ms_path
 
 # ============================================================================
 # Step 3: Pre-process - split TW Hya and channel-average for continuum
@@ -219,7 +246,20 @@ def run_ajisai(cont_ms: str):
 # ============================================================================
 # Main
 # ============================================================================
-def main():
+
+def _running_inside_casa():
+    """Return True if running inside CASA (monolithic or modular).
+
+    Inside CASA's execfile/exec context, ``__name__`` is ``'<run_path>'``
+    rather than ``'__main__'``, so the standard main guard does not fire.
+    Detecting CASA via its always-imported modules lets the demo run from
+    a CASA prompt with ``execfile(...)`` as documented.
+    """
+    import sys
+    return "casatasks" in sys.modules or "casashell" in sys.modules
+
+
+if __name__ == "__main__" or _running_inside_casa():
     print()
     print("=" * 72)
     print("  AJISAI demonstration: TW Hya Band 7 continuum self-calibration")
@@ -230,8 +270,3 @@ def main():
     raw_ms = prepare_data()
     cont_ms = split_continuum(raw_ms)
     aj = run_ajisai(cont_ms)
-    return aj
-
-
-if __name__ == "__main__":
-    main()
