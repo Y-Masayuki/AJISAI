@@ -62,10 +62,12 @@ from astropy.stats import sigma_clipped_stats
 try:
     import casatools  # type: ignore
     import casatasks  # type: ignore
+    import casaplotms  # type: ignore
     _HAS_CASA = True
 except ImportError:  # pragma: no cover
     casatools = None  # type: ignore
     casatasks = None  # type: ignore
+    casaplotms = None  # type: ignore
     _HAS_CASA = False
 
 # AJISAI MS query helpers (native casatools-based replacement for analysisUtils).
@@ -1828,7 +1830,7 @@ Infrastructure
         diag_dir = self.workdir / "diagnostics"
         diag_dir.mkdir(exist_ok=True)
         phase_png = diag_dir / f"iter{idx}_{step.label}_phasegain.png"
-        casatasks.plotms(
+        casaplotms.plotms(
             vis=caltable,
             xaxis="time",
             yaxis="phase",
@@ -1843,7 +1845,7 @@ Infrastructure
         )
         if step.calmode == "a":
             amp_png = diag_dir / f"iter{idx}_{step.label}_ampgain.png"
-            casatasks.plotms(
+            casaplotms.plotms(
                 vis=caltable,
                 xaxis="time",
                 yaxis="amp",
