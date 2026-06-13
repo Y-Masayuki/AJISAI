@@ -12,15 +12,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the public ALMA TW Hya Band 7 dataset (Project 2011.0.00340.S) with all
   defaults and completed all 4 self-cal iterations with `status="ok"`.
   Reference results:
-  - Dynamic range: ~80 (iter 0) -> ~245 (iter 4), a ~3.1x improvement.
-  - Off-source RMS: ~4100 -> ~1460 uJy/beam, a ~2.8x reduction.
-  - Beam: essentially unchanged at ~482 mas.
-  - Hybrid refant selection chose DA42 after excluding ~7 antennas with
-    flagged fraction >= 25%.
-- `docs/_static/selfcal_summary.png` and `docs/_static/ajisai_refant_selection.png`:
-  reference figures from the TW Hya demo run, embedded in README and the
-  tutorial.
-- TW Hya tutorial updated with real reference numbers and embedded figures.
+  - Dynamic range: 81.06 (iter 0) -> 246.49 (iter 4), a **3.04x improvement**.
+  - Off-source RMS: 4115.18 -> 1443.90 uJy/beam, a **2.85x reduction**.
+  - Peak: 333.59 -> 355.91 mJy/beam (+22.32 mJy, +6.7%).
+  - Beam: 482.8 -> 480.1 mas (essentially unchanged).
+  - Hybrid refant selection chose DA42 after filtering out 7 of 26 antennas
+    with flagged fraction >= 25% (19 antennas passed the filter).
+  - Pipeline-derived parameters: median freq 372.65 GHz, integration time
+    6.048 s, on-source 30.64 min, cellsize 0.066", imsize [375, 375],
+    MRS 4.51".
+- `docs/_static/selfcal_summary.png`, `docs/_static/ajisai_refant_selection.png`:
+  reference figures from the TW Hya demo run, embedded in README and tutorial.
+- `docs/_static/metrics.csv`, `docs/_static/justification.json`: reference
+  outputs from the demo run committed to the repo for byte-by-byte
+  comparison against users' own runs.
+- TW Hya tutorial updated with precise reference numbers, per-iteration
+  metrics table, and embedded figures.
 - README has a new "Example results: TW Hya Band 7 demo" section.
 
 ### Fixed

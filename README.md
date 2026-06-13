@@ -60,22 +60,25 @@ without any anomalies.
   <img src="docs/_static/selfcal_summary.png" alt="TW Hya self-cal summary" width="500"/>
 </p>
 
-| metric           | iter 0 (no self-cal) | iter 4 (best) | change          |
-| ---------------- | -------------------- | ------------- | --------------- |
-| Dynamic range    | ~80                  | ~245          | **~3.1x up**    |
-| Peak [mJy/beam]  | ~334                 | ~356          | +22 mJy         |
-| RMS  [uJy/beam]  | ~4100                | ~1460         | **~2.8x down**  |
-| Beam [mas]       | 482                  | 480           | unchanged       |
+| metric           | iter 0 (no self-cal) | iter 4 (best) | change                    |
+| ---------------- | -------------------- | ------------- | ------------------------- |
+| Dynamic range    | 81.06                | 246.49        | **3.04x up**              |
+| Peak [mJy/beam]  | 333.59               | 355.91        | +22.32 mJy (+6.7%)        |
+| RMS  [uJy/beam]  | 4115.18              | 1443.90       | **2.85x down**            |
+| Beam [mas]       | 482.8                | 480.1         | essentially unchanged     |
 
-AJISAI's hybrid reference-antenna selection chose `DA42`, which sits near
-the array geometric center while excluding the ~7 antennas with flagged
-fraction >= 25%:
+AJISAI's hybrid reference-antenna selection chose `DA42`, the antenna
+closest to the XY geometric center of the array among the 19 antennas
+(out of 26) that passed the flag-fraction threshold (<25%):
 
 <p align="center">
   <img src="docs/_static/ajisai_refant_selection.png" alt="TW Hya refant selection" width="500"/>
 </p>
 
-See the [TW Hya tutorial](https://ajisai.readthedocs.io/en/latest/tutorials/twhya.html)
+Reference output files from this run are committed to the repository for
+exact comparison: [`metrics.csv`](docs/_static/metrics.csv) and
+[`justification.json`](docs/_static/justification.json). See the
+[TW Hya tutorial](https://ajisai.readthedocs.io/en/latest/tutorials/twhya.html)
 for the full walk-through.
 
 ## Quick start
