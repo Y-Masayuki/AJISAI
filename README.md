@@ -48,6 +48,36 @@ pip install -e ".[dev]"
 Full documentation is hosted on Read the Docs:
 **https://ajisai.readthedocs.io**
 
+## Example results: TW Hya Band 7 demo
+
+To verify the pipeline end-to-end, AJISAI was run on the public
+[ALMA TW Hya Band 7 dataset](https://casaguides.nrao.edu/index.php?title=First_Look_at_Imaging_CASA_6)
+(Project 2011.0.00340.S) via `examples/run_twhya_demo.py`. With default
+settings, three phase + one amplitude self-cal iterations completed
+without any anomalies.
+
+<p align="center">
+  <img src="docs/_static/selfcal_summary.png" alt="TW Hya self-cal summary" width="500"/>
+</p>
+
+| metric           | iter 0 (no self-cal) | iter 4 (best) | change          |
+| ---------------- | -------------------- | ------------- | --------------- |
+| Dynamic range    | ~80                  | ~245          | **~3.1x up**    |
+| Peak [mJy/beam]  | ~334                 | ~356          | +22 mJy         |
+| RMS  [uJy/beam]  | ~4100                | ~1460         | **~2.8x down**  |
+| Beam [mas]       | 482                  | 480           | unchanged       |
+
+AJISAI's hybrid reference-antenna selection chose `DA42`, which sits near
+the array geometric center while excluding the ~7 antennas with flagged
+fraction >= 25%:
+
+<p align="center">
+  <img src="docs/_static/ajisai_refant_selection.png" alt="TW Hya refant selection" width="500"/>
+</p>
+
+See the [TW Hya tutorial](https://ajisai.readthedocs.io/en/latest/tutorials/twhya.html)
+for the full walk-through.
+
 ## Quick start
 
 ```python

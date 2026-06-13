@@ -111,20 +111,22 @@ print(f"Working directory: {aj.workdir}")
 While AJISAI runs, you will see a banner, then progress messages like:
 
 ```
-[AJISAI] refant = DA46 (hybrid: nearest to XY geometric center among ...)
+[AJISAI] refant = DA42 (hybrid: nearest to XY geometric center among ...)
 [AJISAI] refant selection plot: ajisai_TWHya_demo/ajisai_refant_selection.png
-[AJISAI] cell                  : 0.08000 arcsec
-[AJISAI] imsize                : [256, 256]
-[AJISAI] dirty image: peak=1.123 mJy/bm, RMS=0.234 uJy/bm, DR=4799
-[AJISAI] iter 0 (no selfcal)   : DR=4500.0, peak=1.234 mJy/bm, ...
+[AJISAI] iter 0 (no selfcal)   : DR=~80,  peak=~334 mJy/bm, RMS=~4100 uJy/bm
 [AJISAI] --- iter 1 (phase_inf) calmode=p solint=inf ---
-[AJISAI]   -> ok. DR=12345.0, RMS=0.080 uJy/bm
+[AJISAI]   -> ok. DR=~175, peak=~341 mJy/bm, RMS=~1950 uJy/bm
 [AJISAI] --- iter 2 (phase_6IT) calmode=p solint=36.30s ---
-...
+[AJISAI]   -> ok. DR=~235, peak=~352 mJy/bm, RMS=~1500 uJy/bm
+[AJISAI] --- iter 3 (phase_3IT) calmode=p solint=18.15s ---
+[AJISAI]   -> ok. DR=~240, peak=~355 mJy/bm, RMS=~1490 uJy/bm
+[AJISAI] --- iter 4 (amp_inf) calmode=a solint=inf ---
+[AJISAI]   -> ok. DR=~245, peak=~356 mJy/bm, RMS=~1460 uJy/bm
+[AJISAI] best iteration: #4, dynamic_range = ~245
 ```
 
-(The exact numbers depend on your CASA version and the random initialization
-of CASA's deconvolver.)
+(The exact numbers can vary slightly with CASA version and the random
+initialization of CASA's deconvolver, but the magnitudes match closely.)
 
 ### Step 4: Inspect the results
 
@@ -145,6 +147,36 @@ Open `selfcal_summary.png` first: it shows how dynamic range, peak, RMS,
 and beam evolved across iterations. You should see DR climbing through the
 three phase iterations and a further bump from the amplitude iteration.
 
+The reference run produced the following result on the TW Hya Band 7 demo:
+
+```{image} ../_static/selfcal_summary.png
+:alt: TW Hya self-cal summary
+:width: 600px
+:align: center
+```
+
+| metric           | iter 0 (no self-cal) | iter 4 (best) | change          |
+| ---------------- | -------------------- | ------------- | --------------- |
+| Dynamic range    | ~80                  | ~245          | **~3.1x up**    |
+| Peak [mJy/beam]  | ~334                 | ~356          | +22 mJy         |
+| RMS  [uJy/beam]  | ~4100                | ~1460         | **~2.8x down**  |
+| Beam [mas]       | 482                  | 480           | essentially unchanged |
+
+All four iterations completed with `status="ok"` (no anomalies). The
+amplitude iteration provided a final ~2% bump in DR after the phase
+iterations had nearly plateaued, which is the typical pattern AJISAI is
+designed to capture.
+
+The reference-antenna selection picked `DA42`, a centrally-located antenna
+that passed the flag-fraction filter. About seven antennas with flagged
+fraction >= 25% were excluded (marked with red `x`):
+
+```{image} ../_static/ajisai_refant_selection.png
+:alt: TW Hya reference antenna selection
+:width: 600px
+:align: center
+```
+
 If you want to know *why* AJISAI made each choice, read
 `justification.json`. An abbreviated example (real output is fully valid
 JSON; ellipses below are placeholders for omitted fields):
@@ -154,12 +186,13 @@ JSON; ellipses below are placeholders for omitted fields):
   "ajisai_version": "0.1.0",
   "derived": {
     "refant": {
-      "value": "DA46",
-      "reason": "hybrid: nearest to XY geometric center among 23 antennas ...",
+      "value": "DA42",
+      "reason": "hybrid: nearest to XY geometric center among the antennas
+                 with flagged fraction < 0.25",
       ...
     },
     "cellsize": {
-      "value_arcsec": 0.08,
+      "value_arcsec": ...,
       "reason": "cellsize = beam/10 from the 90-percentile baseline ..."
     },
     "phase_shift": {
@@ -169,11 +202,13 @@ JSON; ellipses below are placeholders for omitted fields):
     ...
   },
   "iterations": [
-    {"iteration": 0, "label": "no_selfcal", "dynamic_range": 4500.0, ...},
-    {"iteration": 1, "label": "phase_inf",  "dynamic_range": 12345.0, "status": "ok", ...},
-    ...
+    {"iteration": 0, "label": "no_selfcal", "dynamic_range":  80.0, ...},
+    {"iteration": 1, "label": "phase_inf",  "dynamic_range": 175.0, "status": "ok", ...},
+    {"iteration": 2, "label": "phase_6IT",  "dynamic_range": 235.0, "status": "ok", ...},
+    {"iteration": 3, "label": "phase_3IT",  "dynamic_range": 240.0, "status": "ok", ...},
+    {"iteration": 4, "label": "amp_inf",    "dynamic_range": 245.0, "status": "ok", ...}
   ],
-  "best": {"iteration": 4, "metric_key": "dynamic_range", "value": 15234.0}
+  "best": {"iteration": 4, "metric_key": "dynamic_range", "value": 245.0}
 }
 ```
 

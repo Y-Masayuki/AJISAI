@@ -8,6 +8,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **TW Hya demo validated end-to-end on real CASA.** The pipeline ran on
+  the public ALMA TW Hya Band 7 dataset (Project 2011.0.00340.S) with all
+  defaults and completed all 4 self-cal iterations with `status="ok"`.
+  Reference results:
+  - Dynamic range: ~80 (iter 0) -> ~245 (iter 4), a ~3.1x improvement.
+  - Off-source RMS: ~4100 -> ~1460 uJy/beam, a ~2.8x reduction.
+  - Beam: essentially unchanged at ~482 mas.
+  - Hybrid refant selection chose DA42 after excluding ~7 antennas with
+    flagged fraction >= 25%.
+- `docs/_static/selfcal_summary.png` and `docs/_static/ajisai_refant_selection.png`:
+  reference figures from the TW Hya demo run, embedded in README and the
+  tutorial.
+- TW Hya tutorial updated with real reference numbers and embedded figures.
+- README has a new "Example results: TW Hya Band 7 demo" section.
+
+### Fixed
+
+- `examples/run_twhya_demo.py`: SSL verification failure on some monolithic
+  CASA distributions (`CERTIFICATE_VERIFY_FAILED`) is now avoided by using
+  `certifi`'s CA bundle when available.
+- `examples/run_twhya_demo.py`: switched plotms invocation from
+  `casatasks.plotms` to `casaplotms.plotms` to match modern CASA where
+  `plotms` was moved out of `casatasks`.
+- `examples/run_twhya_demo.py`: made the demo runnable from inside a CASA
+  interactive prompt (`exec(open(...).read())`) without losing the
+  `prepare_data` entry point.
+
+### Added (test/CI infrastructure)
+
 - pytest test suite under `tests/` with 78 unit tests covering:
   - `ms_utils` pure-math helpers (`_smallest_5_smooth_at_least`,
     `_round_to_sig_figs`, `_baars_taper_factor`,
