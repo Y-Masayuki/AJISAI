@@ -1,18 +1,16 @@
-<p align="center">
-  <img src="docs/_static/ajisai_logo.png" alt="AJISAI logo" width="200"/>
-</p>
 
-# AJISAI
-
-**Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure**
-
-AJISAI is a fully automated, reproducible, and explainable self-calibration
-pipeline for ALMA continuum data, built on top of CASA.
+# AJISAI: Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure <img src="docs/_static/ajisai_logo.png" align="right" height="139" />
 
 [![CI](https://github.com/Y-Masayuki/AJISAI/actions/workflows/ci.yml/badge.svg)](https://github.com/Y-Masayuki/AJISAI/actions/workflows/ci.yml)
 [![Documentation Status](https://app.readthedocs.org/projects/ajisai/badge/?version=latest)](https://ajisai.readthedocs.io/en/latest/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
+
+# AJISAI
+
+AJISAI is a fully automated, reproducible, and explainable self-calibration pipeline for ALMA continuum data, built on top of CASA. The name is inspired by the Japanese word for hydrangea (紫陽花).
+
 
 ## Design principles
 
@@ -27,28 +25,6 @@ pipeline for ALMA continuum data, built on top of CASA.
    selected by dynamic range at the end. No adaptive rollback that would
    make the result depend on run-order.
 
-## About the name and the logo
-
-**AJISAI** is the Japanese word for hydrangea (紫陽花). The acronym
-unpacks as *Automated **J**ustification-based **I**maging and
-**S**elf-calibration for **A**LMA **I**nfrastructure*, and the name was
-chosen so that the project's identity carries a clear visual metaphor.
-
-The logo combines three sources of inspiration:
-
-- **Self-calibration.** The two arrows that wrap around the bloom in a
-  closed loop stand for the iterative self-cal schedule. The bloom in
-  the middle is what emerges after the loop converges — the final
-  best image, selected by dynamic range.
-- **Hydrangea (紫陽花).** Each four-petal floret stands for a single
-  iteration; the dense cluster is the composite final image that the
-  iterations contribute to. The four-petal motif also echoes the four
-  support struts of an ALMA antenna dish, so each floret can be read
-  both as a flower and as one antenna in the array.
-- **Japanese family crest (家紋, *kamon*).** The strict rotational
-  symmetry and the geometric abstraction of each floret follow the
-  visual language of traditional Japanese *kamon*, which compress
-  natural forms into compact, recognizable emblems.
 
 ## Installation
 
