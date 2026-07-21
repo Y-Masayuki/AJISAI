@@ -247,3 +247,88 @@ def test_uvtaper_fwhm_product_constant():
 def test_arcsec_per_rad_constant():
     """206264.806 arcsec per radian."""
     assert ARCSEC_PER_RAD == pytest.approx(206264.806, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# icrs_to_j2000 / RA-Dec string parsing
+#
+# Regression: _max_pixel_world_coords (and analysisUtils' rad2radec) emit
+# declination with '.' field separators, e.g. '-34.17.38.348'. The original
+# icrs_to_j2000 only split on ':', so the CASA-format string collapsed to 4
+# tokens and raised "Expected ... (6 parts)". See phase-shift crash on
+# 2MASSJ15450634 (LupusI_13).
+# ---------------------------------------------------------------------------
+from ajisai.ms_utils import (  # noqa: E402
+    _sexagesimal_to_colon,
+    _split_radec,
+    icrs_to_j2000,
+)
+
+
+@pytest.mark.parametrize("token, expected", [
+    ("-34.17.38.348", "-34:17:38.348"),   # CASA dec, negative, fractional sec
+    ("+34.17.38.348", "+34:17:38.348"),   # CASA dec, explicit positive
+    ("34.17.38.348", "34:17:38.348"),     # CASA dec, unsigned
+    ("-00.05.30.5", "-00:05:30.5"),       # small negative dec
+    ("-34.17.38", "-34:17:38"),           # integer arcsec (3 fields)
+    ("15:45:06.322", "15:45:06.322"),     # already ':'-separated -> unchanged
+])
+def test_sexagesimal_to_colon(token, expected):
+    assert _sexagesimal_to_colon(token) == expected
+
+
+def test_split_radec_casa_form():
+    """CASA form: RA ':'-separated, Dec '.'-separated (2 whitespace tokens)."""
+    ra, dec = _split_radec("15:45:06.322 -34.17.38.348")
+    assert ra == "15:45:06.322"
+    assert dec == "-34:17:38.348"
+
+
+def test_split_radec_space_form():
+    """Legacy documented form: 6 whitespace tokens."""
+    ra, dec = _split_radec("15 45 06.322 -34 17 38.348")
+    assert ra == "15:45:06.322"
+    assert dec == "-34:17:38.348"
+
+
+def test_split_radec_rejects_garbage():
+    with pytest.raises(ValueError):
+        _split_radec("not a coordinate")
+
+
+def test_icrs_to_j2000_casa_format_regression():
+    """The exact string that crashed the phase-shift step must now convert.
+
+    ICRS and FK5 (J2000.0) share an origin, so the label is essentially
+    unchanged; we assert the on-sky position is preserved to < 1 mas and the
+    output keeps the CASA convention (RA ':'-sep, Dec '.'-sep).
+    """
+    pytest.importorskip("astropy")
+    from astropy.coordinates import SkyCoord
+    from astropy import units as u
+
+    crash_input = "15:45:06.322 -34.17.38.348"
+    out = icrs_to_j2000(crash_input)
+
+    # Output layout: RA uses ':', Dec uses '.' (CASA-parseable declination)
+    ra_out, dec_out = out.split()
+    assert ra_out.count(":") == 2
+    assert ":" not in dec_out
+    assert dec_out.startswith("-34.17.38")
+
+    # On-sky position is preserved (frame relabel, not a physical move)
+    c_in = SkyCoord(ra="15:45:06.322", dec="-34:17:38.348",
+                    unit=(u.hourangle, u.deg), frame="icrs")
+    c_out = SkyCoord(ra=ra_out.replace(":", " "),
+                     dec=dec_out.replace(".", " ", 2),
+                     unit=(u.hourangle, u.deg), frame="fk5")
+    assert c_in.separation(c_out).arcsec < 1e-3
+
+
+def test_icrs_to_j2000_accepts_space_form():
+    """The legacy 6-token layout still works."""
+    pytest.importorskip("astropy")
+    out = icrs_to_j2000("15 45 06.322 -34 17 38.348")
+    ra_out, dec_out = out.split()
+    assert ra_out.count(":") == 2
+    assert dec_out.startswith("-34.17.38")

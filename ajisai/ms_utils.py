@@ -710,32 +710,81 @@ def rad_to_radec_from_imfit(
                          delimiter=delimiter, precision=precision)
 
 
+def _sexagesimal_to_colon(token: str) -> str:
+    """Normalise a single sexagesimal token to ':'-separated form.
+
+    CASA / analysisUtils declination strings use '.' as the *field*
+    separator, e.g. ``-34.17.38.348`` (= -34d 17m 38.348s). astropy cannot
+    parse that directly, so convert the field separators to ':' while
+    preserving the fractional seconds. RA tokens (already ':'-separated) and
+    unrecognised tokens are returned unchanged for astropy to handle.
+    """
+    if ":" in token:
+        return token
+    sign, body = "", token
+    if body[:1] in "+-":
+        sign, body = body[0], body[1:]
+    fields = body.split(".")
+    if len(fields) == 3:          # DD.MM.SS
+        d, m, s = fields
+    elif len(fields) == 4:        # DD.MM.SS.ffff  -> seconds = SS.ffff
+        d, m, s = fields[0], fields[1], f"{fields[2]}.{fields[3]}"
+    else:
+        return token             # unknown layout; let astropy try as-is
+    return f"{sign}{d}:{m}:{s}"
+
+
+def _split_radec(coord_str: str) -> tuple:
+    """Split a CASA/analysisUtils RA-Dec string into (ra_str, dec_str).
+
+    Accepts both real-world input layouts:
+
+    * CASA / analysisUtils form ``'HH:MM:SS.s DD.MM.SS.s'`` -- RA uses ':'
+      separators, Dec uses '.' separators. This is what ``imstat`` /
+      ``au.rad2radec`` emit and is the layout AJISAI actually feeds in.
+    * Space-separated form ``'HH MM SS.s DD MM SS.s'`` (6 whitespace tokens).
+
+    Both are returned with ':'-separated RA and Dec so astropy can parse them.
+    """
+    tokens = coord_str.split()
+    if len(tokens) == 2:
+        return _sexagesimal_to_colon(tokens[0]), _sexagesimal_to_colon(tokens[1])
+    if len(tokens) == 6:
+        return ":".join(tokens[:3]), ":".join(tokens[3:])
+    raise ValueError(
+        f"Cannot parse RA/Dec string {coord_str!r}; expected CASA form "
+        f"'HH:MM:SS.s DD.MM.SS.s' or space form 'HH MM SS.s DD MM SS.s'"
+    )
+
+
 def icrs_to_j2000(coord_str: str) -> str:
     """Convert an ICRS sexagesimal coordinate string to J2000 (FK5).
 
-    Replaces analysisUtils.ICRSToJ2000. Uses astropy. The two frames differ
-    by < 0.1 arcsec, so the output is numerically very close to the input;
-    AJISAI uses this for CASA's phasecenter argument which sometimes needs
-    an explicit J2000 label.
+    Replaces analysisUtils.ICRSToJ2000. Uses astropy. The two frames share
+    the same origin at epoch J2000.0, so the on-sky position is unchanged and
+    the returned coordinate label is numerically almost identical to the
+    input; AJISAI uses this for CASA's ``fixplanets`` / ``phasecenter``
+    arguments, which need an explicit J2000 label.
 
-    The input string is expected as 'HH MM SS.s DD MM SS.s' (space-separated).
-    Returns the same sexagesimal layout in the J2000 (FK5) frame.
+    Input may be either the CASA / analysisUtils layout
+    ``'HH:MM:SS.s DD.MM.SS.s'`` (RA ':'-separated, Dec '.'-separated -- the
+    format emitted by ``imstat``'s ``maxposf`` and ``au.rad2radec``) or the
+    space-separated ``'HH MM SS.s DD MM SS.s'`` layout.
+
+    The output preserves the CASA convention: RA with ':' separators and Dec
+    with '.' separators (e.g. ``'15:45:06.32 -34.17.38.34'``). This matters
+    because CASA interprets ':' in a declination as a time (hours) value, so
+    Dec must use '.' separators to be parsed as an angle downstream.
     """
     from astropy.coordinates import SkyCoord
     from astropy import units as u
 
-    parts = coord_str.replace(":", " ").split()
-    if len(parts) != 6:
-        raise ValueError(
-            f"Expected 'HH MM SS.s DD MM SS.s' (6 parts); got {coord_str!r}"
-        )
-    ra_str = ":".join(parts[:3])
-    dec_str = ":".join(parts[3:])
+    ra_str, dec_str = _split_radec(coord_str)
     c_icrs = SkyCoord(ra=ra_str, dec=dec_str, unit=(u.hourangle, u.deg), frame="icrs")
     c_j2000 = c_icrs.transform_to("fk5")  # FK5 J2000.0
     ra_out = c_j2000.ra.to_string(unit=u.hour, sep=":", precision=5, pad=True)
-    dec_out = c_j2000.dec.to_string(unit=u.deg, sep=":", precision=5,
-                                     pad=True, alwayssign=True)
+    dec_out = c_j2000.dec.to_string(unit=u.deg, sep=".", precision=5,
+                                    pad=True, alwayssign=True)
     return f"{ra_out} {dec_out}"
 
 
