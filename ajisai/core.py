@@ -1619,6 +1619,7 @@ Infrastructure
         # Cleanup any stale files from previous run (safe: only within workdir)
         _safe_rmtree_path(caltable)
         _safe_rmtree_path(out_vis)
+        _safe_rmtree_path(interm / f"selfcal_{idx}_avg.ms")
         _safe_rmtree_glob(interm, f"clean_sc{idx}.*")
 
         # Resolve solint expression like "6*IT"
@@ -1671,6 +1672,10 @@ Infrastructure
             outputvis=str(out_vis),
             datacolumn="corrected",
         )
+
+        # === 4b. frequency-averaged (1 ch/spw) copy for continuum inspection ===
+        # Byproduct only: NOT fed back into the self-cal loop (step 5 uses out_vis).
+        avg_vis = self._make_chanavg_ms(out_vis, idx)
 
         # === 5. tclean of the new MS, save model for next iteration ===
         # Self-cal iterations ALWAYS reuse the mask produced by the initial
@@ -1732,6 +1737,8 @@ Infrastructure
             "anomaly_reason": anomaly_reason,
             "image_path": str(clean_base) + ".image",
             "fits_path": str(fits_path),
+            "selfcal_ms": str(out_vis),
+            "selfcal_avg_ms": str(avg_vis),
         }
         self.metrics.append(rec)
         self.justification["iterations"].append(rec)
@@ -1760,6 +1767,55 @@ Infrastructure
     # ----------------------------------------------------------------------
     # Helper methods for iteration
     # ----------------------------------------------------------------------
+    def _make_chanavg_ms(self, src_vis, idx: int):
+        """Create a fully frequency-averaged copy of a self-cal MS.
+
+        Every channel in each spectral window is averaged into a single
+        output channel (``width`` = the per-spw channel count), i.e. a
+        continuum "1 channel per spw" measurement set. The result is written
+        next to the input as ``<workdir>/intermediate/selfcal_<idx>_avg.ms``.
+
+        This is a byproduct for quick inspection and downstream continuum
+        analysis; it is NOT fed back into the self-cal loop (the loop keeps
+        using the full-resolution ``selfcal_<idx>.ms``).
+
+        Parameters
+        ----------
+        src_vis : path-like
+            The per-iteration self-cal MS (``selfcal_<idx>.ms``). It is itself
+            a split of the corrected column, so its calibrated visibilities
+            live in the DATA column and ``datacolumn='data'`` is used here.
+        idx : int
+            Iteration index, used to name the output MS.
+
+        Returns
+        -------
+        pathlib.Path
+            Path to the averaged MS.
+        """
+        interm = self.workdir / "intermediate"
+        avg_vis = interm / f"selfcal_{idx}_avg.ms"
+        _safe_rmtree_path(avg_vis)
+
+        # One width entry per selected spw so EVERY spw collapses to exactly one
+        # channel, regardless of whether the spws share the same channel count.
+        # Falls back to the scalar chavg_width (first spw's NUM_CHAN) if the
+        # per-spw list is unavailable.
+        width = self._derived.get("num_chan_per_spw")
+        if not width:
+            width = self._derived.get("chavg_width", 1)
+
+        casatasks.split(
+            vis=str(src_vis),
+            outputvis=str(avg_vis),
+            datacolumn="data",
+            width=width,
+        )
+        if self.cfg.verbose:
+            print(f"[AJISAI]   channel-averaged MS   : {avg_vis.name} "
+                  f"(width={width}, 1 ch/spw)")
+        return avg_vis
+
     def _resolve_solint(self, solint: str) -> str:
         """Resolve solint expressions: '6*IT' → '36.30s' (6 * avg integration time)."""
         m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*\*\s*IT\s*$", solint)
