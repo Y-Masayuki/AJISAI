@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use AJISAI in your research, please cite the version you used via its Zenodo DOI."
+type: software
+title: "AJISAI: Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure"
+authors:
+  - family-names: Yamaguchi
+    given-names: Masayuki
+    orcid: "https://orcid.org/0000-0002-8185-9882"
+    affiliation: "Kyushu University / National Astronomical Observatory of Japan"
+version: 0.1.0
+date-released: "2026-09-30"
+doi: 10.5281/zenodo.23053992
+repository-code: "https://github.com/Y-Masayuki/AJISAI"
+url: "https://ajisai.readthedocs.io"
+license: MIT
+keywords:
+  - ALMA
+  - self-calibration
+  - radio interferometry
+  - CASA
+  - Python

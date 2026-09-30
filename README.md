@@ -5,7 +5,7 @@
 [![Documentation Status](https://app.readthedocs.org/projects/ajisai/badge/?version=latest)](https://ajisai.readthedocs.io/en/latest/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-
+[![DOI](https://zenodo.org/badge/1248874800.svg)](https://doi.org/10.5281/zenodo.23053992)
 
 # AJISAI
 

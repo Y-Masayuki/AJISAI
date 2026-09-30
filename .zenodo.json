@@ -1,0 +1,15 @@
+{
+  "title": "AJISAI: Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "Yamaguchi, Masayuki",
+      "affiliation": "Kyushu University / National Astronomical Observatory of Japan",
+      "orcid": "0000-0002-8185-9882"
+    }
+  ],
+  "description": "AJISAI is a Python package for fully automated and reproducible iterative self-calibration of ALMA continuum data with CASA. It executes a fixed schedule of phase-only and amplitude self-calibration rounds, selects the CLEAN image with the highest peak signal-to-noise ratio as the final product, and records the justification for every parameter choice in a machine-readable log.",
+  "keywords": ["ALMA", "self-calibration", "radio interferometry", "CASA", "Python"]
+}
