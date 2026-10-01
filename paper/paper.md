@@ -24,7 +24,7 @@ bibliography: paper.bib
 # Summary
 
 Radio telescopes such as the Atacama Large Millimeter/submillimeter Array
-[ALMA; @wootten2009] make images by combining the signals recorded by many
+[ALMA, @wootten2009] make images by combining the signals recorded by many
 separate antennas. The atmosphere and the instruments themselves alter the
 timing and strength of the signal reaching each antenna, which blurs the image
 and adds spurious features. Self-calibration corrects these errors by using the
