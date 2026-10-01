@@ -167,6 +167,18 @@ The `tools/` directory contains standalone diagnostic utilities:
   CASA-exported FITS image to validate the sigma-clipping-based default
   used in AJISAI.
 
+## Support and contributing
+
+Bug reports and questions are welcome on
+[GitHub Issues](https://github.com/Y-Masayuki/AJISAI/issues). For bug
+reports, please include your AJISAI and CASA versions, the command you ran,
+and the `justification.json` from the affected run. Support is provided on a
+best-effort basis; we usually reply within one to two weeks.
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for
+the development setup, testing and lint instructions, and the project's design
+policy (a deterministic fixed schedule; no adaptive rollback or heuristics).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
