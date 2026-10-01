@@ -22,8 +22,8 @@ assignees: ""
 
 AJISAI is built around a deterministic, fixed self-calibration schedule and
 explainability through `justification.json`. Proposals that add adaptive
-rollback or heuristic decision-making (as in `auto_selfcal`) will not be
-accepted. See [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md#design-policy).
+rollback or heuristic decision-making will not be accepted. See
+[CONTRIBUTING.md](../blob/main/CONTRIBUTING.md#design-policy).
 
 - [ ] This proposal keeps the schedule deterministic and does not add adaptive rollback or heuristics
 - [ ] Any new parameter choice can be recorded with its rationale in `justification.json`

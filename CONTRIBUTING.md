@@ -101,10 +101,9 @@ parameter choice is recorded with its rationale, and the same input must
 produce the same sequence of steps, independent of run order.
 
 For this reason, **we do not accept proposals that add adaptive rollback or
-heuristic decision-making**, such as the adaptive behavior of `auto_selfcal`
-(for example, reverting an iteration or changing the schedule based on
-intermediate results). Pull requests and feature requests of this kind will be
-closed.
+heuristic decision-making** (for example, reverting an iteration or changing
+the schedule based on intermediate results). Pull requests and feature
+requests of this kind will be closed.
 
 Contributions that fit the design are welcome, for example:
 
