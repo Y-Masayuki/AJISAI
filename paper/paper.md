@@ -1,5 +1,5 @@
 ---
-title: 'AJISAI: An auditable, deterministic self-calibration pipeline for ALMA continuum data'
+title: 'AJISAI: Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure'
 tags:
   - Python
   - astronomy
