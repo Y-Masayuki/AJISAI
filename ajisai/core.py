@@ -210,7 +210,7 @@ class AJISAIConfig:
     # NOTE: AJISAI runs ALL iterations to completion and selects the best by DR
     # at the end. Anomalies (e.g. catastrophic DR drop) are logged for the
     # justification but do NOT alter pipeline flow. This preserves the
-    # deterministic-fixed-schedule identity vs. auto_selfcal's adaptive rollback.
+    # deterministic fixed-schedule identity (no adaptive rollback).
     on_iter_anomaly: str = "log_only"      # "log_only" (default) | future: "warn_loudly"
 
     # === Misc ===

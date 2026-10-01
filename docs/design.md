@@ -1,20 +1,17 @@
 # Design
 
 This page explains *why* AJISAI exists, the principles that govern its
-behavior, and how it compares to the established alternative
-[`auto_selfcal`](https://github.com/jjtobin/auto_selfcal).
+behavior, and the design choices that define it.
 
 ## Why AJISAI
 
 ALMA self-calibration is well understood algorithmically, but writing a
 script that reliably performs it on a new dataset is still tedious and
-error-prone. Several groups have addressed this by building automated
-pipelines, of which the NRAO/SRDP **auto_selfcal** is the most prominent
-and is now part of the ALMA Pipeline (as the `hif_selfcal` task).
+error-prone, and the choices made in such scripts are rarely recorded in
+a form that others can check.
 
-AJISAI does not try to compete with auto_selfcal on feature breadth.
-Instead, it occupies a complementary niche: a tool optimized for
-**reproducibility and explainability**. Specifically:
+AJISAI does not aim for feature breadth. Instead, it is a tool optimized
+for **reproducibility and explainability**. Specifically:
 
 - AJISAI's parameter choices are deterministic given the input MS and
   the config. The same MS + same config always produces the same
@@ -28,9 +25,8 @@ The intended use cases are:
 
 1. **Reproducible production self-calibration** for users who want a
    deterministic, well-documented pipeline and an audit trail.
-2. **Cross-validation of other self-cal results** including auto_selfcal
-   output, since AJISAI's fixed schedule and explicit logging make it a
-   useful reference.
+2. **Cross-validation of other self-cal results**, since AJISAI's fixed
+   schedule and explicit logging make it a useful reference.
 3. **Pedagogy.** Reading AJISAI's code and justification log is an
    accessible introduction to the practical art of self-calibration.
 
@@ -69,14 +65,13 @@ shortens or extends based on intermediate image quality. After all
 iterations complete, AJISAI selects the best one by dynamic range
 (peak / RMS_offsource).
 
-This is the principal difference from auto_selfcal, which uses an
-adaptive rollback strategy: each iteration's outcome is evaluated, and
-the iteration is discarded if the noise gets worse. Adaptive rollback
-often produces better images for marginal datasets, but it makes the
-behaviour data-dependent at run time — the same config can produce
-different numbers of iterations on different MSes, which complicates
-publication-grade reproducibility. AJISAI chooses determinism over
-adaptivity.
+AJISAI deliberately does not use adaptive rollback, in which each
+iteration's outcome is evaluated and the iteration is discarded if the
+noise gets worse. Adaptive rollback can produce better images for
+marginal datasets, but it makes the behaviour data-dependent at run time
+— the same config can produce different numbers of iterations on
+different MSes, which complicates publication-grade reproducibility.
+AJISAI chooses determinism over adaptivity.
 
 Anomalies (iterations where, e.g., the dynamic range drops by more
 than 50%, or gaincal returns no solutions) are still detected, but
@@ -118,26 +113,23 @@ AJISAI(cfg).run() pipeline order:
 10. write summary CSV, PNG, and justification.json
 ```
 
-## Comparison with auto_selfcal
+## At a glance
 
-| Aspect                          | AJISAI                                  | auto_selfcal                                   |
-|---------------------------------|-----------------------------------------|------------------------------------------------|
-| Self-cal schedule               | Fixed (3 phase + 1 amp by default)      | Adaptive; iterates until no further gain       |
-| Behaviour on anomalies          | Log only; pipeline continues            | Rollback; iteration may be discarded           |
-| Number of iterations per run    | Always the same for a given config      | Data-dependent                                 |
-| Reference antenna selection     | Flag-stats + geometric center (hybrid)  | Flag-stats based                                |
-| RMS estimator                   | Sigma-clip + center exclusion (default) | Annulus / pipeline default                     |
-| Best-image criterion            | Dynamic range over all iterations       | Last accepted iteration                        |
-| Decision audit log              | `justification.json` (structured)        | Logs in CASA-style format                      |
-| Supported targets               | ALMA continuum, single field, multi-EB  | ALMA + VLA, continuum + line, mosaics, ephemeris |
-| Codebase size (LOC)             | ~3000 (focused)                          | ~10000+ (broad)                                |
-| Primary use                     | Reproducible production + audit         | Adaptive imaging for pipeline processing       |
+| Aspect                          | AJISAI                                  |
+|---------------------------------|-----------------------------------------|
+| Self-cal schedule               | Fixed (3 phase + 1 amp by default)      |
+| Behaviour on anomalies          | Log only; pipeline continues            |
+| Number of iterations per run    | Always the same for a given config      |
+| Reference antenna selection     | Flag-stats + geometric center (hybrid)  |
+| RMS estimator                   | Sigma-clip + center exclusion (default) |
+| Best-image criterion            | Dynamic range over all iterations       |
+| Decision audit log              | `justification.json` (structured)       |
+| Supported targets               | ALMA continuum, single field, multi-EB  |
+| Codebase size (LOC)             | ~3000 (focused)                         |
+| Primary use                     | Reproducible production + audit         |
 
-AJISAI is **not** a replacement for auto_selfcal in cases where
-auto_selfcal already works well (which is most cases). AJISAI is a
-**complement**: use it when reproducibility, explainability, or
-educational transparency matter more than raw image quality on marginal
-data.
+Use AJISAI when reproducibility, explainability, or educational
+transparency matter more than raw image quality on marginal data.
 
 ## Locked-in design choices
 
@@ -169,9 +161,9 @@ load-bearing. Changing them would alter AJISAI's identity:
 - It is **not** a general radio-astronomy imaging package. It targets
   ALMA continuum imaging.
 
-- It is **not** an adaptive optimizer. If you want the best possible
-  image on a marginal dataset and do not care about reproducibility,
-  use auto_selfcal.
+- It is **not** an adaptive optimizer. It does not try to squeeze the
+  best possible image out of a marginal dataset at the expense of
+  reproducibility.
 
 - It does **not** perform continuum-line separation, flagging, or any
   step that should be done before self-cal. Bring AJISAI a clean,

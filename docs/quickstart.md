@@ -126,5 +126,5 @@ python /path/to/my_script.py
   [Configuration reference](configuration.md).
 - Understand what every output file contains:
   [Output artifacts](outputs.md).
-- Read the design philosophy and how AJISAI differs from `auto_selfcal`:
+- Read the design philosophy behind AJISAI:
   [Design](design.md).
