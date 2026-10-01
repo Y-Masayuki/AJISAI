@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ajisai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automated Justification-based Imaging and Self-calibration for ALMA continuum data"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -59,7 +59,7 @@ casa = [
     # Modular CASA (alternative to monolithic CASA distribution).
     # Once AJISAI is published to PyPI, this extra can be installed via
     # 'pip install ajisai[casa]'. For now, install from GitHub:
-    # 'pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.1.0#egg=ajisai[casa]"'
+    # 'pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.2.0#egg=ajisai[casa]"'
     "casatools>=6.5",
     "casatasks>=6.5",
 ]

@@ -18,6 +18,7 @@ ajisai_<projname>/
 │   ├── clean_sc1.image / .fits    ← after iteration 1
 │   ├── clean_sc2.image / .fits    ← after iteration 2
 │   ├── selfcal_1.ms, selfcal_2.ms, ...
+│   ├── selfcal_1_avg.ms, ...      ← channel-averaged copies (1 ch/spw)
 │   ├── sc1.pcal, sc2.pcal, ...    ← gain tables
 │   └── phaseshifted.ms            ← if phase_shift=True
 └── diagnostics/

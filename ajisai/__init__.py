@@ -75,7 +75,7 @@ from .ms_utils import (
     icrs_to_j2000,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AJISAI",
