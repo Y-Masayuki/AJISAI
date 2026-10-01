@@ -1,0 +1,31 @@
+name: Draft PDF
+
+# Build the JOSS paper (paper/paper.md + paper/paper.bib) with the Open
+# Journals toolchain, so that formatting and citation problems show up before
+# submission. The compiled paper.pdf is uploaded as a workflow artifact.
+on:
+  push:
+    paths:
+      - paper/**
+      - .github/workflows/draft-pdf.yml
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    name: Paper Draft
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Build draft PDF
+        uses: openjournals/openjournals-draft-action@master
+        with:
+          journal: joss
+          paper-path: paper/paper.md
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: paper
+          # Pandoc writes the PDF next to the input paper.md.
+          path: paper/paper.pdf
+          archive: false
