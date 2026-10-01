@@ -6,8 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-01
+
 ### Added
 
+- Each self-calibration iteration now also writes a channel-averaged copy of
+  its measurement set, `intermediate/selfcal_<idx>_avg.ms`, in which every
+  spectral window is averaged to a single channel. The copy is meant for
+  quick inspection and downstream continuum analysis and is not fed back
+  into the self-calibration loop; its path is recorded as `selfcal_avg_ms`
+  in the per-iteration metrics and in `justification.json`.
 - **TW Hya demo validated end-to-end on real CASA.** The pipeline ran on
   the public ALMA TW Hya Band 7 dataset (Project 2011.0.00340.S) with all
   defaults and completed all 4 self-cal iterations with `status="ok"`.
@@ -29,9 +37,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - TW Hya tutorial updated with precise reference numbers, per-iteration
   metrics table, and embedded figures.
 - README has a new "Example results: TW Hya Band 7 demo" section.
+- Community files: `CONTRIBUTING.md` (development setup, tests, lint,
+  pull-request workflow, and design policy), GitHub issue templates for bug
+  reports and feature requests, a pull-request template, and a "Support and
+  contributing" section in the README.
+- Citation metadata: `CITATION.cff`, `.zenodo.json`, and a Zenodo DOI badge
+  in the README. The README citation section points to the published ApJ
+  paper and the Zenodo record.
+- Project logo and the name and design rationale in the README.
+
+### Changed
+
+- The design page of the documentation describes AJISAI's design on its own
+  terms; its comparison table was replaced by an "At a glance" table.
+- Installation instructions install from GitHub; a PyPI release is planned.
 
 ### Fixed
 
+- `phase_shift=True` no longer crashes on ICRS datasets. `icrs_to_j2000`
+  now accepts CASA's declination format with `.` separators
+  (e.g. `-34.17.38.348`) as well as the space-separated form, and writes the
+  J2000 declination in a form that CASA `fixplanets` parses as an angle.
+- `.zenodo.json` described the final image as the one with the highest peak
+  signal-to-noise ratio; it now says dynamic range, matching the default
+  `quality_metric`.
 - `examples/run_twhya_demo.py`: SSL verification failure on some monolithic
   CASA distributions (`CERTIFICATE_VERIFY_FAILED`) is now avoided by using
   `certifi`'s CA bundle when available.
@@ -44,7 +73,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added (test/CI infrastructure)
 
-- pytest test suite under `tests/` with 78 unit tests covering:
+- pytest test suite under `tests/` with 93 unit tests covering:
   - `ms_utils` pure-math helpers (`_smallest_5_smooth_at_least`,
     `_round_to_sig_figs`, `_baars_taper_factor`,
     `_parse_uvtaper_to_image_fwhm`, etc.)
@@ -54,6 +83,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - FITS loader (`load_fits_image`) on a synthetic CASA-style image
   - RMS estimators (`compute_rms`) on noise-only and source+noise
     synthetic FITS images
+  - the channel-averaged MS step and the RA/Dec string parsing used by
+    `icrs_to_j2000`
 - `tests/conftest.py` with reusable synthetic FITS fixtures and a
   `@pytest.mark.casa` marker that auto-skips when CASA is unavailable.
 - GitHub Actions CI workflow (`.github/workflows/ci.yml`):
@@ -127,5 +158,6 @@ Initial public release.
 - `imdata` runtime dependency. FITS image loading is implemented
   directly on top of astropy.
 
-[Unreleased]: https://github.com/Y-Masayuki/AJISAI/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Y-Masayuki/AJISAI/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Y-Masayuki/AJISAI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Y-Masayuki/AJISAI/releases/tag/v0.1.0
