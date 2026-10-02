@@ -43,6 +43,7 @@ The same information is also written to disk:
 
 - `<workdir>/metrics.csv` — one row per iteration
 - `<workdir>/selfcal_summary.png` — 4-panel diagnostic plot
+- `<workdir>/selfcal_images.png` — CLEAN image of every iteration, side by side
 - `<workdir>/justification.json` — every parameter choice with its reason
 - `<workdir>/ajisai_refant_selection.png` — refant choice visualization
 - `<workdir>/final.{image,fits}` — the best image

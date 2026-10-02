@@ -6,6 +6,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `selfcal_images.png`: the CLEAN image of every self-calibration round in
+  one row, left to right in the same order as the summary plot, on a shared
+  `inferno` colour scale. Two rows by default (linear, and a `gamma = 0.3`
+  power-law stretch that brings up faint emission), each with its own
+  colour bar; the field shown is 10 beams wide by default; the best round
+  is framed. A run that stopped early simply has fewer panels.
+- `PlotConfig` (`AJISAIConfig(plots=PlotConfig(...))`) with the gallery
+  options: colour map, the two `gamma` values, field of view (in beams or
+  arcsec), and centring on the phase center or the source peak.
+- `ajisai.plotting` module holding the figure code, and
+  `plot_from_workdir(workdir, ...)` to regenerate the three PNGs from an
+  existing output directory without CASA, e.g. with a different `gamma`.
+
+### Changed
+
+- `selfcal_summary.png`: one tick per round, labelled with what the round
+  did (`no self-cal`, `1st: phase / inf`, `2nd: phase / 36 s`, ...)
+  instead of fractional iteration numbers; the best round is marked in
+  every panel and named in the legend; integer tick labels; the beam panel
+  keeps a minimum y range so that a sub-percent beam change is not drawn as
+  a jump; `ok` points and the best line are drawn in AJISAI purple.
+- `ajisai_refant_selection.png`: square frame with the same X/Y scale and
+  a colour bar of the same height; flagged fraction in 0.25-wide bins of
+  the `Purples` colour map centred on the flag threshold; excluded antennas
+  crossed out in grey; the chosen antenna ringed in light purple.
+- All figures use a serif font (Times New Roman where installed, with
+  fallbacks) and inward ticks, and are saved at 150 dpi (was 120). The
+  style is applied per figure and does not change the caller's matplotlib
+  settings.
+- `plot_refant_selection()` moved to `ajisai.plotting` (still importable
+  from `ajisai`); `outpath` is now optional and the figure is returned.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

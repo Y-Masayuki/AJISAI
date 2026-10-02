@@ -8,7 +8,7 @@ Public API
 ----------
 
 The ``ajisai`` top-level package re-exports the names listed below from
-``ajisai.core`` and ``ajisai.ms_utils``. They are the supported public
+``ajisai.core``, ``ajisai.plotting``, and ``ajisai.ms_utils``. They are the supported public
 interface.
 
 Main class and configuration
@@ -44,6 +44,11 @@ Main class and configuration
    :exclude-members: __init__
    :show-inheritance:
 
+.. autoclass:: ajisai.PlotConfig
+   :members:
+   :exclude-members: __init__
+   :show-inheritance:
+
 
 Image and RMS utilities
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -60,7 +65,25 @@ Reference-antenna selection
 
 .. autofunction:: ajisai.select_refant
 
+
+Diagnostic figures
+~~~~~~~~~~~~~~~~~~
+
+The figures written at the end of ``run()``; see :doc:`plotting` for the
+full module, including :func:`ajisai.plotting.plot_from_workdir` to
+re-plot a finished run without CASA.
+
+.. autofunction:: ajisai.plot_selfcal_summary
+   :no-index:
+
 .. autofunction:: ajisai.plot_refant_selection
+   :no-index:
+
+.. autofunction:: ajisai.plot_selfcal_images
+   :no-index:
+
+.. autofunction:: ajisai.plot_from_workdir
+   :no-index:
 
 
 Coordinate frame utility
@@ -83,6 +106,6 @@ methods, calling pipeline steps individually, etc.).
    :show-inheritance:
    :private-members: False
    :exclude-members: AJISAI, AJISAIConfig, ImagingConfig, GainCalConfig,
-                     SelfcalStep, SelfcalSchedule, load_fits_image,
+                     SelfcalStep, SelfcalSchedule, PlotConfig, load_fits_image,
                      compute_rms, compute_image_stats, select_refant,
                      plot_refant_selection, relabel_J2000_to_ICRS

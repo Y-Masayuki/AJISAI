@@ -9,6 +9,7 @@ This section is generated automatically from the docstrings in the
    :maxdepth: 2
 
    ajisai
+   plotting
    ms_utils
 
 
@@ -17,4 +18,5 @@ Module index
 
 * :mod:`ajisai`
 * :mod:`ajisai.core`
+* :mod:`ajisai.plotting`
 * :mod:`ajisai.ms_utils`

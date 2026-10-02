@@ -70,6 +70,14 @@ without any anomalies.
 | RMS  [uJy/beam]  | 4115.18              | 1443.90       | **2.85x down**            |
 | Beam [mas]       | 482.8                | 480.1         | essentially unchanged     |
 
+`selfcal_images.png` shows the CLEAN image of every round side by side on a
+shared colour scale (top row linear, bottom row with a gamma = 0.3 stretch
+that brings up the noise pattern); the best round is framed:
+
+<p align="center">
+  <img src="docs/_static/selfcal_images.png" alt="TW Hya self-cal images, one panel per round" width="900"/>
+</p>
+
 AJISAI's hybrid reference-antenna selection chose `DA42`, the antenna
 closest to the XY geometric center of the array among the 19 antennas
 (out of 26) that passed the flag-fraction threshold (<25%):
@@ -105,6 +113,7 @@ ajisai_<projname>/
   ajisai_refant_selection.png   # which antenna was chosen, and why
   metrics.csv                    # per-iteration peak / RMS / SNR / DR / beam
   selfcal_summary.png            # 4-panel diagnostic plot
+  selfcal_images.png             # CLEAN image of every iteration, side by side
   justification.json             # structured rationale for every decision
   final.image / final.fits       # the best CLEAN image
   intermediate/                  # all intermediate MS files and images
