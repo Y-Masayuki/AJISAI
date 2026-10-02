@@ -59,7 +59,7 @@ casa = [
     # Modular CASA (alternative to monolithic CASA distribution).
     # Once AJISAI is published to PyPI, this extra can be installed via
     # 'pip install ajisai[casa]'. For now, install from GitHub:
-    # 'pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.2.1#egg=ajisai[casa]"'
+    # 'pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main#egg=ajisai[casa]"'
     "casatools>=6.5",
     "casatasks>=6.5",
 ]

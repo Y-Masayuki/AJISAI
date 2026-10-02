@@ -25,24 +25,20 @@ details.
 
 ## Install from GitHub (current method)
 
-Install the latest released tag directly with `pip`, which fetches the
-package from the GitHub repository:
-
-```bash
-pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.2.1"
-```
-
-Or to track the `main` branch (latest development snapshot):
+Install the latest version directly with `pip`, which fetches the package
+from the `main` branch of the GitHub repository:
 
 ```bash
 pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main"
 ```
 
+Run the same command again to update to the latest version.
+
 If you are using a monolithic CASA distribution, you may need to point at
 its internal `pip`:
 
 ```bash
-/path/to/casa/lib/py/bin/pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.2.1"
+/path/to/casa/lib/py/bin/pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main"
 ```
 
 After installation, verify that AJISAI imports cleanly from inside CASA:

@@ -17,6 +17,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `rms_method="annulus"`. The pipeline passes it to `compute_rms` for every
   image, and it is recorded in the `rms_info` of `justification.json`.
 
+### Changed
+
+- The install instructions (README, documentation) give a single command
+  that installs the latest version from the `main` branch; the per-release
+  tag is no longer quoted.
+
 ### Fixed
 
 - `rms_method="annulus"` could not be used from `AJISAIConfig`: the pipeline
