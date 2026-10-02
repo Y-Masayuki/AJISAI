@@ -49,6 +49,7 @@ from .core import (
     GainCalConfig,
     SelfcalStep,
     SelfcalSchedule,
+    PlotConfig,
     # MS helpers that the orchestrator uses internally
     list_target_fields,
     # Image / RMS helpers
@@ -57,10 +58,17 @@ from .core import (
     compute_image_stats,
     # Refant selection
     select_refant,
-    plot_refant_selection,
     # Coordinate frame utility
     relabel_J2000_to_ICRS,
 )
+# Diagnostic figures (CASA-independent; see ajisai.plotting).
+from .plotting import (
+    plot_refant_selection,
+    plot_selfcal_summary,
+    plot_selfcal_images,
+    plot_from_workdir,
+)
+
 # Helpers re-exported directly from ms_utils for advanced use.
 from .ms_utils import (
     get_array_info,
@@ -84,6 +92,7 @@ __all__ = [
     "GainCalConfig",
     "SelfcalStep",
     "SelfcalSchedule",
+    "PlotConfig",
     "list_target_fields",
     "get_array_info",
     "get_on_source_time",
@@ -100,6 +109,9 @@ __all__ = [
     "compute_image_stats",
     "select_refant",
     "plot_refant_selection",
+    "plot_selfcal_summary",
+    "plot_selfcal_images",
+    "plot_from_workdir",
     "relabel_J2000_to_ICRS",
     "__version__",
 ]

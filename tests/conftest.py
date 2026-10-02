@@ -16,8 +16,12 @@ Fixtures here are CASA-free helpers used by the unit tests.
 """
 from __future__ import annotations
 
+import matplotlib
 
-import numpy as np
+# Figures are only written to files in the tests; never open a window.
+matplotlib.use("Agg")
+
+import numpy as np  # noqa: E402
 import pytest
 from astropy.io import fits
 
