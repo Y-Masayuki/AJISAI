@@ -106,8 +106,10 @@ cfg = AJISAIConfig(
     refant_manual=None,
     refant_flag_threshold=0.25,     # antennas with a larger flagged fraction are excluded
     # Off-source RMS: "sigma_clip_excl" (default) | "sigma_clip" | "mad"
+    #                 | "annulus" (legacy; requires rms_target_radius_arcsec)
     rms_method="sigma_clip_excl",
     rms_exclude_beam_factor=5.0,    # sigma_clip_excl: exclude a central circle of N x beam
+    rms_target_radius_arcsec=None,  # annulus: inner radius in arcsec (must enclose the source)
     rms_sigma=3.0,
     rms_maxiters=5,
     # Best image: "dynamic_range" (default) | "peak_snr"
