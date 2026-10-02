@@ -48,7 +48,7 @@ Per-iteration metrics in CSV form. Columns:
 | `calmode`             | `"p"` or `"a"` (or `"-"` for iteration 0)          |
 | `solint`              | actual solint string used (`"6*IT"` resolved)     |
 | `peak_jy_beam`        | image peak in Jy/beam                              |
-| `rms_jy_beam`         | off-source RMS (method per `cfg.rms_method`)      |
+| `rms_jy_beam`         | off-source RMS (method per `cfg.rms_method`; parameters in `rms_info`, see below) |
 | `snr`                 | peak / rms                                         |
 | `dynamic_range`       | also peak / rms (same numerator/denominator)      |
 | `bmaj_arcsec` / `bmin_arcsec` | synthesized beam axes                     |
@@ -159,7 +159,10 @@ decision AJISAI made. Top-level keys:
 
 `iterations`
 :   List of per-iteration records (same as `metrics.csv` rows, but with
-    nested `rms_info` dicts that describe how RMS was computed).
+    nested `rms_info` dicts that describe how RMS was computed: the
+    method, its parameters, such as the exclusion radius of
+    `sigma_clip_excl` or the inner radius `rms_target_radius_arcsec` and
+    the outer radius of `annulus`, and the number of pixels used).
 
 `best`
 :   `{"iteration": int, "metric_key": "dynamic_range", "value": float,

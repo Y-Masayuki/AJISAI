@@ -93,8 +93,19 @@ you are most likely to want to override.
     dynamic range. The default sigma-clipping with center exclusion has
     been validated to agree with the legacy annulus method to within 1%
     and requires no user-supplied source radius. Alternatives are
-    `"sigma_clip"`, `"annulus"` (legacy; requires target_radius), and
-    `"mad"`.
+    `"sigma_clip"`, `"annulus"` (legacy; requires
+    `rms_target_radius_arcsec`, see below), and `"mad"`.
+
+`rms_target_radius_arcsec: Optional[float] = None`
+:   Inner radius, in arcsec, of the off-source annulus used by
+    `rms_method="annulus"`: the RMS is the standard deviation of the
+    pixels farther than this from the phase center and within 0.4 × the
+    image width. Choose it to enclose the source emission; it is the
+    `target_radius` of the legacy AJISAI script. Required, and must be
+    positive, when `rms_method="annulus"`: `run()` raises a `ValueError`
+    during input validation otherwise, before any imaging is done. For
+    the other methods the value is ignored (with a warning). The radius
+    is recorded in `justification.json` with the RMS of every image.
 
 `quality_metric: str = "dynamic_range"`
 :   How AJISAI picks the best iteration at the end. Default is

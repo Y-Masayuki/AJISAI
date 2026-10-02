@@ -227,6 +227,10 @@ class AJISAIConfig:
     refant_flag_threshold: float = 0.25    # fraction; antennas with > this are excluded
     rms_method: str = "sigma_clip_excl"    # "sigma_clip_excl"|"sigma_clip"|"annulus"|"mad"
     rms_exclude_beam_factor: float = 5.0   # for sigma_clip_excl: radius = N*beam
+    # For rms_method="annulus" (legacy): inner radius of the off-source annulus
+    # in arcsec (the target_radius of the legacy AJISAI script). Required, and
+    # must be positive, when rms_method="annulus"; ignored otherwise.
+    rms_target_radius_arcsec: Optional[float] = None
     rms_sigma: float = 3.0
     rms_maxiters: int = 5
     quality_metric: str = "dynamic_range"  # "dynamic_range"|"peak_snr"
@@ -331,7 +335,8 @@ def compute_rms(
           regions.
         - ``"sigma_clip"``: sigma-clipping over the entire image.
         - ``"annulus"``: legacy AJISAI method; requires
-          ``target_radius_arcsec``.
+          ``target_radius_arcsec`` (in the pipeline, set
+          ``AJISAIConfig.rms_target_radius_arcsec``).
         - ``"mad"``: median absolute deviation based std.
 
     Returns
@@ -911,6 +916,7 @@ Infrastructure
             exclude_factor=self.cfg.rms_exclude_beam_factor,
             sigma=self.cfg.rms_sigma,
             maxiters=self.cfg.rms_maxiters,
+            target_radius_arcsec=self.cfg.rms_target_radius_arcsec,
         )
 
     def select_best_iteration(self) -> int:
@@ -943,10 +949,26 @@ Infrastructure
             raise FileNotFoundError(f"vis not found: {cfg.vis}")
         if cfg.refant_strategy == "manual" and cfg.refant_manual is None:
             raise ValueError("refant_strategy='manual' requires refant_manual to be set")
+        # rms_method validation
         if cfg.rms_method == "annulus":
+            radius = cfg.rms_target_radius_arcsec
+            if radius is None:
+                raise ValueError(
+                    "rms_method='annulus' requires rms_target_radius_arcsec (inner "
+                    "radius of the off-source annulus, in arcsec) to be set"
+                )
+            if not radius > 0:
+                raise ValueError(
+                    f"rms_target_radius_arcsec must be positive; got {radius!r}"
+                )
             warnings.warn(
-                "rms_method='annulus' is the legacy method and requires a target_radius; "
-                "consider switching to 'sigma_clip_excl' (the validated default)."
+                "rms_method='annulus' is the legacy method; consider switching to "
+                "'sigma_clip_excl' (the validated default, which needs no target radius)."
+            )
+        elif cfg.rms_target_radius_arcsec is not None:
+            warnings.warn(
+                f"rms_target_radius_arcsec is set but rms_method={cfg.rms_method!r}; "
+                "the radius is only used by rms_method='annulus' and will be ignored."
             )
         # mask_mode validation
         valid_modes = ("auto-multithresh", "interactive", "user", "none")
