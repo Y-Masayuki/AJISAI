@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-02
+
 ### Added
 
 - `selfcal_images.png`: the CLEAN image of every self-calibration round in
@@ -20,6 +22,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ajisai.plotting` module holding the figure code, and
   `plot_from_workdir(workdir, ...)` to regenerate the three PNGs from an
   existing output directory without CASA, e.g. with a different `gamma`.
+- JOSS paper draft under `paper/` (`paper.md`, `paper.bib`) and a workflow
+  that compiles it with the Open Journals toolchain on every change
+  (`.github/workflows/draft-pdf.yml`).
 
 ### Changed
 
@@ -192,6 +197,7 @@ Initial public release.
 - `imdata` runtime dependency. FITS image loading is implemented
   directly on top of astropy.
 
-[Unreleased]: https://github.com/Y-Masayuki/AJISAI/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Y-Masayuki/AJISAI/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Y-Masayuki/AJISAI/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Y-Masayuki/AJISAI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Y-Masayuki/AJISAI/releases/tag/v0.1.0
