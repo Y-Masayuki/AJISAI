@@ -71,6 +71,12 @@ except ImportError:  # pragma: no cover
     _HAS_CASA = False
 
 # AJISAI MS query helpers (native casatools-based replacement for analysisUtils).
+from .plotting import (
+    panels_from_metrics,
+    plot_refant_selection,
+    plot_selfcal_images,
+    plot_selfcal_summary,
+)
 from .ms_utils import (
     get_on_source_time,
     get_median_frequency,
@@ -164,6 +170,22 @@ class SelfcalSchedule:
 
 
 @dataclass(frozen=True)
+class PlotConfig:
+    """Options for the diagnostic figures written at the end of ``run()``.
+
+    The fields prefixed ``images_`` control ``selfcal_images.png``, the
+    gallery of the CLEAN image of every self-cal iteration. The summary and
+    reference-antenna figures have no options.
+    """
+    images_cmap: str = "inferno"
+    images_gamma: float = 1.0                    # top row: power-law stretch (1 = linear)
+    images_gamma2: Optional[float] = 0.3         # second row; None draws one row only
+    images_fov_beam_factor: float = 10.0         # half-width of the field shown = N * beam
+    images_fov_radius_arcsec: Optional[float] = None  # overrides images_fov_beam_factor
+    images_center: str = "phase"                 # "phase" (phase center) | "peak" (brightest pixel)
+
+
+@dataclass(frozen=True)
 class AJISAIConfig:
     """
     Top-level user-facing configuration.
@@ -183,6 +205,7 @@ class AJISAIConfig:
     imaging: ImagingConfig = _dc_field(default_factory=ImagingConfig)
     gaincal: GainCalConfig = _dc_field(default_factory=GainCalConfig)
     schedule: SelfcalSchedule = _dc_field(default_factory=SelfcalSchedule)
+    plots: PlotConfig = _dc_field(default_factory=PlotConfig)
 
     # === Phase shift ===
     # Off by default. When enabled, AJISAI shifts the MS so that the target
@@ -752,84 +775,6 @@ def select_refant(
     }
 
 
-def plot_refant_selection(
-    refant_info: Dict[str, Any],
-    outpath: str,
-    title: Optional[str] = None,
-) -> None:
-    """
-    Plot A: single scatter plot showing refant selection rationale.
-
-    - Antennas plotted at their XY positions (units = meters from array origin).
-    - Color = flagged fraction (viridis colormap, 0 to 1).
-    - Antennas above the flag threshold are crossed out with red 'x'.
-    - Selected refant is circled in green.
-    - Geometric center is marked with a black cross.
-    - Antenna names are annotated.
-
-    Intended as a justification artifact: one PNG that visually defends the
-    refant choice. Use as supplementary material in publications.
-    """
-    info = refant_info
-    fig, ax = plt.subplots(figsize=(9, 9))
-
-    xs = np.array(info["antenna_x"])
-    ys = np.array(info["antenna_y"])
-    flags = np.array(info["antenna_flag_frac"])
-    names = info["antenna_names"]
-    cx, cy = info["center_xy"]
-    idx = info["chosen_index"]
-    threshold = info["flag_threshold"]
-
-    # Scatter: color by flag fraction
-    sc = ax.scatter(
-        xs - cx, ys - cy, c=flags, cmap="viridis",
-        s=120, edgecolors="black", linewidth=0.5,
-        vmin=0.0, vmax=max(0.5, float(flags.max())),
-    )
-    plt.colorbar(sc, ax=ax, label="flagged fraction", shrink=0.7)
-
-    # Mark excluded antennas (above threshold)
-    excluded = flags >= threshold
-    if excluded.any():
-        ax.scatter(
-            (xs - cx)[excluded], (ys - cy)[excluded],
-            marker="x", s=180, c="red", linewidth=2.5,
-            label=f"excluded (flag ≥ {threshold:.2f})",
-        )
-
-    # Circle the chosen refant
-    ax.scatter(
-        xs[idx] - cx, ys[idx] - cy,
-        s=380, facecolors="none", edgecolors="lime", linewidth=3,
-        label=f"refant = {info['refant']}",
-    )
-
-    # Mark geometric center
-    ax.plot(0, 0, "k+", markersize=18, markeredgewidth=2, label="XY geometric center")
-
-    # Annotate antenna names
-    for x, y, n in zip(xs, ys, names):
-        ax.annotate(str(n), (x - cx, y - cy), fontsize=7,
-                    xytext=(4, 4), textcoords="offset points")
-
-    # Cosmetics
-    ax.set_aspect("equal")
-    ax.grid(True, ls=":", alpha=0.5)
-    ax.set_xlabel("X offset from array center [m]")
-    ax.set_ylabel("Y offset from array center [m]")
-    ttl = title or (
-        f"AJISAI refant selection (strategy={info['strategy']}) → {info['refant']}\n"
-        f"{info['reason']}"
-    )
-    ax.set_title(ttl, fontsize=10)
-    ax.legend(loc="lower right", fontsize=9)
-
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-
-
 # ============================================================================
 # Main class
 # ============================================================================
@@ -1024,6 +969,15 @@ Infrastructure
                 "imaging.mask_mode='user' requires imaging.user_mask to be set "
                 "to the path of a pre-made mask file"
             )
+        # plot options
+        if cfg.plots.images_center not in ("phase", "peak"):
+            raise ValueError(
+                f"plots.images_center must be 'phase' or 'peak'; got {cfg.plots.images_center!r}"
+            )
+        for name in ("images_gamma", "images_gamma2"):
+            val = getattr(cfg.plots, name)
+            if val is not None and not val > 0:
+                raise ValueError(f"plots.{name} must be positive; got {val!r}")
         # phase_center validation
         if cfg.phase_center is not None:
             if not isinstance(cfg.phase_center, tuple) or len(cfg.phase_center) != 3:
@@ -2101,7 +2055,7 @@ Infrastructure
                   f"{metric_key} = {self.best_metric_value}")
 
     def _write_summary(self) -> None:
-        """Write metrics CSV, 4-panel summary PNG, and copy best image to top of workdir."""
+        """Write metrics CSV, summary and gallery PNGs, and copy best image to top of workdir."""
         if not self.metrics or self.workdir is None:
             return
 
@@ -2130,66 +2084,44 @@ Infrastructure
             except Exception as e:
                 warnings.warn(f"Could not copy best image: {e}")
 
+        # --- gallery of the CLEAN image of every iteration ---
+        try:
+            self._plot_images(df)
+        except Exception as e:  # a plotting problem must not fail the run
+            warnings.warn(f"Could not write selfcal_images.png: {e}")
+
     def _plot_summary(self, df: pd.DataFrame) -> None:
-        """4-panel plot: DR / peak / RMS / beam over iterations."""
+        """4-panel plot: DR / peak / RMS / beam over iterations (selfcal_summary.png)."""
         if self.workdir is None or df.empty:
             return
-        fig, axes = plt.subplots(4, 1, figsize=(8, 10), sharex=True)
-        x = df["iteration"].values
-        # Use status to color-code points
-        status = df["status"].values
-        color_map = {"ok": "steelblue", "anomaly": "orange", "skipped": "red"}
-        colors = [color_map.get(s, "gray") for s in status]
+        fig = plot_selfcal_summary(
+            df,
+            best_iteration=(self.justification.get("best") or {}).get("iteration"),
+            projname=self._derived.get("projname", "AJISAI"),
+            outpath=self.workdir / "selfcal_summary.png",
+        )
+        plt.close(fig)
 
-        # DR
-        ax = axes[0]
-        ax.scatter(x, df["dynamic_range"], c=colors, s=80, zorder=3)
-        ax.plot(x, df["dynamic_range"], "-", color="gray", alpha=0.5)
-        ax.set_ylabel("Dynamic Range\n(peak / RMS_offsrc)")
-        ax.grid(True, ls=":", alpha=0.5)
-        if self.best_metric_value:
-            best_iter = self.justification["best"]["iteration"]
-            ax.axvline(best_iter, color="green", ls="--", alpha=0.5,
-                       label=f"best = iter {best_iter}")
-            ax.legend(loc="best", fontsize=8)
-
-        # Peak
-        ax = axes[1]
-        peak_mjy = df["peak_jy_beam"].astype(float) * 1e3
-        ax.scatter(x, peak_mjy, c=colors, s=80, zorder=3)
-        ax.plot(x, peak_mjy, "-", color="gray", alpha=0.5)
-        ax.set_ylabel("Peak [mJy/beam]")
-        ax.grid(True, ls=":", alpha=0.5)
-
-        # RMS
-        ax = axes[2]
-        rms_ujy = df["rms_jy_beam"].astype(float) * 1e6
-        ax.scatter(x, rms_ujy, c=colors, s=80, zorder=3)
-        ax.plot(x, rms_ujy, "-", color="gray", alpha=0.5)
-        ax.set_ylabel("RMS [μJy/beam]")
-        ax.grid(True, ls=":", alpha=0.5)
-
-        # Beam (geometric mean)
-        ax = axes[3]
-        bmaj = df["bmaj_arcsec"].astype(float)
-        bmin = df["bmin_arcsec"].astype(float)
-        beam_mas = np.sqrt(bmaj * bmin) * 1e3
-        ax.scatter(x, beam_mas, c=colors, s=80, zorder=3)
-        ax.plot(x, beam_mas, "-", color="gray", alpha=0.5)
-        ax.set_ylabel("Beam (sqrt(bmaj×bmin)) [mas]")
-        ax.set_xlabel("Iteration")
-        ax.grid(True, ls=":", alpha=0.5)
-
-        # Legend for status colors
-        from matplotlib.patches import Patch
-        handles = [Patch(color=c, label=s) for s, c in color_map.items()]
-        axes[0].legend(handles=handles + axes[0].get_legend_handles_labels()[0],
-                       loc="best", fontsize=8)
-
-        projname = self._derived.get("projname", "AJISAI")
-        fig.suptitle(f"AJISAI self-calibration summary: {projname}", fontsize=12)
-        fig.tight_layout()
-        plt.savefig(self.workdir / "selfcal_summary.png", dpi=120, bbox_inches="tight")
+    def _plot_images(self, df: pd.DataFrame) -> None:
+        """Gallery of the CLEAN image of every iteration (selfcal_images.png)."""
+        if self.workdir is None or df.empty:
+            return
+        panels = panels_from_metrics(df)
+        if not any(p["fits"] is not None for p in panels):
+            return
+        opts = self.cfg.plots
+        fig = plot_selfcal_images(
+            panels,
+            fov_radius_arcsec=opts.images_fov_radius_arcsec,
+            fov_beam_factor=opts.images_fov_beam_factor,
+            cmap=opts.images_cmap,
+            gamma=opts.images_gamma,
+            gamma2=opts.images_gamma2,
+            center=opts.images_center,
+            best_iteration=(self.justification.get("best") or {}).get("iteration"),
+            projname=self._derived.get("projname", "AJISAI"),
+            outpath=self.workdir / "selfcal_images.png",
+        )
         plt.close(fig)
 
     def _write_justification_json(self) -> None:

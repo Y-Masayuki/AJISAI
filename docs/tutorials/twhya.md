@@ -144,6 +144,7 @@ ajisai_TWHya_demo/
 ├── ajisai_refant_selection.png    ← which antenna AJISAI chose
 ├── metrics.csv                     ← one row per iteration
 ├── selfcal_summary.png             ← 4-panel diagnostic plot
+├── selfcal_images.png              ← CLEAN image of every iteration, side by side
 ├── justification.json              ← every parameter choice + reason
 ├── final.image  / final.fits       ← the best image AJISAI produced
 ├── intermediate/                   ← all intermediate MS and image products
@@ -151,14 +152,27 @@ ajisai_TWHya_demo/
 ```
 
 Open `selfcal_summary.png` first: it shows how dynamic range, peak, RMS,
-and beam evolved across iterations. You should see DR climbing through the
-three phase iterations and a further bump from the amplitude iteration.
+and beam evolved across iterations, with one tick per round labelled with
+what the round did. You should see DR climbing through the three phase
+iterations and a further bump from the amplitude iteration.
 
 The reference run produced the following result on the TW Hya Band 7 demo:
 
 ```{image} ../_static/selfcal_summary.png
 :alt: TW Hya self-cal summary
 :width: 600px
+:align: center
+```
+
+`selfcal_images.png` shows the CLEAN image of every round side by side on
+a shared colour scale (top row linear, bottom row with a `gamma = 0.3`
+stretch that brings up the noise pattern). The sidelobe structure visible
+around TW Hya before self-calibration disappears after the first phase
+round, and the `best` panel (the amplitude round) is framed:
+
+```{image} ../_static/selfcal_images.png
+:alt: TW Hya self-cal images, one panel per round
+:width: 100%
 :align: center
 ```
 
@@ -190,7 +204,7 @@ capture.
 The reference-antenna selection picked `DA42`, the antenna closest to the
 XY geometric center of the array among the 19 antennas (out of 26) that
 passed the flag-fraction threshold (<25%). The seven excluded antennas
-are marked with red `x`:
+are crossed out in grey:
 
 ```{image} ../_static/ajisai_refant_selection.png
 :alt: TW Hya reference antenna selection

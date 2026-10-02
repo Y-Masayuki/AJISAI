@@ -2,18 +2,20 @@
 
 AJISAI's behavior is controlled by a hierarchy of frozen dataclasses. The
 top-level container is [`AJISAIConfig`](#ajisaiconfig), which composes
-sub-configs for imaging, gain calibration, and the self-cal schedule.
+sub-configs for imaging, gain calibration, the self-cal schedule, and the
+diagnostic figures.
 
 Pattern:
 
 ```python
-from ajisai import AJISAI, AJISAIConfig, ImagingConfig, GainCalConfig, SelfcalSchedule, SelfcalStep
+from ajisai import AJISAI, AJISAIConfig, ImagingConfig, GainCalConfig, SelfcalSchedule, SelfcalStep, PlotConfig
 
 cfg = AJISAIConfig(
     vis     = "...",
     imaging = ImagingConfig(...),     # optional, default is fine
     gaincal = GainCalConfig(...),     # optional
     schedule= SelfcalSchedule(...),   # optional
+    plots   = PlotConfig(...),        # optional (figure options)
 )
 AJISAI(cfg).run()
 ```
@@ -276,3 +278,40 @@ custom_schedule = SelfcalSchedule(steps=(
 
 cfg = AJISAIConfig(vis="...", schedule=custom_schedule)
 ```
+
+## `PlotConfig`
+
+Options for the diagnostic figures written at the end of `run()`. Only the
+image gallery (`selfcal_images.png`, see [Output artifacts](outputs.md))
+has options; the summary and reference-antenna figures do not.
+
+`images_cmap: str = "inferno"`
+:   Matplotlib colour map of the gallery.
+
+`images_gamma: float = 1.0`
+:   Power-law stretch of the top row (`1` = linear; values below 1 bring
+    up faint emission).
+
+`images_gamma2: Optional[float] = 0.3`
+:   Stretch of a second row drawn below the first, with its own colour
+    bar. `None` draws the top row only.
+
+`images_fov_beam_factor: float = 10.0`
+:   Half-width of the field shown, in units of the geometric-mean beam.
+
+`images_fov_radius_arcsec: Optional[float] = None`
+:   Half-width of the field shown in arcsec; overrides
+    `images_fov_beam_factor` when set.
+
+`images_center: str = "phase"`
+:   `"phase"` centres the panels on the phase center (the reference
+    pixel); `"peak"` on the brightest pixel of the last image.
+
+```python
+from ajisai import AJISAIConfig, PlotConfig
+
+cfg = AJISAIConfig(vis="...", plots=PlotConfig(images_gamma2=0.5, images_fov_beam_factor=15))
+```
+
+A finished run can be re-plotted with other options, without CASA, using
+`ajisai.plot_from_workdir("ajisai_<projname>", gamma2=0.5, fov_beam_factor=15)`.
