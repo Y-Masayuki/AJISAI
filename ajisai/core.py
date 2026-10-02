@@ -91,7 +91,7 @@ _HAS_MS_UTILS = True
 
 # Version is defined in ajisai/__init__.py. This local copy is used for
 # the justification log and for the standalone __main__ smoke test.
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # ============================================================================
