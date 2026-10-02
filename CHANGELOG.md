@@ -12,6 +12,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default value and the allowed alternatives in the comments. Running it
   unchanged (after setting `vis`) is equivalent to the defaults. Shown on
   the configuration page of the documentation and linked from the README.
+- `AJISAIConfig.rms_target_radius_arcsec` (default `None`): inner radius,
+  in arcsec, of the off-source annulus for the legacy
+  `rms_method="annulus"`. The pipeline passes it to `compute_rms` for every
+  image, and it is recorded in the `rms_info` of `justification.json`.
+
+### Fixed
+
+- `rms_method="annulus"` could not be used from `AJISAIConfig`: the pipeline
+  never passed a target radius to `compute_rms`, so `_validate_inputs` only
+  warned and the run then failed with `ValueError` at the dirty-image
+  statistics, after `tclean` had already run. Input validation now raises
+  `ValueError` before any imaging when `rms_method="annulus"` is used
+  without a positive `rms_target_radius_arcsec`, and warns when the radius
+  is set for a method that does not use it.
 
 ## [0.2.1] - 2026-10-02
 

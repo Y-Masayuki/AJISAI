@@ -44,6 +44,7 @@ def test_default_config_smoke(existing_vis):
     assert cfg.refant_strategy == "hybrid"
     assert cfg.refant_flag_threshold == 0.25
     assert cfg.rms_method == "sigma_clip_excl"
+    assert cfg.rms_target_radius_arcsec is None
     assert cfg.quality_metric == "dynamic_range"
     assert cfg.on_iter_anomaly == "log_only"
     assert cfg.verbose is True
@@ -208,12 +209,52 @@ def test_mask_mode_interactive_warns(existing_vis):
 # ---------------------------------------------------------------------------
 def test_rms_method_annulus_warns(existing_vis):
     """The legacy annulus method emits a deprecation-style warning."""
-    cfg = AJISAIConfig(vis=existing_vis, rms_method="annulus")
+    cfg = AJISAIConfig(vis=existing_vis, rms_method="annulus", rms_target_radius_arcsec=1.0)
     aj = AJISAI(cfg)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         aj._validate_inputs()
     assert any("annulus" in str(x.message) and "legacy" in str(x.message) for x in w)
+
+
+def test_rms_method_annulus_requires_target_radius(existing_vis):
+    """rms_method='annulus' without rms_target_radius_arcsec is rejected before imaging."""
+    cfg = AJISAIConfig(vis=existing_vis, rms_method="annulus")
+    with pytest.raises(ValueError, match="rms_target_radius_arcsec"):
+        AJISAI(cfg)._validate_inputs()
+
+
+@pytest.mark.parametrize("radius", [0.0, -1.0])
+def test_rms_target_radius_must_be_positive(existing_vis, radius):
+    cfg = AJISAIConfig(vis=existing_vis, rms_method="annulus", rms_target_radius_arcsec=radius)
+    with pytest.raises(ValueError, match="must be positive"):
+        AJISAI(cfg)._validate_inputs()
+
+
+def test_rms_target_radius_without_annulus_warns(existing_vis):
+    """A radius given for a method that does not use it is reported, not silently ignored."""
+    cfg = AJISAIConfig(vis=existing_vis, rms_target_radius_arcsec=1.0)
+    aj = AJISAI(cfg)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        aj._validate_inputs()
+    assert any("rms_target_radius_arcsec is set but" in str(x.message) for x in w)
+
+
+def test_pipeline_passes_target_radius_to_compute_rms(existing_vis, synthetic_fits):
+    """Regression: the pipeline must forward rms_target_radius_arcsec to compute_rms.
+
+    Before the field existed, rms_method='annulus' passed validation (with a
+    warning) and then raised ValueError at the first image statistics.
+    """
+    cfg = AJISAIConfig(vis=existing_vis, rms_method="annulus", rms_target_radius_arcsec=1.0)
+    stats = AJISAI(cfg).compute_image_stats(synthetic_fits)
+    assert stats["rms_info"]["method"] == "annulus"
+    assert stats["rms_info"]["justification"]["target_radius_arcsec"] == 1.0
+    assert stats["rms_info"]["n_kept"] > 0
+    # The 1 arcsec inner radius excludes the central source, so the annulus
+    # recovers the 10 uJy/beam noise of the synthetic image.
+    assert stats["rms_jy_beam"] == pytest.approx(1e-5, rel=0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -237,3 +278,4 @@ def test_config_can_be_dumped_to_json(existing_vis, tmp_path):
         roundtrip = json.load(f)
     assert roundtrip["vis"] == existing_vis
     assert roundtrip["imaging"]["uvtaper"] == ["100klambda"]
+    assert roundtrip["rms_target_radius_arcsec"] is None
