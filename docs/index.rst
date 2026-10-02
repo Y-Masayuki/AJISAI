@@ -78,8 +78,45 @@ Indices and tables
 Citation
 --------
 
-If AJISAI helps your work, please cite (Yamaguchi et al., in prep.) and the
-software itself via the Zenodo DOI (to be assigned at the first GitHub release).
+If AJISAI helps your work, please cite both the paper describing the method
+and the specific version of the software you used.
+
+**Paper** (the self-calibration procedure is described in Appendix B):
+Yamaguchi, M., Machida, M. N., Tominaga, R. T., et al. 2026, ApJ, 1006, 232,
+`doi:10.3847/1538-4357/ae819b <https://doi.org/10.3847/1538-4357/ae819b>`_
+
+**Software** (v0.2.1):
+Yamaguchi, M. 2026, AJISAI: Automated Justification-based Imaging and
+Self-calibration for ALMA Infrastructure, v0.2.1, Zenodo,
+`doi:10.5281/zenodo.23094438 <https://doi.org/10.5281/zenodo.23094438>`_
+
+Each release has its own version DOI on Zenodo; cite the one matching the
+version you used. The concept DOI
+`10.5281/zenodo.23053992 <https://doi.org/10.5281/zenodo.23053992>`_ always
+resolves to the latest release. You can also use the "Cite this repository"
+button on GitHub, which reads ``CITATION.cff``.
+
+.. code-block:: bibtex
+
+   @article{yamaguchi2026v1094sco,
+     author  = {Yamaguchi, Masayuki and Machida, Masahiro N. and Tominaga, Ryosuke T. and Sai, Jinshi and Muto, Takayuki and Takami, Michihiro and Liu, Hauyu Baobab and Shoshi, Ayumu and Tsukagoshi, Takashi and Ishibashi, Shu},
+     title   = {A Hybrid Origin for the Multiple Ring-gap Structures in the Large Protoplanetary Disk V1094 Sco: A Low-mass Planet and Secular Gravitational Instability},
+     journal = {The Astrophysical Journal},
+     year    = {2026},
+     volume  = {1006},
+     pages   = {232},
+     doi     = {10.3847/1538-4357/ae819b}
+   }
+
+   @software{yamaguchi2026ajisai,
+     author    = {Yamaguchi, Masayuki},
+     title     = {{AJISAI}: Automated Justification-based Imaging and Self-calibration for {ALMA} Infrastructure},
+     version   = {v0.2.1},
+     publisher = {Zenodo},
+     year      = {2026},
+     doi       = {10.5281/zenodo.23094438},
+     url       = {https://doi.org/10.5281/zenodo.23094438}
+   }
 
 
 License
