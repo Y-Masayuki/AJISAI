@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `examples/full_config_template.py`: every configuration option with its
+  default value and the allowed alternatives in the comments. Running it
+  unchanged (after setting `vis`) is equivalent to the defaults. Shown on
+  the configuration page of the documentation and linked from the README.
 - `AJISAIConfig.rms_target_radius_arcsec` (default `None`): inner radius,
   in arcsec, of the off-source annulus for the legacy
   `rms_method="annulus"`. The pipeline passes it to `compute_rms` for every
