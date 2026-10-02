@@ -33,10 +33,6 @@ modular CASA installed via pip). The current install method is from GitHub
 source; a PyPI release is planned for a future version.
 
 ```bash
-# Install the v0.2.1 release directly from GitHub
-pip install "git+https://github.com/Y-Masayuki/AJISAI.git@v0.2.1"
-
-# Or for the latest development snapshot
 pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main"
 ```
 
