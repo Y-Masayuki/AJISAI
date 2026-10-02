@@ -24,6 +24,18 @@ For the complete auto-generated reference, see
 [API reference](api/index.rst). The page below highlights the parameters
 you are most likely to want to override.
 
+## Full configuration template
+
+The file below, [`examples/full_config_template.py`](https://github.com/Y-Masayuki/AJISAI/blob/main/examples/full_config_template.py)
+in the repository, lists every option with its default value and the allowed
+alternatives in the comments. Run as it is (after setting `vis`) it is
+equivalent to `AJISAI(AJISAIConfig(vis=...)).run()`; copy it and change only
+the lines you need.
+
+```{literalinclude} ../examples/full_config_template.py
+:language: python
+```
+
 ## `AJISAIConfig`
 
 ### Required

@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/full_config_template.py`: every configuration option with its
+  default value and the allowed alternatives in the comments. Running it
+  unchanged (after setting `vis`) is equivalent to the defaults. Shown on
+  the configuration page of the documentation and linked from the README.
+
 ## [0.2.1] - 2026-10-02
 
 ### Added

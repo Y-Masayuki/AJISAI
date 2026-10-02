@@ -140,8 +140,9 @@ for f in list_target_fields(vis):
 
 ## Advanced configuration
 
-`AJISAIConfig` exposes sub-configs for imaging, gain calibration, and the
-self-cal schedule. All have defaults; override only what you need.
+`AJISAIConfig` exposes sub-configs for imaging, gain calibration, the
+self-cal schedule, and the diagnostic figures. All have defaults; override
+only what you need. For example:
 
 ```python
 from ajisai import (
@@ -167,6 +168,13 @@ cfg = AJISAIConfig(
 )
 AJISAI(cfg).run()
 ```
+
+Every option, with its default value and the allowed alternatives, is listed
+in [`examples/full_config_template.py`](examples/full_config_template.py).
+Running it unchanged (after setting `vis`) is the same as the defaults; copy
+it and change only the lines you need. The
+[configuration reference](https://ajisai.readthedocs.io/en/latest/configuration.html)
+explains each parameter.
 
 ## Tools
 
