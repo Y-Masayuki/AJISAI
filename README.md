@@ -203,8 +203,8 @@ If AJISAI helps your work, please cite both the paper describing the method and 
 **Paper** (the self-calibration procedure is described in Appendix B):
 Yamaguchi, M., Machida, M. N., Tominaga, R. T., et al. 2026, ApJ, 1006, 232, [doi:10.3847/1538-4357/ae819b](https://doi.org/10.3847/1538-4357/ae819b)
 
-**Software** (v0.2.1):
-Yamaguchi, M. 2026, AJISAI: Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure, v0.2.1, Zenodo, [doi:10.5281/zenodo.23094438](https://doi.org/10.5281/zenodo.23094438)
+**Software**:
+Yamaguchi, M. 2026, AJISAI: Automated Justification-based Imaging and Self-calibration for ALMA Infrastructure, Zenodo, [doi:10.5281/zenodo.23094438](https://doi.org/10.5281/zenodo.23094438)
 
 Each release has its own version DOI on Zenodo; cite the one matching the version you used. The concept DOI [10.5281/zenodo.23053992](https://doi.org/10.5281/zenodo.23053992) always resolves to the latest release. You can also use the "Cite this repository" button on GitHub, which reads `CITATION.cff`.
 
