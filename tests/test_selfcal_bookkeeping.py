@@ -92,6 +92,8 @@ def _solve(**over):
 def test_solve_info_has_the_stable_keys_in_order():
     info = _solve()
     assert tuple(info) == SOLVE_INFO_KEYS
+    assert info["field"] == ""                       # all fields unless the caller names one
+    assert _solve(field="0")["field"] == "0"
     assert info["applycal"] == {"interp": "linearPDperobs", "applymode": "calonly",
                                 "calwt": False, "spwmap": []}
     assert info["model_image"] == ["c.model.tt0", "c.model.tt1"]

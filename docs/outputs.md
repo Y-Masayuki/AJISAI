@@ -227,12 +227,18 @@ decision AJISAI made. Top-level keys:
     `stage_ms` (`selfcal_<N>.ms`, DATA + MODEL), `image`, `image_base`,
     `nterms`, `model_image` (the model stored in the stage MS),
     `threshold_jy`, and for self-cal stages `solve`: the gain `table`,
-    `solint` and `solint_s`, `combine`, `refant`, `calmode`, `gaintype`,
+    `solint` and `solint_s`, `combine`, `refant`, `field` (the gaincal
+    field selection), `calmode`, `gaintype`,
     `minsnr`, `minblperant`, `solnorm`, `applycal` (`interp`, `applymode`,
     `calwt`, `spwmap`), `model_image` / `model_nterms` / `model_reffreq_hz`
     (the model the solve used), `solved_on`, `stage_ms`, `n_solutions`, and
     `flagged_solution_fraction` per observation and spw. The same list is
     `AJISAI.stages`; the keys of `solve` are `ajisai.SOLVE_INFO_KEYS`.
+    The model images named in `solve.model_image` (`intermediate/clean_iter0.*`,
+    `intermediate/clean_sc<k>.*`) are kept after the run: a caller can re-solve
+    a stage from this record (ASEBI re-solves the accepted stages with the line
+    channels flagged). AJISAI removes them only when the same stage is made
+    again.
     With `mode="data"`, `solve["solint"]` is the string given to gaincal and
     `solve["solint_s"]` the nominal `n x IT`. gaincal bins a scan on a fixed
     time grid from its first integration, so for `n` integrations the string

@@ -117,6 +117,8 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
   `rms_method="annulus"`. The pipeline passes it to `compute_rms` for every
   image, and it is recorded in the `rms_info` of `justification.json`.
 
+- `solve.field`: the gaincal field selection is recorded with each stage (`SOLVE_INFO_KEYS`), so a caller can re-solve the stage exactly; the per-stage model images are documented as kept after the run.
+
 ### Changed
 
 - **Default self-calibration is `SelfcalSchedule(mode="data")`.** The v0.2

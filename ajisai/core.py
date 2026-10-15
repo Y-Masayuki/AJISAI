@@ -917,7 +917,7 @@ def flagged_solution_fractions(obs_ids, spw_ids, flags) -> List[Dict[str, Any]]:
 # Keys of the per-stage solve record (AJISAI.stages[i]["solve"]); stable API
 # for callers that re-use the solutions (e.g. ASEBI's line re-solve).
 SOLVE_INFO_KEYS = (
-    "table", "solint", "solint_s", "combine", "refant", "calmode", "gaintype",
+    "table", "solint", "solint_s", "combine", "refant", "field", "calmode", "gaintype",
     "minsnr", "minblperant", "solnorm", "applycal", "model_image", "model_nterms",
     "model_reffreq_hz", "solved_on", "stage_ms", "n_solutions",
     "flagged_solution_fraction",
@@ -947,11 +947,13 @@ def build_solve_info(
     stage_ms: Optional[str],
     n_solutions: int,
     flagged_solution_fraction: List[Dict[str, Any]],
+    field: str = "",
 ) -> Dict[str, Any]:
     """Per-stage record of how the gain table was solved and applied.
 
     Enough to re-solve the same stage later (same solint, combine, refant,
-    model) and to re-apply the table elsewhere (interp, applymode, spwmap).
+    field, model) and to re-apply the table elsewhere (interp, applymode,
+    spwmap). ``field`` is the gaincal field selection ("" = all fields).
     """
     info = {
         "table": str(table),
@@ -959,6 +961,7 @@ def build_solve_info(
         "solint_s": solint_s,
         "combine": combine,
         "refant": refant,
+        "field": str(field),
         "calmode": calmode,
         "gaintype": gaintype,
         "minsnr": float(minsnr),
@@ -2794,6 +2797,7 @@ Infrastructure
             solint_s=solint_seconds(solint_str, self._derived.get("avg_int_time_sec")),
             combine=g.combine,
             refant=refant,
+            field=str(field_id),
             calmode=step.calmode,
             gaintype=g.gaintype,
             minsnr=g.minsnr,
@@ -3082,7 +3086,7 @@ Infrastructure
         solve = build_solve_info(
             table=str(caltable), solint=cand["gaincal_solint"],
             solint_s=None if cand["kind"] == "eb" else float(cand["T_s"]),
-            combine=combine, refant=refant, calmode="p", gaintype=g.gaintype, minsnr=g.minsnr,
+            combine=combine, refant=refant, field=str(field_id), calmode="p", gaintype=g.gaintype, minsnr=g.minsnr,
             minblperant=g.minblperant, solnorm=False, interp=g.applycal_interp,
             applymode=g.applymode, calwt=g.calwt, spwmap=spwmap or g.spwmap,
             model_image=model_info["model_image"], model_nterms=model_info["nterms"],
