@@ -3,7 +3,8 @@ End-to-end run of AJISAI on a tiny simulated MS (CASA required).
 
 Marked ``casa``: skipped automatically when casatools/casatasks are absent.
 Run with ``python -m pytest -m casa`` in a CASA Python (e.g. CASA 6.5.1).
-Checks the v0.3 data hygiene and products:
+Checks the v0.3 data hygiene and products (with a one-step ``mode="fixed"``
+schedule; the data-driven stages are tested in ``test_casa_solint.py``):
 
 * the input MS is byte-for-byte unchanged after the run;
 * each stage MS holds DATA + MODEL only (no CORRECTED), the final
@@ -53,7 +54,7 @@ def run(tmp_path_factory):
         vis=ms,
         results_dir=str(work / "out"),
         imaging=ImagingConfig(nterms=2, mask_mode="user", user_mask=str(crtf), niter=2000),
-        schedule=SelfcalSchedule(steps=(SelfcalStep("p", "inf", label="p_inf"),)),
+        schedule=SelfcalSchedule(mode="fixed", steps=(SelfcalStep("p", "inf", label="p_inf"),)),
         # Read the input directly (no relabelled copy), so that the dirty,
         # noise and initial images and the first copy all touch the input MS.
         relabel_j2000_to_icrs=False,

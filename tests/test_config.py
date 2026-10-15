@@ -45,8 +45,9 @@ def test_default_config_smoke(existing_vis):
     assert cfg.refant_flag_threshold == 0.25
     assert cfg.rms_method == "sigma_clip_excl"
     assert cfg.rms_target_radius_arcsec is None
-    assert cfg.quality_metric == "dynamic_range"
+    assert cfg.quality_metric == "dynamic_range"      # mode="fixed" only
     assert cfg.on_iter_anomaly == "log_only"
+    assert cfg.schedule.mode == "data"
     assert cfg.verbose is True
     assert cfg.show_banner is True
 
@@ -87,11 +88,19 @@ def test_default_data_hygiene_options(existing_vis):
     assert cfg.relabel_j2000_to_icrs is True
 
 
-def test_default_schedule_is_three_phase_one_amp():
-    """The locked-in design: 3 phase + 1 amp iterations."""
+def test_default_schedule_is_data_driven():
+    """v0.3: stages and solution intervals from the data (ASEBI SPEC v0.3 10.2)."""
     sched = SelfcalSchedule()
+    assert sched.mode == "data"
+    assert sched.amplitude == "never"
+
+
+def test_fixed_schedule_is_three_phase_one_amp():
+    """mode='fixed' keeps the v0.2 ladder: 3 phase + 1 amp iterations."""
+    sched = SelfcalSchedule(mode="fixed")
     assert len(sched.steps) == 4
     assert [s.calmode for s in sched.steps] == ["p", "p", "p", "a"]
+    assert [s.solint for s in sched.steps] == ["inf", "6*IT", "3*IT", "inf"]
     assert sched.steps[3].solnorm is True  # amp step must normalize
 
 
@@ -354,3 +363,21 @@ def test_config_can_be_dumped_to_json(existing_vis, tmp_path):
     assert roundtrip["vis"] == existing_vis
     assert roundtrip["imaging"]["uvtaper"] == ["100klambda"]
     assert roundtrip["rms_target_radius_arcsec"] is None
+
+
+def test_full_config_template_equals_the_defaults(monkeypatch):
+    """examples/full_config_template.py, run unchanged, is AJISAIConfig(vis=...)."""
+    from dataclasses import asdict
+    from pathlib import Path
+
+    seen = {}
+
+    def fake_run(self):
+        seen["cfg"] = self.cfg
+        return self
+    monkeypatch.setattr(AJISAI, "run", fake_run)
+    path = Path(__file__).resolve().parents[1] / "examples" / "full_config_template.py"
+    ns: dict = {}
+    exec(compile(path.read_text(), str(path), "exec"), ns)
+    cfg = seen["cfg"]
+    assert asdict(cfg) == asdict(AJISAIConfig(vis=cfg.vis))

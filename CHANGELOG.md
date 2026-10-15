@@ -7,13 +7,64 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Development version `0.3.0.dev0`. The changes below make AJISAI usable as the
-self-calibration engine of a larger pipeline (ASEBI) and fix data-hygiene
-issues; defaults stay usable for standalone runs, and the previous rules
-remain available as explicit options (`cell_rule="percentile"`,
+self-calibration engine of a larger pipeline (ASEBI), decide the phase
+self-calibration stages from the data, and fix data-hygiene issues; defaults
+stay usable for standalone runs, and the previous rules remain available as
+explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 `threshold_mode="image_rms"`, `final_depth=()`).
 
 ### Added
 
+- **Data-driven phase self-calibration (`SelfcalSchedule(mode="data")`, the
+  new default).** The stages and their solution intervals follow the ASEBI
+  specification v0.3 (section 10.2, appendices C.2-C.3), implemented in the
+  new pure-numpy module `ajisai.solint`:
+  - measured from DATA, MODEL_DATA, WEIGHT and FLAG (read once per stage,
+    no gain solution and no image): the noise scale `s` per spw from adjacent
+    integrations, the solution-SNR rate `r_i` of every antenna
+    (`SNR_i(T) = r_i sqrt(T)`), the phase structure function `D_eff(tau)`
+    from the model-weighted lag correlation (power-law fit), and the
+    interpolation geometry `kappa`;
+  - stage 1 is one solution per execution block, applied unless its
+    loss-corrected held-out change is below -2 sigma;
+  - later stages: candidate intervals (divisors of the median scan length in
+    integrations, with non-divisors where neighbours differ by more than a
+    factor 2, the scan, the EB), G1 (predicted true SNR >= 5 for the typical
+    solution; solutions below 5 are flagged in the gain table so those
+    antennas keep the previous stage with `applymode="calonly"`), the
+    predicted residual phase variance `V(T)` on the actual times with the
+    coefficients of gaincal's linear interpolation and the CASA loss table
+    (`-ln C`: SNR 2 -> 0.844, ..., 20 -> 0.0027), and G2: the predicted
+    best, its neighbours and the EB solved in numpy on the even (odd)
+    integrations of each scan and evaluated on the odd (even) ones (band
+    halves when scans have fewer than four integrations), with an antenna
+    delete-one paired jackknife; rule A (loss-corrected argmin) and rule B
+    (one candidate shorter than the held-out argmin), the longer when they
+    disagree;
+  - acceptance when the corrected held-out improvement exceeds
+    `max(1 sigma, 0.001)`, against the accepted stages re-solved on the
+    training half with their own models, with the conditional two-sided
+    correction; at most three phase stages; the run stops at the first stage
+    that is not accepted; gaincal runs only for the chosen interval, with
+    `solint = n x IT - IT/(4M)` (gaincal bins each scan on a fixed time grid
+    from its first integration; the small offset keeps the grid edges clear of
+    the integrations, so every chunk holds exactly `n`);
+  - the best stage is the last accepted one; peak, RMS and dynamic range are
+    diagnostics only;
+  - every measured quantity, candidate, gate, rule answer, decision and
+    reason is recorded in `justification.json["stages"][k]["selection"]`,
+    with a summary in `justification.json["selfcal"]`; stages that were
+    evaluated but not applied appear with `status: "rejected"`.
+  The amplitude stage of the specification is not included yet
+  (`SelfcalSchedule.amplitude` accepts only `"never"`).
+- `ajisai.selfcal_measurement(vis, results_dir=..., ...)`: the measurement
+  self-calibration of one execution block for a calling pipeline (ASEBI),
+  with the same rules and no amplitude stage; `AJISAI.selfcal_summary()`
+  returns the stage decisions, tables, stage MSs and the best stage's image
+  and model.
+- `ajisai.ms_utils.read_vis_summary`: one read-only pass over DATA,
+  MODEL_DATA, WEIGHT and FLAG reduced per row (`sum w V M*`, `sum w |M|^2`).
+- `ajisai.FIXED_SCHEDULE_STEPS`: the v0.2 ladder.
 - **Image geometry and Taylor terms from the caller.** `ImagingConfig` gains
   `cell`, `imsize`, `reffreq` and `scales`; when given they are used for
   every `tclean` of the run (dirty image, initial CLEAN, each iteration,
@@ -68,6 +119,16 @@ remain available as explicit options (`cell_rule="percentile"`,
 
 ### Changed
 
+- **Default self-calibration is `SelfcalSchedule(mode="data")`.** The v0.2
+  ladder (`inf -> 6*IT -> 3*IT -> amplitude inf`, best by dynamic range) is
+  `SelfcalSchedule(mode="fixed")`. Passing `steps` without `mode="fixed"`
+  raises `ValueError` instead of being silently ignored. `mode="data"`
+  requires `gaintype="T"`, `applymode="calonly"` and a linear
+  `applycal_interp` (the defaults); from `GainCalConfig.combine` it takes
+  only `"spw"` (and derives the applycal `spwmap` when none is given).
+- A failing `plotms` (e.g. no DISPLAY on a headless server) no longer fails
+  the run: the gain-table plots are skipped with a warning.
+- The summary figure draws stages that were not applied (`rejected`) in gray.
 - **The input MS is never written.** Previously the initial CLEAN saved its
   model into the input MS, the first iteration ran `applycal` on it (creating
   CORRECTED_DATA) and the J2000 -> ICRS relabelling edited it in place. Now

@@ -669,6 +669,98 @@ def get_uv_max(vis: str, field: Optional[str] = None) -> Dict[str, Any]:
     return best
 
 
+def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = False,
+                     chunk_samples: int = _CHUNK_SAMPLES):
+    """Read DATA, MODEL_DATA, WEIGHT and FLAG of a field once into an ``ajisai.solint.VisSummary``.
+
+    Spec (ASEBI v0.3): 10.2 item 14 (the held-out evaluation reads the four
+    columns once and solves in numpy), C.2.
+
+    Cross-correlations of the field only; per row the sums of
+    :func:`ajisai.solint.reduce_visibilities` over the parallel hands
+    (WEIGHT_SPECTRUM when the column holds values, else WEIGHT), the UV
+    distance (m) and, with ``band_halves=True``, the sums over the lower and
+    upper half of each spw's channels. Rows without any valid sample are
+    dropped. The table is opened read-only.
+    """
+    _require_casa()
+    from .solint import VisSummary, reduce_visibilities
+
+    fid = _field_id_for(vis, field)
+    dd_spw = _casa_column_reader(vis + "/DATA_DESCRIPTION", "SPECTRAL_WINDOW_ID")
+    dd_pol = _casa_column_reader(vis + "/DATA_DESCRIPTION", "POLARIZATION_ID")
+    names = [str(n) for n in _casa_column_reader(vis + "/ANTENNA", "NAME")]
+    tb = casatools.table()
+    tb.open(vis + "/POLARIZATION")
+    try:
+        corr = [np.asarray(tb.getcell("CORR_TYPE", i)).ravel() for i in range(tb.nrows())]
+    finally:
+        tb.close()
+    parts: Dict[str, List[np.ndarray]] = {k: [] for k in (
+        "time", "obs", "scan", "spw", "a1", "a2", "y", "P", "S", "uv", "yh", "Ph")}
+    tb.open(vis)
+    try:
+        cols = tb.colnames()
+        if "MODEL_DATA" not in cols:
+            raise RuntimeError(f"{vis} has no MODEL_DATA column; predict the model first")
+        has_ws = "WEIGHT_SPECTRUM" in cols
+        for dd in range(len(dd_spw)):
+            query = f"DATA_DESC_ID=={dd} && ANTENNA1!=ANTENNA2"
+            if fid is not None:
+                query += f" && FIELD_ID=={fid}"
+            sub = tb.query(query)
+            try:
+                nrow = sub.nrows()
+                if nrow == 0:
+                    continue
+                use_ws = has_ws and sub.iscelldefined("WEIGHT_SPECTRUM", 0)
+                npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
+                chunk = max(1, chunk_samples // max(1, npol * nchan))
+                ctypes = corr[int(dd_pol[dd])]
+                for start in range(0, nrow, chunk):
+                    nr = min(chunk, nrow - start)
+                    red = reduce_visibilities(
+                        sub.getcol("DATA", start, nr), sub.getcol("MODEL_DATA", start, nr),
+                        sub.getcol("FLAG", start, nr),
+                        sub.getcol("WEIGHT_SPECTRUM" if use_ws else "WEIGHT", start, nr),
+                        sub.getcol("FLAG_ROW", start, nr), ctypes,
+                        halves=band_halves and nchan >= 2)
+                    keep = red["n_valid"] > 0
+                    uvw = sub.getcol("UVW", start, nr)
+                    parts["time"].append(sub.getcol("TIME", start, nr)[keep])
+                    parts["obs"].append(sub.getcol("OBSERVATION_ID", start, nr)[keep])
+                    parts["scan"].append(sub.getcol("SCAN_NUMBER", start, nr)[keep])
+                    parts["spw"].append(np.full(int(keep.sum()), int(dd_spw[dd])))
+                    parts["a1"].append(sub.getcol("ANTENNA1", start, nr)[keep])
+                    parts["a2"].append(sub.getcol("ANTENNA2", start, nr)[keep])
+                    parts["y"].append(red["y"][keep])
+                    parts["P"].append(red["P"][keep])
+                    parts["S"].append(red["S"][keep])
+                    parts["uv"].append(np.hypot(uvw[0], uvw[1])[keep])
+                    if band_halves:
+                        if "y_half" not in red:
+                            raise RuntimeError(f"spw {int(dd_spw[dd])} of {vis} has one channel; "
+                                               f"the band cannot be split into halves")
+                        parts["yh"].append(red["y_half"][:, keep])
+                        parts["Ph"].append(red["P_half"][:, keep])
+            finally:
+                sub.close()
+    finally:
+        tb.close()
+    cat = {k: (np.concatenate(v, axis=-1) if v else np.zeros(0)) for k, v in parts.items()}
+    order = np.lexsort((cat["time"], cat["a2"], cat["a1"], cat["spw"], cat["obs"]))
+
+    def pick(x):
+        return x[..., order] if x.ndim == 2 else x[order]
+
+    return VisSummary(
+        time=cat["time"][order], obs=cat["obs"][order], scan=cat["scan"][order],
+        spw=cat["spw"][order], a1=cat["a1"][order], a2=cat["a2"][order], y=cat["y"][order],
+        P=cat["P"][order], antenna_names=names, S=cat["S"][order], uvdist_m=cat["uv"][order],
+        y_half=pick(cat["yh"]) if band_halves else None,
+        P_half=pick(cat["Ph"]) if band_halves else None, source=str(vis))
+
+
 def get_antenna_positions(vis: str) -> Dict[str, np.ndarray]:
     """Return ``{antenna_name: np.array([x, y, z])}`` from the ANTENNA table."""
     _require_casa()

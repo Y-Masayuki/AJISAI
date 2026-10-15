@@ -14,10 +14,11 @@ pipeline for ALMA continuum data. It is designed around three principles:
    recorded in a structured ``justification.json`` file with the rationale,
    so the run is auditable and the choices are reproducible in publications.
 
-3. **Deterministic.** A fixed self-calibration schedule (three phase
-   iterations plus one amplitude iteration by default) runs to completion;
-   the best image is selected by dynamic range at the end. There is no
-   adaptive rollback that would make the result depend on run order.
+3. **Deterministic and data-driven.** The phase self-calibration stages and
+   their solution intervals are decided from quantities measured in the data
+   and accepted only when they improve integrations the gains were not
+   solved from; the same data and config always give the same stages. The
+   v0.2 fixed schedule remains available as ``SelfcalSchedule(mode="fixed")``.
 
 .. note::
    AJISAI requires CASA at runtime (either a monolithic CASA distribution or
@@ -34,8 +35,8 @@ Minimal example
    cfg = AJISAIConfig(vis="/path/to/data.ms")
    aj = AJISAI(cfg).run()
 
-   print(aj.best_image)              # path to the best CLEAN image
-   print(aj.best_metric_value)       # achieved dynamic range
+   print(aj.best_image)              # CLEAN image of the last accepted stage
+   print(aj.best_metric_value)       # its dynamic range (a diagnostic)
    print(aj.justification)           # full structured rationale (also JSON on disk)
 
 

@@ -50,6 +50,12 @@ Main class and configuration
    :show-inheritance:
 
 
+Measurement self-calibration for a calling pipeline
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: ajisai.selfcal_measurement
+
+
 Image and RMS utilities
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -120,4 +126,5 @@ methods, calling pipeline steps individually, etc.).
                      SelfcalStep, SelfcalSchedule, PlotConfig, load_fits_image,
                      compute_rms, compute_image_stats, select_refant,
                      plot_refant_selection, relabel_J2000_to_ICRS,
-                     final_depth_decision, aperture_flux_terms
+                     final_depth_decision, aperture_flux_terms,
+                     selfcal_measurement

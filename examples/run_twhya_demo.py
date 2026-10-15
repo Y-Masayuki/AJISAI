@@ -15,8 +15,9 @@ What this script does (one command, from start to finish):
        (TW Hya, field='5') and averages 8 channels together. The output
        is ``twhya_continuum.ms``.
     4. Runs AJISAI on the prepared continuum MS with default settings
-       (3 phase + 1 amp self-cal iterations, dynamic-range best selection,
-       sigma-clip RMS, hybrid refant).
+       (data-driven phase self-cal: one solution per EB, then solution
+       intervals chosen from the data and accepted on held-out integrations;
+       the last accepted stage is the best; sigma-clip RMS, hybrid refant).
     5. Prints the paths to the resulting image, FITS, summary plot, and
        justification log.
 
@@ -210,8 +211,7 @@ def run_ajisai(cont_ms: str):
         #   phase_shift=False  (TW Hya is already at the phase center)
         #   rms_method='sigma_clip_excl'
         #   refant_strategy='hybrid'
-        #   quality_metric='dynamic_range'
-        #   schedule = 3 phase iterations + 1 amp iteration
+        #   schedule = SelfcalSchedule(mode="data") (stages from the data)
         verbose=True,
     )
 
@@ -220,7 +220,7 @@ def run_ajisai(cont_ms: str):
     print("  Running AJISAI on TW Hya")
     print(f"  Input MS  : {cont_ms}")
     print(f"  Projname  : {PROJ_NAME}")
-    print(f"  Schedule  : {[s.label for s in cfg.schedule.steps]}")
+    print(f"  Self-cal  : schedule.mode={cfg.schedule.mode!r}")
     print("=" * 72)
 
     aj = AJISAI(cfg).run()
@@ -232,9 +232,9 @@ def run_ajisai(cont_ms: str):
     print(f"  Working directory : {aj.workdir}")
     print(f"  Best image        : {aj.best_image}")
     print(f"  Best FITS         : {aj.best_fits}")
-    print(f"  Best dynamic range: {aj.best_metric_value:.1f}"
+    print(f"  Best stage DR     : {aj.best_metric_value:.1f} (diagnostic)"
           if aj.best_metric_value is not None
-          else "  Best dynamic range: (n/a)")
+          else "  Best stage DR     : (n/a)")
     print()
     print(f"  Metrics CSV       : {os.path.join(str(aj.workdir), 'metrics.csv')}")
     print(f"  Summary plot      : {os.path.join(str(aj.workdir), 'selfcal_summary.png')}")

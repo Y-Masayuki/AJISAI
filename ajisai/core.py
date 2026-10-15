@@ -90,12 +90,15 @@ from .ms_utils import (
     get_dish_diameter_m,
     pick_cell_imsize,
     icrs_to_j2000,
+    read_vis_summary,
     CELL_RULES,
     _CHUNK_SAMPLES,
     _primary_beam_fwhm_arcsec,
     _smallest_5_smooth_at_least,
 )
 _HAS_MS_UTILS = True
+# Data-driven solution intervals (pure numpy; ASEBI SPEC v0.3 section 10.2).
+from . import solint as _solint
 
 
 # Version is defined in ajisai/__init__.py. This local copy is used for
@@ -218,15 +221,44 @@ class SelfcalStep:
     label: Optional[str] = None    # human-readable name for justification log
 
 
+#: The fixed ladder of AJISAI v0.2 (``SelfcalSchedule(mode="fixed")``).
+FIXED_SCHEDULE_STEPS: Tuple[SelfcalStep, ...] = (
+    SelfcalStep("p", "inf",  label="phase_inf"),
+    SelfcalStep("p", "6*IT", label="phase_6IT"),
+    SelfcalStep("p", "3*IT", label="phase_3IT"),
+    SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
+)
+
+#: Self-calibration modes: "data" (stages and solints from the data) and "fixed".
+SELFCAL_MODES = ("data", "fixed")
+
+
 @dataclass(frozen=True)
 class SelfcalSchedule:
-    """Ordered sequence of self-cal steps. Default = AJISAI Description spec."""
-    steps: Tuple[SelfcalStep, ...] = _dc_field(default_factory=lambda: (
-        SelfcalStep("p", "inf",  label="phase_inf"),
-        SelfcalStep("p", "6*IT", label="phase_6IT"),
-        SelfcalStep("p", "3*IT", label="phase_3IT"),
-        SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
-    ))
+    """How the self-calibration stages are chosen.
+
+    ``mode="data"`` (default, v0.3): phase stages with solution intervals
+    decided from the data (ASEBI SPEC v0.3 section 10.2; ``ajisai.solint``):
+    stage 1 is one solution per execution block; every later stage measures
+    the noise scale, the solution-SNR rate and the phase structure function,
+    predicts the residual phase variance of candidate intervals (divisors of
+    the scan length, the scan, the EB), gates them on the predicted
+    solution SNR (G1) and chooses and accepts one on held-out integrations
+    (G2). At most three phase stages; the run stops at the first stage that
+    is not accepted, and the best stage is the last accepted one. ``steps``
+    is not used.
+
+    ``mode="fixed"`` (v0.2): every step of ``steps`` is run (default: the
+    ladder ``inf -> 6*IT -> 3*IT -> amplitude inf``) and the best iteration
+    is chosen by ``AJISAIConfig.quality_metric``.
+
+    ``amplitude``: the amplitude stage of ``mode="data"``. Only ``"never"``
+    in this version; the conditional amplitude stage (P18 item 6, P24) will
+    be added later.
+    """
+    steps: Tuple[SelfcalStep, ...] = FIXED_SCHEDULE_STEPS
+    mode: str = "data"
+    amplitude: str = "never"
 
 
 @dataclass(frozen=True)
@@ -293,11 +325,12 @@ class AJISAIConfig:
     rms_target_radius_arcsec: Optional[float] = None
     rms_sigma: float = 3.0
     rms_maxiters: int = 5
-    quality_metric: str = "dynamic_range"  # "dynamic_range"|"peak_snr"
-    # NOTE: AJISAI runs ALL iterations to completion and selects the best by DR
-    # at the end. Anomalies (e.g. catastrophic DR drop) are logged for the
-    # justification but do NOT alter pipeline flow. This preserves the
-    # deterministic fixed-schedule identity (no adaptive rollback).
+    # Best iteration of schedule.mode="fixed": "dynamic_range" | "peak_snr".
+    # With mode="data" the best stage is the last accepted one, and peak,
+    # RMS and DR of every image are recorded as diagnostics only.
+    quality_metric: str = "dynamic_range"
+    # Anomalies (e.g. catastrophic DR drop) are logged for the justification
+    # but do NOT alter pipeline flow.
     on_iter_anomaly: str = "log_only"      # "log_only" (default) | future: "warn_loudly"
 
     # === Data hygiene ===
@@ -1405,9 +1438,13 @@ class AJISAI:
         7. Measure the thermal noise sigma_th on a signal-free dirty image.
         8. Derive the multiscale scales from the beam and the mask region.
         9. Make initial CLEAN image (iteration 0).
-        10. Run each self-cal iteration in the schedule (each on a temporary
-            copy of the previous stage's MS; stage MSs are kept).
-        11. Select the best iteration by quality metric.
+        10. Self-calibrate (each stage on a temporary copy of the previous
+            stage's MS; stage MSs are kept). ``schedule.mode="data"``
+            (default): phase stages decided from the data (stage 1 one
+            solution per EB, then G1/G2 on candidate intervals, at most three
+            stages); ``mode="fixed"``: every step of ``schedule.steps``.
+        11. Select the best stage: the last accepted one (``mode="data"``),
+            or by ``quality_metric`` (``mode="fixed"``).
         12. Write the DATA-only ``final_selfcal.ms`` of that iteration and
             make the final (deep) image from it.
         13. Write summary CSV, summary PNG, and justification JSON.
@@ -1425,8 +1462,11 @@ class AJISAI:
             self._measure_noise()
             self._compute_scales()
             self._make_initial_clean()
-            for i, step in enumerate(self.cfg.schedule.steps, 1):
-                self._run_iteration(i, step)
+            if self.cfg.schedule.mode == "fixed":
+                for i, step in enumerate(self.cfg.schedule.steps, 1):
+                    self._run_iteration(i, step)
+            else:
+                self._run_data_driven()
             self._select_best()
             self._write_final_ms()
             self._make_final_image()
@@ -1552,6 +1592,7 @@ Infrastructure
                 "operation); give a CRTF region file with mask_mode='user' instead"
             )
         self._validate_imaging_config()
+        self._validate_schedule()
         if cfg.imaging.mask_mode == "interactive":
             ver = _casa_version_string()
             warnings.warn(
@@ -1633,6 +1674,43 @@ Infrastructure
         if img.final_aperture_arcsec is not None and not img.final_aperture_arcsec > 0:
             raise ValueError("imaging.final_aperture_arcsec must be positive; "
                              f"got {img.final_aperture_arcsec!r}")
+
+    def _validate_schedule(self) -> None:
+        """Checks of SelfcalSchedule (mode, steps, amplitude) and the gaincal options it needs."""
+        cfg = self.cfg
+        sch = cfg.schedule
+        if sch.mode not in SELFCAL_MODES:
+            raise ValueError(f"schedule.mode must be one of {SELFCAL_MODES}; got {sch.mode!r}")
+        if sch.mode == "fixed":
+            return
+        if tuple(sch.steps) != FIXED_SCHEDULE_STEPS:
+            raise ValueError(
+                "SelfcalSchedule.steps is used only with mode='fixed'; mode='data' (the default) "
+                "chooses the stages and solution intervals from the data. Pass "
+                "SelfcalSchedule(mode='fixed', steps=...) to run a fixed list of steps")
+        if sch.amplitude != "never":
+            raise ValueError(
+                "schedule.amplitude: only 'never' is implemented in this version; the conditional "
+                "amplitude stage of mode='data' (P18 item 6, P24) will come later. Use "
+                "mode='fixed' with an amplitude step for an unconditional one")
+        if cfg.gaincal.gaintype != "T":
+            raise ValueError("schedule.mode='data' solves phase-only gains with gaintype='T' "
+                             f"(one phase per antenna for both correlations); got "
+                             f"gaincal.gaintype={cfg.gaincal.gaintype!r}")
+        if cfg.gaincal.applymode != "calonly":
+            raise ValueError("schedule.mode='data' needs gaincal.applymode='calonly': the solutions "
+                             "below the G1 gate are flagged so that those antennas keep the "
+                             f"previous stage (got {cfg.gaincal.applymode!r}, which would flag data)")
+        interp = cfg.gaincal.applycal_interp.split(",")[0].strip().lower()
+        if not interp.startswith("linear"):
+            raise ValueError("schedule.mode='data' predicts and evaluates the stages with linear time "
+                             "interpolation of the solutions; gaincal.applycal_interp must be "
+                             f"'linear...' (e.g. 'linearPDperobs'); got {cfg.gaincal.applycal_interp!r}")
+        parts = [x.strip() for x in cfg.gaincal.combine.split(",") if x.strip()]
+        bad = [x for x in parts if x not in ("scan", "spw")]
+        if bad:
+            raise ValueError(f"gaincal.combine may contain 'scan' and 'spw' in mode='data' (the "
+                             f"time combination is chosen per stage); got {cfg.gaincal.combine!r}")
 
     def _setup_workdir(self) -> None:
         """Create a unique output directory per field/projname."""
@@ -2605,6 +2683,410 @@ Infrastructure
                       f"RMS={stats['rms_jy_beam']*1e6:.2f} uJy/bm")
 
     # ----------------------------------------------------------------------
+    # schedule.mode="data": stages and solution intervals from the data
+    # ----------------------------------------------------------------------
+    def _run_data_driven(self) -> None:
+        """Phase self-calibration with data-driven stages (ASEBI SPEC v0.3 section 10.2).
+
+        Stage 1 solves one phase per execution block; its held-out change
+        (G2) is computed and the stage is skipped only below -2 sigma. Each
+        later stage measures s, r_i, D_eff and kappa on the current data and
+        model, builds the candidate intervals (divisors of the median scan
+        length in integrations, the scan, the EB), gates them on the
+        predicted solution SNR (G1), predicts V(T), evaluates the predicted
+        best, its neighbours and the EB on held-out integrations (G2, numpy,
+        no gaincal per candidate), chooses with rules A/B and accepts when
+        the corrected improvement exceeds max(1 sigma, 0.001); gaincal runs
+        only for the chosen interval. At most three phase stages; the run
+        stops at the first stage that is not accepted. Every accepted stage
+        is re-imaged, so the last accepted stage's image is the final
+        self-cal image. All quantities, candidates, gates, decisions and
+        reasons are recorded under ``stages[k]["selection"]``.
+        """
+        cfg = self.cfg
+        combine_spw = "spw" in [x.strip() for x in cfg.gaincal.combine.split(",")]
+        self._sc: Dict[str, Any] = {
+            "state0": None, "geom": None, "halves": False, "chain": [], "best_iteration": 0,
+            "combine_spw": combine_spw, "pending_g3": None, "spwmap": None,
+        }
+        summary: Dict[str, Any] = {
+            "mode": "data",
+            "spec": "ASEBI SPEC v0.3 section 10.2, appendices C.2-C.3; DESIGN_REVIEW P17, P18, P23",
+            "rules": {
+                "g1_snr_min": _solint.G1_SNR_MIN,
+                "gaincal_minsnr": float(cfg.gaincal.minsnr),
+                "accept": f"corrected held-out improvement > max({_solint.ACCEPT_SIGMA:g} sigma, "
+                          f"{_solint.ACCEPT_FLOOR:g})",
+                "stage1_skip": f"corrected held-out improvement < -{_solint.STAGE1_SKIP_SIGMA:g} sigma",
+                "max_phase_stages": _solint.MAX_PHASE_STAGES,
+                "loss_table": {"snr": list(_solint.LOSS_TABLE_SNR),
+                               "neg_ln_C": list(_solint.LOSS_TABLE_NEG_LN_C)},
+                "amplitude": cfg.schedule.amplitude,
+            },
+            "combine_spw": combine_spw,
+            "stages": [],
+        }
+        self.justification["selfcal"] = summary
+        stop_reason = f"the limit of {_solint.MAX_PHASE_STAGES} phase stages was reached"
+        for k in range(1, _solint.MAX_PHASE_STAGES + 1):
+            decision, reason = self._data_stage(k)
+            summary["stages"].append({"stage": k, "decision": decision, "reason": reason})
+            if decision == "stop":
+                stop_reason = reason
+                break
+        self._finish_g3()
+        # Hook for the conditional amplitude stage (ASEBI SPEC v0.3 10.2 item 9, P24):
+        # sigma_a SNR_EB > 2, SNR_EB >= 10, G2 and G3; 'ap', T = EB, on top of the phase
+        # tables, normalised per observation, calwt=False. Not implemented in this version.
+        summary["amplitude_stage"] = {
+            "attempted": False,
+            "reason": ("schedule.amplitude='never': the conditional amplitude stage is not "
+                       "implemented in this version"),
+        }
+        accepted = [st["stage"] for st in self.stages
+                    if st["stage"] > 0 and st.get("status") in ("ok", "anomaly")]
+        summary.update({
+            "accepted_stages": accepted,
+            "best_stage": accepted[-1] if accepted else 0,
+            "stop_reason": stop_reason,
+            "g2_split": (self._sc["geom"] and _solint.split_mode(self._sc["geom"],
+                                                                 self._sc["halves"])),
+            "spwmap": self._sc["spwmap"],
+            "split_note": self._sc.get("split_note"),
+        })
+        self._derived["selfcal_summary"] = summary
+        if cfg.verbose:
+            print(f"[AJISAI] self-cal (mode='data'): accepted stages {accepted or 'none'}; "
+                  f"{stop_reason}")
+
+    def _read_state(self, vis) -> "_solint.VisSummary":
+        """Reduce DATA/MODEL/WEIGHT/FLAG of an AJISAI MS once; track its phase to state 0."""
+        sc = self._sc
+        fid = self._derived["resolved_field_id"]
+        st = read_vis_summary(str(vis), fid, band_halves=sc["halves"])
+        if sc["state0"] is None:
+            geom = _solint.geometry(st)
+            if _solint.split_mode(geom, True) == "band" and not sc["halves"]:
+                try:
+                    st = read_vis_summary(str(vis), fid, band_halves=True)
+                    sc["halves"] = True
+                    geom = _solint.geometry(st)
+                except RuntimeError as e:   # a spw with one channel: no band halves
+                    sc["split_note"] = (f"scans have fewer than {_solint.BAND_SPLIT_BELOW_NINT} "
+                                        f"integrations but the band cannot be halved ({e}); "
+                                        f"G2 uses the even/odd split")
+                    warnings.warn(f"[AJISAI] {sc['split_note']}")
+            sc["state0"] = st
+            sc["geom"] = geom
+        else:
+            st.track_phase(sc["state0"])
+        return st
+
+    def _data_spwmap(self, state) -> Optional[List[int]]:
+        """applycal spwmap for combined-spw tables: the configured one, else derived."""
+        g = self.cfg.gaincal
+        if not self._sc["combine_spw"]:
+            return None
+        if g.spwmap:
+            return [int(x) for x in g.spwmap]
+        per_obs: Dict[int, List[int]] = {}
+        for o in np.unique(state.obs):
+            per_obs[int(o)] = sorted(int(x) for x in np.unique(state.spw[state.obs == o]))
+        nspw = int(self._derived.get("nspw") or (int(state.spw.max()) + 1))
+        return _solint.spwmap_for_combined_spw(per_obs, nspw)
+
+    def _data_stage(self, k: int) -> Tuple[str, str]:
+        """One stage of mode="data"; returns (decision, reason) with decision apply|skip|stop."""
+        cfg = self.cfg
+        sc = self._sc
+        assert self.workdir is not None
+        interm = self.workdir / "intermediate"
+        caltable = interm / f"sc{k}.pcal"
+        out_vis = interm / f"selfcal_{k}.ms"
+        tmp_vis = interm / f"selfcal_{k}_applycal.tmp.ms"
+        clean_base = interm / f"clean_sc{k}"
+        fits_path = interm / f"clean_sc{k}.fits"
+        _safe_rmtree_path(caltable)
+        _safe_rmtree_path(out_vis)
+        _safe_rmtree_path(tmp_vis)
+        _safe_rmtree_glob(interm, f"clean_sc{k}.*")
+
+        field_id = self._derived["resolved_field_id"]
+        refant = self._derived["refant"]
+        prev_vis = self._derived["good_vis"]
+        prev_base = self._derived["last_image_base"]
+        prev_nterms = self._derived["last_nterms"]
+        have_model = self._derived.get("good_vis_model_from") == prev_base
+        copied = False
+        gate_info: Dict[str, Any] = {}
+        try:
+            if have_model:
+                read_vis = prev_vis
+                model_info = {"model_image": _model_images(prev_base, prev_nterms),
+                              "nterms": prev_nterms,
+                              "reffreq_hz": self._derived.get("good_vis_model_reffreq_hz")}
+            else:
+                _copy_ms(prev_vis, tmp_vis)
+                copied = True
+                model_info = self._predict_model(tmp_vis, prev_base, prev_nterms)
+                read_vis = tmp_vis
+            state = self._read_state(read_vis)
+            self._record_pending_g3(state)
+            names = state.antenna_names
+            refant_idx = names.index(refant) if refant in names else None
+            rec = _solint.evaluate_stage(k, state, sc["chain"], sc["geom"],
+                                         combine_spw=sc["combine_spw"], refant=refant_idx,
+                                         minblperant=cfg.gaincal.minblperant)
+            selection = _solint.strip_internal(rec)
+            selection["data_read_from"] = str(read_vis)
+            if cfg.verbose:
+                self._print_selection(selection)
+            if rec["decision"] != "apply":
+                self._record_unapplied_stage(k, selection)
+                return rec["decision"], selection["reason"]
+
+            cand = rec["_"]["chosen"]
+            combine = ",".join(x for x in (cand["time_combine"],
+                                           "spw" if sc["combine_spw"] else "") if x)
+            spwmap = self._data_spwmap(state)
+            sc["spwmap"] = spwmap
+            label = f"phase_{cand['label']}"
+            step = SelfcalStep("p", cand["gaincal_solint"], label=label)
+            if not copied:
+                _copy_ms(prev_vis, tmp_vis)
+                copied = True
+            n_solutions, gaincal_ok = self._run_gaincal(
+                input_vis=str(tmp_vis), caltable=str(caltable), solint=cand["gaincal_solint"],
+                step=step, field_id=field_id, refant=refant, combine=combine)
+            if gaincal_ok:
+                gate_info = self._gate_caltable(str(caltable), state, cand, rec["_"]["s_rows"])
+                n_solutions -= int(gate_info.get("n_flagged", 0))
+            if not gaincal_ok or n_solutions <= 0:
+                selection["decision"] = "stop"
+                selection["reason"] = (f"gaincal returned no usable solution for {cand['label']} "
+                                       f"(minsnr={cfg.gaincal.minsnr:g} and the G1 gate)")
+                self._record_unapplied_stage(k, selection)
+                return "stop", selection["reason"]
+            self._plot_gain_table(str(caltable), k, step)
+            self._applycal(tmp_vis, caltable, spwmap=spwmap)
+            casatasks.split(vis=str(tmp_vis), outputvis=str(out_vis), datacolumn="corrected")
+        finally:
+            if copied:
+                _safe_rmtree_path(tmp_vis)
+
+        solution_stats = self._caltable_solution_stats(str(caltable))
+        threshold_jy = self._loop_threshold_jy(self._derived["last_rms"])
+        usemask_kwargs = self._build_usemask_kwargs(
+            existing_mask=self._derived.get("initial_mask_path"))
+        nterms = self._tclean(out_vis, clean_base, niter=cfg.imaging.niter,
+                              threshold_jy=threshold_jy, mask_kwargs=usemask_kwargs)
+        own_model = self._predict_model(out_vis, clean_base, nterms)
+        stats = self._export_and_stats(clean_base, nterms, fits_path)
+        is_anomaly, anomaly_reason = self._detect_iter_anomaly(stats, n_solutions)
+
+        g = cfg.gaincal
+        solve = build_solve_info(
+            table=str(caltable), solint=cand["gaincal_solint"],
+            solint_s=None if cand["kind"] == "eb" else float(cand["T_s"]),
+            combine=combine, refant=refant, calmode="p", gaintype=g.gaintype, minsnr=g.minsnr,
+            minblperant=g.minblperant, solnorm=False, interp=g.applycal_interp,
+            applymode=g.applymode, calwt=g.calwt, spwmap=spwmap or g.spwmap,
+            model_image=model_info["model_image"], model_nterms=model_info["nterms"],
+            model_reffreq_hz=model_info.get("reffreq_hz"), solved_on=str(prev_vis),
+            stage_ms=str(out_vis), n_solutions=n_solutions,
+            flagged_solution_fraction=solution_stats)
+        selection["g1_gate_applied"] = gate_info
+        selection["same_data_diagnostics"] = {
+            "peak_jy_beam": stats["peak_jy_beam"], "rms_jy_beam": stats["rms_jy_beam"],
+            "dynamic_range": stats["dynamic_range"],
+            "note": "measured on the data the gains were solved from; never used for decisions",
+        }
+        metric = {
+            "iteration": k, "label": label, "calmode": "p", "solint": cand["label"],
+            "solint_s": solve["solint_s"], "peak_jy_beam": stats["peak_jy_beam"],
+            "rms_jy_beam": stats["rms_jy_beam"], "snr": stats["snr"],
+            "dynamic_range": stats["dynamic_range"], "bmaj_arcsec": stats["bmaj_arcsec"],
+            "bmin_arcsec": stats["bmin_arcsec"], "threshold_jy": threshold_jy,
+            "n_gaincal_solutions": n_solutions,
+            "status": "anomaly" if is_anomaly else "ok", "anomaly_reason": anomaly_reason,
+            "image_path": _image_name(clean_base, nterms), "image_base": str(clean_base),
+            "fits_path": str(fits_path), "caltable": str(caltable), "selfcal_ms": str(out_vis),
+        }
+        self.metrics.append(metric)
+        self.justification["iterations"].append(metric)
+        self._add_stage({
+            "stage": k, "label": label, "status": metric["status"],
+            "data_ms": str(out_vis), "stage_ms": str(out_vis),
+            "stage_ms_columns": "DATA + MODEL (model of this stage's image)",
+            "image_base": str(clean_base), "image": _image_name(clean_base, nterms),
+            "nterms": nterms, "model_image": own_model["model_image"],
+            "threshold_jy": threshold_jy, "threshold_reason": self._threshold_reason(),
+            "solve": solve, "selection": selection,
+        })
+        sc["chain"].append(_solint.StageSolve(k, cand, state, rec["_"]["s_rows"],
+                                              float(rec["_"]["chosen_corr"])))
+        sc["pending_g3"] = {"stage": k, "before": _solint.g3_short_baseline_ratio(state),
+                            "s": float(np.median(rec["_"]["s_rows"])) if state.n_rows else 1.0,
+                            "vis": str(out_vis)}
+        sc["best_iteration"] = len(self.metrics) - 1
+        self._derived["good_vis"] = str(out_vis)
+        self._derived["good_vis_model_from"] = str(clean_base)
+        self._derived["good_vis_model_reffreq_hz"] = own_model.get("reffreq_hz")
+        self._derived["last_image_base"] = str(clean_base)
+        self._derived["last_nterms"] = nterms
+        self._derived["last_dr"] = stats["dynamic_range"]
+        self._derived["last_rms"] = stats["rms_jy_beam"]
+        if is_anomaly:
+            warnings.warn(f"[AJISAI] stage {k} ({label}) anomaly detected: {anomaly_reason}. "
+                          f"Recorded only; see justification.json.")
+        if cfg.verbose:
+            print(f"[AJISAI]   -> stage {k} applied ({cand['label']}). "
+                  f"DR={stats['dynamic_range']:.1f} (diagnostic), "
+                  f"RMS={stats['rms_jy_beam'] * 1e6:.2f} uJy/bm")
+        return "apply", selection["reason"]
+
+    def _gate_caltable(self, caltable: str, state, cand: Dict[str, Any], s_rows) -> Dict[str, Any]:
+        """G1 per antenna and solution: flag table rows whose predicted SNR is below 5.
+
+        ASEBI SPEC v0.3 10.2 item 4: the flagged solutions are not applied
+        (applymode 'calonly'), so those antennas keep the previous stage's
+        correction. A direct edit of the table AJISAI just wrote; recorded.
+        """
+        gt = _solint.gate_table(state, self._sc["geom"], cand, s_rows, self._sc["combine_spw"])
+        tb = casatools.table()
+        tb.open(caltable, nomodify=False)
+        try:
+            if tb.nrows() == 0:
+                return {"n_rows": 0, "n_flagged": 0}
+            flag = tb.getcol("FLAG")
+            res = _solint.caltable_gate(gt, tb.getcol("TIME"), tb.getcol("OBSERVATION_ID"),
+                                        tb.getcol("SPECTRAL_WINDOW_ID"), tb.getcol("ANTENNA1"))
+            ant = tb.getcol("ANTENNA1")
+            already = flag.reshape(-1, flag.shape[-1]).all(axis=0)
+            new = res["flag"] & ~already
+            if new.any():
+                flag[:, :, new] = True
+                tb.putcol("FLAG", flag)
+        finally:
+            tb.close()
+        names = state.antenna_names
+        per_ant: Dict[str, int] = {}
+        for a in ant[new]:
+            nm = names[int(a)] if 0 <= int(a) < len(names) else str(int(a))
+            per_ant[nm] = per_ant.get(nm, 0) + 1
+        return {
+            "table": caltable, "n_rows": res["n_rows"], "n_flagged": int(new.sum()),
+            "unmatched": res["unmatched"], "per_antenna": per_ant,
+            "rule": (f"solutions with a predicted SNR below {_solint.G1_SNR_MIN:g} are flagged; "
+                     f"with applymode='{self.cfg.gaincal.applymode}' those antennas keep the "
+                     f"previous stage's correction"),
+        }
+
+    def _record_unapplied_stage(self, k: int, selection: Dict[str, Any]) -> None:
+        """A stage that was evaluated but not applied (G1, G2 or no solution)."""
+        chosen = selection.get("chosen")
+        label = f"phase_{chosen}" if chosen else "phase"
+        reason = selection.get("reason", "")
+        status = "rejected"
+        rec = {
+            "iteration": k, "label": label, "calmode": "p", "solint": chosen or "-",
+            "solint_s": None, "peak_jy_beam": None, "rms_jy_beam": None, "snr": None,
+            "dynamic_range": None, "bmaj_arcsec": None, "bmin_arcsec": None,
+            "threshold_jy": None, "n_gaincal_solutions": None, "status": status,
+            "anomaly_reason": reason, "image_path": None, "image_base": None,
+            "fits_path": None, "caltable": None, "selfcal_ms": None,
+        }
+        self.metrics.append(rec)
+        self.justification["iterations"].append(rec)
+        self._add_stage({
+            "stage": k, "label": label, "status": status, "data_ms": None, "stage_ms": None,
+            "image_base": None, "image": None, "model_image": None, "solve": None,
+            "reason": reason, "selection": selection,
+        })
+        if self.cfg.verbose:
+            print(f"[AJISAI]   -> stage {k} not applied: {reason}")
+
+    def _record_pending_g3(self, state) -> None:
+        """G3 of the last accepted stage: short-baseline data/model ratio before vs after."""
+        pend = self._sc.get("pending_g3")
+        if not pend:
+            return
+        after = _solint.g3_short_baseline_ratio(state)
+        cmp = _solint.g3_compare(pend["before"], after, pend["s"])
+        st = self._stage(pend["stage"])
+        if st is not None and st.get("selection") is not None:
+            st["selection"]["g3"] = {
+                "per_observation": {str(o): v for o, v in cmp.items()},
+                "rule": ("data/model flux ratio of the shortest 20% baselines before and after "
+                         "the stage; > max(3 sigma, 1%) would reject an amplitude stage and is "
+                         "recorded only for phase stages"),
+            }
+        self._sc["pending_g3"] = None
+
+    def _finish_g3(self) -> None:
+        """Read the last accepted stage MS once more for its G3 record, if still pending."""
+        pend = self._sc.get("pending_g3")
+        if not pend:
+            return
+        try:
+            state = self._read_state(pend["vis"])
+        except Exception as e:  # the record is informational; never fail the run on it
+            warnings.warn(f"[AJISAI] G3 record of stage {pend['stage']} skipped: {e}")
+            self._sc["pending_g3"] = None
+            return
+        self._record_pending_g3(state)
+
+    def _print_selection(self, sel: Dict[str, Any]) -> None:
+        meas = sel.get("measured", {})
+        r = meas.get("r", {})
+        fit = meas.get("D_fit", {})
+        print(f"[AJISAI] --- stage {sel['stage']} (mode='data') ---")
+        print(f"[AJISAI]   r median {r.get('median', float('nan')):.3g} s^-1/2 "
+              f"(p10 {r.get('p10', float('nan')):.3g}); D_eff fit: "
+              + (f"tau0={fit['tau0_s']:.3g} s, beta={fit['beta']:.2f}" if fit.get("significant")
+                 else "no significant structure")
+              + f"; G2 split: {meas.get('g2_split')}")
+        for c in sel.get("candidates", []):
+            g2 = c.get("g2") or {}
+            line = (f"[AJISAI]   {c['label']:>8s}: G1 {'pass' if c['g1']['pass'] else 'fail'} "
+                    f"(SNR {c['g1']['snr_median']:.1f})")
+            if "V_pred" in c:
+                line += f", V_pred {c['V_pred']:.4f}"
+            if g2:
+                line += (f", dV_held {g2['dV_raw']:+.4f} +- {g2['sigma']:.4f}, "
+                         f"corrected improvement {g2['improvement_corr']:+.4f}")
+            print(line)
+        print(f"[AJISAI]   rule A {sel.get('rule_A')}, rule B {sel.get('rule_B')} -> "
+              f"{sel.get('chosen')}: {sel.get('decision')} ({sel.get('reason')})")
+
+    def selfcal_summary(self) -> Dict[str, Any]:
+        """Compact record of the self-calibration for a calling pipeline (e.g. ASEBI).
+
+        Per stage: status, label, decision record (``selection``), gain table
+        and how it was applied (``solve``), stage MS, image and model; plus
+        the best stage, the final DATA-only MS and the image of the best stage.
+        """
+        best = self.justification.get("best") or {}
+        stages = []
+        for st in self.stages:
+            stages.append({k: st.get(k) for k in ("stage", "label", "status", "stage_ms", "image",
+                                                   "model_image", "solve", "selection", "reason")})
+        best_stage = None
+        if best.get("iteration") is not None and 0 <= int(best["iteration"]) < len(self.metrics):
+            best_stage = int(self.metrics[int(best["iteration"])]["iteration"])
+        st = self._stage(best_stage) if best_stage is not None else None
+        return {
+            "mode": self.cfg.schedule.mode,
+            "best_stage": best_stage,
+            "best_image": self.best_image,
+            "best_model": (st or {}).get("model_image"),
+            "final_ms": self.final_ms,
+            "final_image": self.final_image,
+            "selfcal": self.justification.get("selfcal"),
+            "stages": stages,
+        }
+
+    # ----------------------------------------------------------------------
     # Helper methods for iteration
     # ----------------------------------------------------------------------
     def _add_stage(self, stage: Dict[str, Any]) -> None:
@@ -2618,10 +3100,14 @@ Infrastructure
                 return st
         return None
 
-    def _applycal(self, vis, caltable) -> None:
-        """applycal of one self-cal table on an AJISAI-owned temporary MS."""
+    def _applycal(self, vis, caltable, spwmap=None) -> None:
+        """applycal of one self-cal table on an AJISAI-owned temporary MS.
+
+        ``spwmap`` overrides ``GainCalConfig.spwmap`` (mode="data" derives it
+        when spws are combined and none was given).
+        """
         g = self.cfg.gaincal
-        spwmap = [int(x) for x in g.spwmap]
+        spwmap = [int(x) for x in (g.spwmap if spwmap is None else spwmap)]
         casatasks.applycal(
             vis=str(vis),
             gaintable=[str(caltable)],
@@ -2665,8 +3151,13 @@ Infrastructure
         step: SelfcalStep,
         field_id: str,
         refant: str,
+        combine: Optional[str] = None,
     ) -> Tuple[int, bool]:
-        """Run gaincal and return (n_solutions, success)."""
+        """Run gaincal and return (n_solutions, success).
+
+        ``combine`` overrides ``GainCalConfig.combine`` (mode="data" chooses
+        the time combination per stage).
+        """
         cfg = self.cfg
         try:
             casatasks.gaincal(
@@ -2675,7 +3166,7 @@ Infrastructure
                 spw="*",
                 field=field_id,
                 selectdata=True,
-                combine=cfg.gaincal.combine,
+                combine=cfg.gaincal.combine if combine is None else combine,
                 timerange="",
                 observation="",
                 spwmap=[],
@@ -2721,6 +3212,14 @@ Infrastructure
             return
         diag_dir = self.workdir / "diagnostics"
         diag_dir.mkdir(exist_ok=True)
+        try:
+            self._plotms_gain_table(caltable, idx, step, diag_dir)
+        except Exception as e:  # a diagnostic plot must not fail the run (e.g. no DISPLAY)
+            if not self._derived.get("warned_plotms_failed"):
+                warnings.warn(f"[AJISAI] gain-table plots are skipped: plotms failed ({e})")
+                self._derived["warned_plotms_failed"] = True
+
+    def _plotms_gain_table(self, caltable: str, idx: int, step: SelfcalStep, diag_dir) -> None:
         phase_png = diag_dir / f"iter{idx}_{step.label}_phasegain.png"
         casaplotms.plotms(
             vis=caltable,
@@ -3083,11 +3582,23 @@ Infrastructure
                       f"Pipeline continues to next iteration.")
 
     def _select_best(self) -> None:
-        """Pick best iteration and set best_image / best_fits / best_metric_value."""
+        """Pick best iteration and set best_image / best_fits / best_metric_value.
+
+        ``schedule.mode="data"``: the last accepted stage (the image statistics
+        are diagnostics only; ASEBI SPEC v0.3 10.2 item 13). ``mode="fixed"``:
+        :meth:`select_best_iteration` (``quality_metric``).
+        """
         if not self.metrics:
             warnings.warn("_select_best called with empty metrics list; nothing to choose.")
             return
-        best_i = self.select_best_iteration()
+        data_mode = self.cfg.schedule.mode == "data"
+        if data_mode:
+            best_i = int(getattr(self, "_sc", {}).get("best_iteration", 0))
+            rule = ("last accepted stage (schedule.mode='data'); peak, RMS and dynamic range "
+                    "are recorded as diagnostics only")
+        else:
+            best_i = self.select_best_iteration()
+            rule = f"highest {self.cfg.quality_metric} over all iterations (schedule.mode='fixed')"
         best_metric = self.metrics[best_i]
         self.best_image = best_metric.get("image_path")
         self.best_fits = best_metric.get("fits_path")
@@ -3095,6 +3606,7 @@ Infrastructure
         self.best_metric_value = best_metric.get(metric_key)
         self.justification["best"] = {
             "iteration": best_i,
+            "rule": rule,
             "metric_key": metric_key,
             "value": self.best_metric_value,
             "image": self.best_image,
@@ -3372,6 +3884,62 @@ Infrastructure
             return obj
         with open(self.workdir / "justification.json", "w") as f:
             json.dump(_convert(self.justification), f, indent=2)
+
+
+# ============================================================================
+# Entry point for a calling pipeline's measurement self-calibration (ASEBI)
+# ============================================================================
+
+def selfcal_measurement(
+    vis: str,
+    *,
+    results_dir: str,
+    field: Optional[str] = None,
+    imaging: Optional[ImagingConfig] = None,
+    gaincal: Optional[GainCalConfig] = None,
+    refant: Optional[str] = None,
+    projname: Optional[str] = None,
+    verbose: bool = False,
+    **options: Any,
+) -> "AJISAI":
+    """Phase self-calibration of one execution block with the data-driven rules.
+
+    The measurement self-cal of ASEBI (ASEBI SPEC v0.3 section 6 and 10;
+    DESIGN_REVIEW P23 item 1: the measurement and the production self-cal use
+    the same rules): ``schedule.mode="data"`` with no amplitude stage, run on
+    ``vis`` (only read) under ``results_dir``. Defaults that suit a calling
+    pipeline: ``caller="asebi"`` (viewer-free), ``relabel_j2000_to_icrs=False``
+    (the products stay in the input frame), no banner, and
+    ``ImagingConfig(final_depth=())`` when ``imaging`` is not given (the image
+    of the last accepted stage, CLEANed to the loop threshold, is the result;
+    pass an ``ImagingConfig`` with the caller's cell, imsize, nterms, reffreq
+    and CRTF mask). ``refant`` selects the reference antenna by name;
+    ``options`` are further ``AJISAIConfig`` fields.
+
+    Returns the finished :class:`AJISAI`; :meth:`AJISAI.selfcal_summary` gives
+    the per-stage decisions, gain tables (with their applycal arguments),
+    stage MSs, the best stage's image and model and the DATA-only
+    ``final_selfcal.ms``.
+    """
+    kw: Dict[str, Any] = dict(
+        vis=vis,
+        results_dir=results_dir,
+        field=field,
+        projname=projname,
+        imaging=imaging if imaging is not None else ImagingConfig(final_depth=()),
+        gaincal=gaincal if gaincal is not None else GainCalConfig(),
+        schedule=SelfcalSchedule(mode="data", amplitude="never"),
+        caller="asebi",
+        relabel_j2000_to_icrs=False,
+        show_banner=False,
+        verbose=verbose,
+    )
+    if refant:
+        kw.update(refant_strategy="manual", refant_manual=refant)
+    kw.update(options)
+    if kw["schedule"].mode != "data":
+        raise ValueError("selfcal_measurement uses schedule.mode='data'")
+    return AJISAI(AJISAIConfig(**kw)).run()
 
 
 # ============================================================================
