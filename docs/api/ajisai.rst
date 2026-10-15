@@ -92,6 +92,17 @@ Coordinate frame utility
 .. autofunction:: ajisai.relabel_J2000_to_ICRS
 
 
+Self-calibration record and final-image depth rule
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ajisai.SOLVE_INFO_KEYS`` is the tuple of keys of the per-stage ``solve``
+record (``AJISAI.stages[i]["solve"]``, see :doc:`../outputs`).
+
+.. autofunction:: ajisai.final_depth_decision
+
+.. autofunction:: ajisai.aperture_flux_terms
+
+
 ``ajisai.core`` — internal pipeline implementation
 ---------------------------------------------------
 
@@ -108,4 +119,5 @@ methods, calling pipeline steps individually, etc.).
    :exclude-members: AJISAI, AJISAIConfig, ImagingConfig, GainCalConfig,
                      SelfcalStep, SelfcalSchedule, PlotConfig, load_fits_image,
                      compute_rms, compute_image_stats, select_refant,
-                     plot_refant_selection, relabel_J2000_to_ICRS
+                     plot_refant_selection, relabel_J2000_to_ICRS,
+                     final_depth_decision, aperture_flux_terms

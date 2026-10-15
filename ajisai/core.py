@@ -62,13 +62,17 @@ from astropy.stats import sigma_clipped_stats
 try:
     import casatools  # type: ignore
     import casatasks  # type: ignore
-    import casaplotms  # type: ignore
     _HAS_CASA = True
 except ImportError:  # pragma: no cover
     casatools = None  # type: ignore
     casatasks = None  # type: ignore
-    casaplotms = None  # type: ignore
     _HAS_CASA = False
+# casaplotms is only needed for the per-iteration gain plots; without it (e.g.
+# a headless server or a CASA build that lacks it) the plots are skipped.
+try:
+    import casaplotms  # type: ignore
+except ImportError:  # pragma: no cover
+    casaplotms = None  # type: ignore
 
 # AJISAI MS query helpers (native casatools-based replacement for analysisUtils).
 from .plotting import (
@@ -83,15 +87,20 @@ from .ms_utils import (
     get_baseline_at_percentile,
     get_antenna_positions,
     get_antenna_flag_stats,
+    get_dish_diameter_m,
     pick_cell_imsize,
     icrs_to_j2000,
+    CELL_RULES,
+    _CHUNK_SAMPLES,
+    _primary_beam_fwhm_arcsec,
+    _smallest_5_smooth_at_least,
 )
 _HAS_MS_UTILS = True
 
 
 # Version is defined in ajisai/__init__.py. This local copy is used for
 # the justification log and for the standalone __main__ smoke test.
-__version__ = "0.2.1"
+__version__ = "0.3.0.dev0"
 
 
 # ============================================================================
@@ -100,20 +109,63 @@ __version__ = "0.2.1"
 
 @dataclass(frozen=True)
 class ImagingConfig:
-    """tclean-related parameters. Extend by adding fields here."""
+    """tclean-related parameters. Extend by adding fields here.
+
+    Every tclean call of a run (dirty image, initial CLEAN, each self-cal
+    iteration, the final image) uses the same ``cell``, ``imsize``,
+    ``nterms``, ``reffreq``, ``scales`` and mask. ``None`` means "derived
+    from the data" (the derivation is recorded in ``justification.json``).
+    """
     robust: float = 0.5
     weighting: str = "briggs"
     niter: int = 50000
     gain: float = 0.05
     cyclefactor: float = 1.5
-    threshold_factor: float = 1.0      # threshold = threshold_factor * RMS
-    deconvolver: str = "multiscale"
+    deconvolver: str = "multiscale"    # "mtmfs" is used automatically when nterms > 1
     gridder: str = "standard"
     pbcor: bool = False
     parallel: bool = False
     uvtaper: Tuple[str, ...] = ()
-    nterms: int = 1
-    cellpix: int = 10                  # pixels per beam
+    nterms: int = 1                    # > 1: deconvolver="mtmfs" (multiscale scales kept)
+    # --- Image geometry (None = derived from the data) ---
+    # cell: tclean cell string, e.g. "0.0062arcsec" or "6.2mas".
+    cell: Optional[str] = None
+    # imsize: N or (Nx, Ny) pixels.
+    imsize: Optional[Tuple[int, ...]] = None
+    # Rule for the derived cell:
+    #   "umax" (default): cell = 1/(5 u_max), u_max from the longest unflagged
+    #       baseline at the highest frequency.
+    #   "percentile" (legacy, v0.2): beam from the 90th-percentile baseline at
+    #       the median frequency, divided by ``cellpix``.
+    cell_rule: str = "umax"
+    cellpix: int = 10                  # pixels per beam; used by cell_rule="percentile" only
+    # reffreq: Taylor-expansion reference frequency, e.g. "227.0GHz". None =
+    # CASA's default (the middle of the frequency range). The value actually
+    # used is read back from the image and recorded.
+    reffreq: Optional[str] = None
+    # scales: multiscale scales in pixels. None = from the measured beam b:
+    # 0, b, 3b, 9b, ... up to the largest that fits inside the user mask
+    # region (factor-3 ladder); without a user mask region, (0, b, 3b).
+    scales: Optional[Tuple[int, ...]] = None
+    # --- CLEAN depth of the self-cal loop ---
+    #   "pure_noise" (default): absolute threshold = threshold_nsigma x sigma_th,
+    #       sigma_th measured once on a signal-free dirty image ((XX-YY)/2 or
+    #       (RR-LL)/2), the same for every iteration.
+    #   "image_rms" (legacy, v0.2): threshold = threshold_factor x the
+    #       off-source RMS of the previous image.
+    threshold_mode: str = "pure_noise"
+    threshold_nsigma: float = 3.0
+    threshold_factor: float = 1.0      # threshold_mode="image_rms" only
+    # --- Final image (made once, on the selected iteration's data) ---
+    # Depth schedule in units of sigma_th: CLEAN to 3 sigma, then continue to
+    # 2, 1, 0.5 sigma, stopping as soon as the aperture flux has converged
+    # (see AJISAI._make_final_image). () = no final image (v0.2 behaviour:
+    # final.image is the selected iteration's image).
+    final_depth: Tuple[float, ...] = (3.0, 2.0, 1.0, 0.5)
+    # Radius (arcsec, about the phase center) of the aperture used for the
+    # flux convergence test. None = the CLEAN mask region, or 5 beams
+    # (rms_exclude_beam_factor) when there is no mask.
+    final_aperture_arcsec: Optional[float] = None
     # Mask strategy. Supported values:
     #   "auto-multithresh" (default): CASA's automatic threshold-based masking.
     #       Works in any CASA version. Robust for typical ALMA continuum sources.
@@ -121,10 +173,10 @@ class ImagingConfig:
     #       tclean call. The saved mask is reused by all subsequent self-cal
     #       iterations. REQUIRES CASA <= 6.6; the casaviewer GUI was removed
     #       in CASA 6.7+, so interactive tclean is non-functional there.
-    #   "user": use a pre-made mask file supplied via `user_mask`. This is the
-    #       portable option for CASA 6.7+ users: prepare a mask externally
-    #       (e.g. with CARTA, an older CASA installation, or any FITS-aware
-    #       tool) and point AJISAI at it.
+    #       Refused when AJISAIConfig.caller == "asebi".
+    #   "user": use a pre-made mask supplied via `user_mask`: a CRTF region
+    #       file (text, first line "#CRTF") or a CASA mask image. It is passed
+    #       to every tclean (initial, each iteration, final).
     #   "none": no mask at all (cleans without restriction). Rarely useful.
     mask_mode: str = "auto-multithresh"
     user_mask: Optional[str] = None
@@ -140,13 +192,21 @@ class ImagingConfig:
 class GainCalConfig:
     """gaincal/applycal-related parameters."""
     minblperant: int = 4
-    minsnr: float = 1.5
+    # Solutions below this SNR are dropped (the data stay unflagged: calonly).
+    minsnr: float = 3.0
     gaintype: str = "T"
     combine: str = "scan"
     gaincal_interp: str = "linear,linear"
-    applycal_interp: str = "linearPD"
+    # "perobs": time interpolation never crosses an observation (execution
+    # block) boundary of a concatenated MS; ignored for a single observation.
+    applycal_interp: str = "linearPDperobs"
     applymode: str = "calonly"
-    calwt: bool = True
+    # False: the self-cal tables never change WEIGHT (an amplitude step with
+    # calwt=True would rescale the weights by |g|^2).
+    calwt: bool = False
+    # spwmap passed to applycal for every table, e.g. (0, 0, 0, 0) when the
+    # solve combines spws; () = identity.
+    spwmap: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -239,6 +299,17 @@ class AJISAIConfig:
     # justification but do NOT alter pipeline flow. This preserves the
     # deterministic fixed-schedule identity (no adaptive rollback).
     on_iter_anomaly: str = "log_only"      # "log_only" (default) | future: "warn_loudly"
+
+    # === Data hygiene ===
+    # AJISAI never writes to the input MS (``vis``): every MODEL/CORRECTED
+    # column and every relabelling lives in copies under results_dir. When
+    # this is True and the input carries J2000 frame codes, a copy
+    # (intermediate/input_icrs.ms) is relabelled J2000 -> ICRS (frame code
+    # only; coordinates are not converted) and used as the working MS.
+    relabel_j2000_to_icrs: bool = True
+    # Who drives this run: "user" (standalone) or "asebi" (the ASEBI pipeline).
+    # With "asebi", interactive masking is refused (viewer-free operation).
+    caller: str = "user"
 
     # === Misc ===
     verbose: bool = True
@@ -474,6 +545,477 @@ def compute_image_stats(
 
 
 # ============================================================================
+# Pure helpers for imaging, self-cal bookkeeping and checks (CASA-independent)
+# ============================================================================
+
+# tclean products that carry a Taylor-term suffix (".tt0", ".tt1", ...) when
+# deconvolver="mtmfs" (nterms > 1). Others (mask, alpha, alpha.error) do not.
+_TAYLOR_PRODUCTS = ("image", "model", "residual", "psf", "sumwt", "pb", "weight")
+
+
+def _image_name(base, nterms: int = 1, product: str = "image", term: int = 0) -> str:
+    """Name of a tclean product for an image base name.
+
+    ``nterms == 1``: ``<base>.<product>`` (``.image``, ``.model``, ...).
+    ``nterms > 1`` (mtmfs): ``<base>.<product>.tt<term>`` for the Taylor
+    products (image, model, residual, psf, sumwt, pb, weight); the other
+    products (``mask``, ``alpha``, ``alpha.error``) never take a suffix.
+
+    Every place that reads an image (statistics, FITS export, model
+    prediction, checks) goes through this helper, so that statistics are
+    always taken on the Taylor-0 (``tt0``) image.
+    """
+    base = str(base)
+    if int(nterms) > 1 and product in _TAYLOR_PRODUCTS:
+        return f"{base}.{product}.tt{int(term)}"
+    return f"{base}.{product}"
+
+
+def _model_images(base, nterms: int = 1) -> List[str]:
+    """Model image(s) of a tclean run: one per Taylor term for mtmfs."""
+    if int(nterms) > 1:
+        return [_image_name(base, nterms, "model", t) for t in range(int(nterms))]
+    return [_image_name(base, 1, "model")]
+
+
+def _deconvolver_kwargs(deconvolver: str, nterms: int, scales) -> Dict[str, Any]:
+    """tclean deconvolver/nterms/scales for an ImagingConfig.
+
+    ``nterms > 1`` always selects ``mtmfs``; the multiscale scales are kept
+    (``[0]`` when the configured deconvolver is not a multiscale one).
+    """
+    nterms = int(nterms)
+    sc = [int(x) for x in scales] if scales else [0]
+    if nterms > 1:
+        if deconvolver not in ("multiscale", "mtmfs"):
+            sc = [0]
+        return {"deconvolver": "mtmfs", "nterms": nterms, "scales": sc}
+    if deconvolver in ("multiscale", "mtmfs"):
+        out: Dict[str, Any] = {"deconvolver": deconvolver, "scales": sc}
+        if deconvolver == "mtmfs":
+            out["nterms"] = 1
+        return out
+    return {"deconvolver": deconvolver}
+
+
+def _cell_to_arcsec(cell) -> float:
+    """Parse a tclean cell ("0.0062arcsec", "6.2mas", '0.1"', 0.1) to arcsec."""
+    if isinstance(cell, (list, tuple)):
+        cell = cell[0]
+    if isinstance(cell, (int, float)):
+        return float(cell)
+    m = re.fullmatch(r"\s*([0-9.eE+-]+)\s*(arcsec|\"|mas|arcmin|deg|rad)?\s*", str(cell))
+    if not m:
+        raise ValueError(f"cannot parse cell {cell!r}; use e.g. '0.0062arcsec' or '6.2mas'")
+    value = float(m.group(1))
+    unit = m.group(2) or "arcsec"
+    factor = {"arcsec": 1.0, '"': 1.0, "mas": 1e-3, "arcmin": 60.0,
+              "deg": 3600.0, "rad": 180.0 * 3600.0 / math.pi}[unit]
+    return value * factor
+
+
+def _imsize_list(imsize) -> List[int]:
+    """Normalise an imsize (N or (Nx, Ny)) to tclean's [Nx, Ny]."""
+    if isinstance(imsize, (int, np.integer)):
+        return [int(imsize), int(imsize)]
+    vals = [int(x) for x in imsize]
+    if len(vals) == 1:
+        return [vals[0], vals[0]]
+    if len(vals) != 2:
+        raise ValueError(f"imsize must be N or (Nx, Ny); got {imsize!r}")
+    return vals
+
+
+def scale_ladder(beam_pix: float, max_scale_pix: float, ratio: float = 3.0) -> List[int]:
+    """Multiscale scales ``0, b, ratio*b, ratio^2*b, ...`` not larger than ``max_scale_pix``.
+
+    ``b`` is the beam FWHM in pixels. Scales are rounded to whole pixels and
+    duplicates removed; 0 (the point component) is always first.
+    """
+    if not (beam_pix > 0 and math.isfinite(beam_pix)):
+        return [0]
+    out = [0]
+    s = float(beam_pix)
+    while s <= max_scale_pix + 1e-9:
+        v = int(round(s))
+        if v > out[-1]:
+            out.append(v)
+        s *= ratio
+    return out
+
+
+def _disk_fits(mask, radius_pix: float) -> bool:
+    """True if a disk of radius ``radius_pix`` fits entirely inside ``mask``.
+
+    This mirrors CASA's own test (MatrixCleaner "Ignoring scale N since it is
+    too large to fit within the mask"): a multiscale component of scale size
+    ``s`` pixels has a support of radius ``s``. Computed by an FFT
+    correlation of the mask's bounding box with the disk.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if radius_pix <= 0:
+        return bool(mask.any())
+    idx = np.argwhere(mask)
+    if idx.size == 0:
+        return False
+    lo = idx.min(axis=0)
+    hi = idx.max(axis=0) + 1
+    sub = mask[tuple(slice(a, b) for a, b in zip(lo, hi))].astype(float)
+    r = int(math.ceil(radius_pix))
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    disk = (xx ** 2 + yy ** 2) <= radius_pix ** 2
+    if disk.shape[0] > sub.shape[0] or disk.shape[1] > sub.shape[1]:
+        return False
+    shape = [sub.shape[0] + disk.shape[0], sub.shape[1] + disk.shape[1]]
+    conv = np.fft.irfft2(np.fft.rfft2(sub, shape) * np.fft.rfft2(disk.astype(float), shape),
+                         shape)
+    return bool((conv > disk.sum() - 0.5).any())
+
+
+def multiscale_scales(
+    beam_pix: float,
+    region_mask=None,
+    ratio: float = 3.0,
+) -> Tuple[List[int], str]:
+    """Scales for multiscale/mtmfs CLEAN from the beam and the mask region.
+
+    With a mask region (the user's CRTF rasterised on the image grid): the
+    factor-``ratio`` ladder ``0, b, 3b, 9b, ...`` up to the largest scale
+    whose support (radius = scale) fits inside the region, i.e. half the
+    region size for a round region. Larger scales would be ignored by CASA
+    ("Ignoring scale ... too large to fit within the mask").
+    Without a region: ``0, b, 3b`` (the v0.2 rule ``[0, 1, 3] x beam``).
+
+    Returns ``(scales, reason)``.
+    """
+    b = float(beam_pix)
+    if region_mask is None or not np.asarray(region_mask, dtype=bool).any():
+        scales = scale_ladder(b, 3.0 * b * (1 + 1e-9), ratio=ratio)
+        return scales, (f"[0, 1, 3] x beam (beam = {b:.2f} pix); no mask region to "
+                        f"bound larger scales")
+    mask = np.asarray(region_mask, dtype=bool)
+    # Candidate ladder up to the region's bounding size, then keep those that fit.
+    extent = float(max(np.ptp(np.argwhere(mask), axis=0)) + 1)
+    candidates = scale_ladder(b, extent, ratio=ratio)
+    scales = [0]
+    for s in candidates[1:]:
+        if _disk_fits(mask, s):
+            scales.append(s)
+        else:
+            break
+    return scales, (f"0, b, {ratio:g}b, ... (b = beam = {b:.2f} pix) up to the largest scale "
+                    f"whose support fits inside the mask region ({int(mask.sum())} pix, "
+                    f"extent {extent:.0f} pix)")
+
+
+# CASA Stokes codes of the correlation products (casacore Stokes enum).
+_CORR_RR, _CORR_LL = 5, 8
+_CORR_XX, _CORR_YY = 9, 12
+
+
+def _noise_stokes(corr_types_per_pol) -> Optional[str]:
+    """Stokes parameter whose image is signal-free noise, or None.
+
+    ``(XX - YY)/2`` is Stokes Q for linear feeds, ``(RR - LL)/2`` Stokes V for
+    circular feeds; both have the same thermal noise as Stokes I and (to the
+    level of the source polarisation) no signal. Every polarisation setup
+    of the MS must contain the parallel-hand pair.
+    """
+    setups = [set(int(c) for c in np.asarray(ct).ravel()) for ct in corr_types_per_pol]
+    if not setups:
+        return None
+    if all({_CORR_XX, _CORR_YY} <= s for s in setups):
+        return "Q"
+    if all({_CORR_RR, _CORR_LL} <= s for s in setups):
+        return "V"
+    return None
+
+
+def solint_seconds(solint: str, int_time_s: Optional[float] = None) -> Optional[float]:
+    """Solution interval in seconds from a resolved CASA solint string.
+
+    ``"inf"`` -> None (one solution per scan, or per observation with
+    ``combine='scan'``); ``"int"`` -> the integration time; ``"36.300s"``,
+    ``"1.5min"``, ``"0.5h"``, ``"60"`` -> seconds.
+    """
+    s = str(solint).strip().lower()
+    if s == "inf":
+        return None
+    if s == "int":
+        return float(int_time_s) if int_time_s is not None else None
+    m = re.fullmatch(r"([0-9.]+(?:e[+-]?[0-9]+)?)\s*(s|sec|min|m|h)?", s)
+    if not m:
+        raise ValueError(f"cannot convert solint {solint!r} to seconds")
+    value = float(m.group(1))
+    unit = m.group(2) or "s"
+    return value * {"s": 1.0, "sec": 1.0, "min": 60.0, "m": 60.0, "h": 3600.0}[unit]
+
+
+def flagged_solution_fractions(obs_ids, spw_ids, flags) -> List[Dict[str, Any]]:
+    """Fraction of flagged gain solutions per (observation, spw).
+
+    ``flags`` is the caltable FLAG column (npol, nchan, nrow); a solution
+    (row) counts as flagged when all its entries are flagged (e.g. below
+    ``minsnr``).
+    """
+    obs = np.asarray(obs_ids).ravel()
+    spw = np.asarray(spw_ids).ravel()
+    f = np.asarray(flags, dtype=bool)
+    row_flagged = f.reshape(-1, f.shape[-1]).all(axis=0) if f.size else np.zeros(0, bool)
+    out = []
+    for o, w in sorted(set(zip(obs.tolist(), spw.tolist()))):
+        sel = (obs == o) & (spw == w)
+        n = int(sel.sum())
+        k = int(row_flagged[sel].sum())
+        out.append({"observation": int(o), "spw": int(w), "n_solutions": n,
+                    "n_flagged": k, "fraction": (k / n) if n else None})
+    return out
+
+
+# Keys of the per-stage solve record (AJISAI.stages[i]["solve"]); stable API
+# for callers that re-use the solutions (e.g. ASEBI's line re-solve).
+SOLVE_INFO_KEYS = (
+    "table", "solint", "solint_s", "combine", "refant", "calmode", "gaintype",
+    "minsnr", "minblperant", "solnorm", "applycal", "model_image", "model_nterms",
+    "model_reffreq_hz", "solved_on", "stage_ms", "n_solutions",
+    "flagged_solution_fraction",
+)
+
+
+def build_solve_info(
+    *,
+    table: str,
+    solint: str,
+    solint_s: Optional[float],
+    combine: str,
+    refant: str,
+    calmode: str,
+    gaintype: str,
+    minsnr: float,
+    minblperant: int,
+    solnorm: bool,
+    interp: str,
+    applymode: str,
+    calwt: bool,
+    spwmap,
+    model_image,
+    model_nterms: int,
+    model_reffreq_hz: Optional[float],
+    solved_on: str,
+    stage_ms: Optional[str],
+    n_solutions: int,
+    flagged_solution_fraction: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Per-stage record of how the gain table was solved and applied.
+
+    Enough to re-solve the same stage later (same solint, combine, refant,
+    model) and to re-apply the table elsewhere (interp, applymode, spwmap).
+    """
+    info = {
+        "table": str(table),
+        "solint": str(solint),
+        "solint_s": solint_s,
+        "combine": combine,
+        "refant": refant,
+        "calmode": calmode,
+        "gaintype": gaintype,
+        "minsnr": float(minsnr),
+        "minblperant": int(minblperant),
+        "solnorm": bool(solnorm),
+        "applycal": {
+            "interp": interp,
+            "applymode": applymode,
+            "calwt": bool(calwt),
+            "spwmap": [int(x) for x in spwmap] if spwmap else [],
+        },
+        "model_image": [str(m) for m in model_image] if isinstance(model_image, (list, tuple))
+        else [str(model_image)],
+        "model_nterms": int(model_nterms),
+        "model_reffreq_hz": model_reffreq_hz,
+        "solved_on": str(solved_on),
+        "stage_ms": str(stage_ms) if stage_ms is not None else None,
+        "n_solutions": int(n_solutions),
+        "flagged_solution_fraction": flagged_solution_fraction,
+    }
+    return info
+
+
+# Largest offset between the image's spectral frame (LSRK) and the data's
+# (TOPO) as a fraction of frequency: 60 km/s (Earth's orbit + rotation + the
+# Sun's motion are < 50 km/s).
+_DOPPLER_TOLERANCE = 2.0e-4
+
+
+def imaging_consistency_problems(
+    ref_freq_hz: float,
+    width_hz: float,
+    sumwt: float,
+    data_fmin_hz: Optional[float],
+    data_fmax_hz: Optional[float],
+    tolerance: float = _DOPPLER_TOLERANCE,
+) -> List[str]:
+    """Problems with an MFS image made by tclean ([] if consistent).
+
+    1. The frequency axis is finite and positive.
+    2. The image's single channel ``[ref - width/2, ref + width/2]`` covers
+       the data's frequency range (within the LSRK/TOPO Doppler tolerance).
+       A narrower band means tclean dropped channels (seen with spws of
+       different channel counts in CASA 6.5/6.7).
+    3. ``sumwt > 0`` (some data were gridded).
+    """
+    problems = []
+    if not (np.isfinite(ref_freq_hz) and ref_freq_hz > 0):
+        problems.append(f"reference frequency is not finite/positive ({ref_freq_hz!r})")
+    if not (np.isfinite(width_hz) and width_hz != 0):
+        problems.append(f"frequency width is not finite/non-zero ({width_hz!r})")
+    if not problems and data_fmin_hz is not None and data_fmax_hz is not None:
+        half = abs(width_hz) / 2.0
+        lo, hi = ref_freq_hz - half, ref_freq_hz + half
+        tol = tolerance * data_fmax_hz
+        if lo > data_fmin_hz + tol or hi < data_fmax_hz - tol:
+            problems.append(
+                f"image band {lo / 1e9:.6f}-{hi / 1e9:.6f} GHz does not cover the data "
+                f"{data_fmin_hz / 1e9:.6f}-{data_fmax_hz / 1e9:.6f} GHz (channels dropped)")
+    if not (np.isfinite(sumwt) and sumwt > 0):
+        problems.append(f"sumwt is not positive ({sumwt!r}): no data were gridded")
+    return problems
+
+
+def model_zero_channels(absmax_by_chan, n_unflagged_by_chan) -> List[int]:
+    """Channels with unflagged data whose MODEL is zero (or not finite) everywhere.
+
+    After ``ft`` (or a tclean model prediction) every unflagged channel must
+    carry a non-zero model; zeros mean the channel fell outside the model's
+    band and would be dropped from the gain solve.
+    """
+    a = np.asarray(absmax_by_chan, dtype=float)
+    n = np.asarray(n_unflagged_by_chan)
+    bad = (n > 0) & ~(np.isfinite(a) & (a > 0))
+    return [int(i) for i in np.flatnonzero(bad)]
+
+
+def psf_volume_within(psf, radius_pix: float) -> float:
+    """Sum of the PSF (peak normalised to 1) within ``radius_pix`` of its peak.
+
+    This is Omega_R, the dirty-beam volume in pixels that converts a sum of
+    residual pixels (Jy/beam) inside an aperture of that size into Jy.
+    """
+    p = np.asarray(psf, dtype=float)
+    p = np.where(np.isfinite(p), p, 0.0)
+    peak_idx = np.unravel_index(int(np.argmax(p)), p.shape)
+    peak = p[peak_idx]
+    if not peak > 0:
+        raise ValueError("PSF has no positive peak")
+    grids = np.indices(p.shape)
+    r2 = sum((g - c) ** 2 for g, c in zip(grids, peak_idx))
+    return float(p[r2 <= radius_pix ** 2].sum() / peak)
+
+
+def aperture_flux_terms(
+    model,
+    residual,
+    psf,
+    aperture,
+    cell_arcsec: float,
+    bmaj_arcsec: float,
+    bmin_arcsec: float,
+    sigma_jy: float,
+) -> Dict[str, Any]:
+    """Flux bookkeeping of a CLEAN image inside an aperture.
+
+    - ``F_model`` = sum of the model (Jy/pixel) inside the aperture.
+    - ``Omega_R`` = PSF volume within the radius of a circle of the same
+      area as the aperture (pixels); ``F_unc = sum(residual)/Omega_R`` is the
+      flux not yet CLEANed; ``F_corr = F_model + F_unc``.
+    - ``sigma_F = sigma sqrt(N_pix / Omega_R)``: noise of ``F_unc`` for
+      residual noise sigma (Jy/beam) correlated over the dirty beam.
+    - ``Omega_clean`` = restoring-beam area (pixels); the restored image
+      counts the residual with the CLEAN beam, so its aperture flux is biased
+      by ``F_unc (Omega_R/Omega_clean - 1)`` (``restored_bias_jy``).
+    """
+    ap = np.asarray(aperture, dtype=bool)
+    n_pix = int(ap.sum())
+    if n_pix == 0:
+        raise ValueError("empty aperture")
+    model = np.asarray(model, dtype=float)
+    residual = np.asarray(residual, dtype=float)
+    radius = math.sqrt(n_pix / math.pi)
+    omega_r = psf_volume_within(psf, radius)
+    if not omega_r > 0:
+        raise ValueError(f"PSF volume within the aperture is not positive ({omega_r})")
+    f_model = float(np.nansum(model[ap]))
+    f_unc = float(np.nansum(residual[ap])) / omega_r
+    sigma_f = float(sigma_jy) * math.sqrt(n_pix / omega_r)
+    omega_clean = math.pi * bmaj_arcsec * bmin_arcsec / (4.0 * math.log(2.0)) / cell_arcsec ** 2
+    return {
+        "aperture_npix": n_pix,
+        "aperture_radius_equiv_pix": radius,
+        "omega_r_pix": omega_r,
+        "omega_clean_pix": omega_clean,
+        "f_model_jy": f_model,
+        "f_unc_jy": f_unc,
+        "f_corr_jy": f_model + f_unc,
+        "sigma_f_jy": sigma_f,
+        "restored_bias_jy": f_unc * (omega_r / omega_clean - 1.0),
+    }
+
+
+def final_depth_decision(
+    f_model_jy: float,
+    f_unc_jy: float,
+    sigma_f_jy: float,
+    prev_f_corr_jy: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Stop rule of the final image's CLEAN depth (decided 2026-10-15).
+
+    After each depth stage (3 -> 2 -> 1 -> 0.5 sigma_th) with
+    ``F_corr = F_model + F_unc`` inside the aperture and the width
+    ``w = max(3 sigma_F, 0.01 F_corr)``, stop when
+
+    - ``|F_unc| <= w`` (the flux left in the residual is within the noise /
+      1 % of the total), or
+    - ``|F_corr - F_corr(previous stage)| <= w`` (deeper CLEAN no longer
+      changes the corrected flux).
+    """
+    f_corr = f_model_jy + f_unc_jy
+    width = max(3.0 * sigma_f_jy, 0.01 * abs(f_corr))
+    unc_ok = abs(f_unc_jy) <= width
+    change = None if prev_f_corr_jy is None else f_corr - prev_f_corr_jy
+    change_ok = change is not None and abs(change) <= width
+    if unc_ok:
+        reason = (f"|F_unc| = {abs(f_unc_jy) * 1e3:.3g} mJy <= max(3 sigma_F, 1% F_corr) "
+                  f"= {width * 1e3:.3g} mJy")
+    elif change_ok:
+        reason = (f"F_corr changed by {abs(change) * 1e3:.3g} mJy since the previous stage "
+                  f"<= max(3 sigma_F, 1% F_corr) = {width * 1e3:.3g} mJy")
+    else:
+        reason = (f"|F_unc| = {abs(f_unc_jy) * 1e3:.3g} mJy > {width * 1e3:.3g} mJy"
+                  + ("" if change is None else
+                     f" and F_corr changed by {abs(change) * 1e3:.3g} mJy"))
+    return {
+        "f_corr_jy": f_corr,
+        "width_jy": width,
+        "f_unc_within_width": bool(unc_ok),
+        "f_corr_change_jy": change,
+        "f_corr_change_within_width": bool(change_ok),
+        "stop": bool(unc_ok or change_ok),
+        "reason": reason,
+    }
+
+
+def _relabel_needed(ref_code_columns, source_direction_ref: Optional[str]) -> bool:
+    """Would :func:`relabel_J2000_to_ICRS` change anything?
+
+    ``ref_code_columns``: the FIELD ``*_Ref`` integer columns (0 = J2000);
+    ``source_direction_ref``: the SOURCE.DIRECTION MEASINFO reference.
+    """
+    for col in ref_code_columns:
+        if np.any(np.asarray(col) == 0):
+            return True
+    return source_direction_ref == "J2000"
+
+
+# ============================================================================
 # MS-querying utilities (CASA-dependent)
 # ============================================================================
 
@@ -534,7 +1076,8 @@ def relabel_J2000_to_ICRS(msfile: str, verbose: bool = False) -> None:
 
     Ported from AJISAI.py. Addresses the J2000/ICRS confusion that has
     historically caused CASA imaging tasks to error on archival ALMA data.
-    Operates in place on the MS; safe to call repeatedly (idempotent).
+    Operates in place on the MS; safe to call repeatedly (idempotent). The
+    pipeline calls it only on its own copies (never on the input MS).
     """
     _require_casa()
     tb = casatools.table()
@@ -823,13 +1366,25 @@ class AJISAI:
             "input_config": asdict(config),
             "derived": {},
             "iterations": [],
+            "stages": [],
+            "checks": [],
             "best": None,
+            "final_ms": None,
+            "final_image": None,
         }
         self._derived: Dict[str, Any] = {}
         self.workdir: Optional[Path] = None
         self.best_image: Optional[str] = None
         self.best_fits: Optional[str] = None
         self.best_metric_value: Optional[float] = None
+        # Per-stage records (stage 0 = no self-cal): data and stage MS, image
+        # and model, and for stages >= 1 the solve information ("solve", see
+        # SOLVE_INFO_KEYS). Also written to justification.json ("stages").
+        self.stages: List[Dict[str, Any]] = []
+        # DATA-only MS of the selected stage, and the final (deep) image.
+        self.final_ms: Optional[str] = None
+        self.final_image: Optional[str] = None
+        self.final_fits: Optional[str] = None
 
     # ----------------------------------------------------------------------
     # Public API
@@ -841,14 +1396,21 @@ class AJISAI:
 
         1. Validate inputs.
         2. Set up working directory.
-        3. Inspect MS (refant, frequency, integration time, etc.).
-        4. Compute imaging parameters (cell, imsize, scales).
-        5. Make dirty image (initial RMS reference).
+        3. Inspect MS (refant, frequency, integration time, etc.); the input
+           MS is only read (a relabelled copy is made if needed).
+        4. Compute imaging parameters (cell from u_max, imsize from the
+           primary beam of the smallest dish).
+        5. Make dirty image (beam and peak).
         6. Apply phase shift if requested (off by default).
-        7. Make initial CLEAN image (iteration 0).
-        8. Run each self-cal iteration in the schedule.
-        9. Select the best iteration by quality metric.
-        10. Write summary CSV, summary PNG, and justification JSON.
+        7. Measure the thermal noise sigma_th on a signal-free dirty image.
+        8. Derive the multiscale scales from the beam and the mask region.
+        9. Make initial CLEAN image (iteration 0).
+        10. Run each self-cal iteration in the schedule (each on a temporary
+            copy of the previous stage's MS; stage MSs are kept).
+        11. Select the best iteration by quality metric.
+        12. Write the DATA-only ``final_selfcal.ms`` of that iteration and
+            make the final (deep) image from it.
+        13. Write summary CSV, summary PNG, and justification JSON.
         """
         self.justification["started_at"] = datetime.utcnow().isoformat() + "Z"
         if self.cfg.show_banner:
@@ -860,10 +1422,14 @@ class AJISAI:
             self._compute_imaging_params()
             self._make_dirty_image()
             self._apply_phase_shift_if_requested()
+            self._measure_noise()
+            self._compute_scales()
             self._make_initial_clean()
             for i, step in enumerate(self.cfg.schedule.steps, 1):
                 self._run_iteration(i, step)
             self._select_best()
+            self._write_final_ms()
+            self._make_final_image()
             self._write_summary()
         finally:
             self.justification["finished_at"] = datetime.utcnow().isoformat() + "Z"
@@ -970,6 +1536,9 @@ Infrastructure
                 f"rms_target_radius_arcsec is set but rms_method={cfg.rms_method!r}; "
                 "the radius is only used by rms_method='annulus' and will be ignored."
             )
+        # caller
+        if cfg.caller not in ("user", "asebi"):
+            raise ValueError(f"caller must be 'user' or 'asebi'; got {cfg.caller!r}")
         # mask_mode validation
         valid_modes = ("auto-multithresh", "interactive", "user", "none")
         if cfg.imaging.mask_mode not in valid_modes:
@@ -977,6 +1546,12 @@ Infrastructure
                 f"imaging.mask_mode must be one of {valid_modes}; "
                 f"got {cfg.imaging.mask_mode!r}"
             )
+        if cfg.imaging.mask_mode == "interactive" and cfg.caller == "asebi":
+            raise ValueError(
+                "mask_mode='interactive' is refused when caller='asebi' (viewer-free "
+                "operation); give a CRTF region file with mask_mode='user' instead"
+            )
+        self._validate_imaging_config()
         if cfg.imaging.mask_mode == "interactive":
             ver = _casa_version_string()
             warnings.warn(
@@ -991,6 +1566,15 @@ Infrastructure
                 "imaging.mask_mode='user' requires imaging.user_mask to be set "
                 "to the path of a pre-made mask file"
             )
+        if cfg.imaging.mask_mode == "user" and os.path.isfile(cfg.imaging.user_mask):
+            with open(cfg.imaging.user_mask, "r", errors="replace") as fh:
+                first = fh.readline()
+            if not first.lstrip().startswith("#CRTF"):
+                raise ValueError(
+                    f"imaging.user_mask {cfg.imaging.user_mask!r} is a file but not a CRTF "
+                    f"region file (its first line must start with '#CRTF'); give a CRTF "
+                    f"file or a CASA mask image"
+                )
         # plot options
         if cfg.plots.images_center not in ("phase", "peak"):
             raise ValueError(
@@ -1022,6 +1606,33 @@ Infrastructure
                     "phase_center is set but phase_shift=False; the coordinates "
                     "will be ignored. Set phase_shift=True to apply the shift."
                 )
+
+    def _validate_imaging_config(self) -> None:
+        """Checks of the ImagingConfig fields added in v0.3 (geometry, depth)."""
+        img = self.cfg.imaging
+        if img.cell_rule not in CELL_RULES:
+            raise ValueError(f"imaging.cell_rule must be one of {CELL_RULES}; got {img.cell_rule!r}")
+        if img.cell is not None and not _cell_to_arcsec(img.cell) > 0:
+            raise ValueError(f"imaging.cell must be positive; got {img.cell!r}")
+        if img.imsize is not None and min(_imsize_list(img.imsize)) < 1:
+            raise ValueError(f"imaging.imsize must be positive; got {img.imsize!r}")
+        if int(img.nterms) < 1:
+            raise ValueError(f"imaging.nterms must be >= 1; got {img.nterms!r}")
+        if img.scales is not None and (len(img.scales) == 0
+                                       or any(int(x) < 0 for x in img.scales)):
+            raise ValueError(f"imaging.scales must be non-negative pixels; got {img.scales!r}")
+        if img.threshold_mode not in ("pure_noise", "image_rms"):
+            raise ValueError("imaging.threshold_mode must be 'pure_noise' or 'image_rms'; "
+                             f"got {img.threshold_mode!r}")
+        if not img.threshold_nsigma > 0:
+            raise ValueError(f"imaging.threshold_nsigma must be positive; got {img.threshold_nsigma!r}")
+        depth = tuple(img.final_depth)
+        if any(not d > 0 for d in depth) or any(b >= a for a, b in zip(depth, depth[1:])):
+            raise ValueError("imaging.final_depth must be positive and strictly decreasing "
+                             f"(e.g. (3, 2, 1, 0.5)); got {img.final_depth!r}")
+        if img.final_aperture_arcsec is not None and not img.final_aperture_arcsec > 0:
+            raise ValueError("imaging.final_aperture_arcsec must be positive; "
+                             f"got {img.final_aperture_arcsec!r}")
 
     def _setup_workdir(self) -> None:
         """Create a unique output directory per field/projname."""
@@ -1070,8 +1681,9 @@ Infrastructure
         # --- Field validation ---
         self._validate_field()
 
-        # --- J2000 → ICRS relabel (CASA hygiene; preserves AJISAI behavior) ---
-        relabel_J2000_to_ICRS(cfg.vis, verbose=cfg.verbose)
+        # --- Working MS: the input is only read; J2000 -> ICRS relabelling
+        #     (CASA hygiene) is done on a copy when needed ---
+        self._prepare_working_vis()
 
         # --- Integration time (per-dump time, used to resolve "N*IT" solints) ---
         # NOTE: original AJISAI named this 'avg_scantime_sec' but it is in fact
@@ -1111,7 +1723,7 @@ Infrastructure
             warnings.warn(f"get_median_frequency failed: {e}")
             self._derived["median_freq_hz"] = None
 
-        # --- SPW info (needed for split width) ---
+        # --- SPW info ---
         tb = casatools.table()
         tb.open(cfg.vis + "/SPECTRAL_WINDOW")
         try:
@@ -1121,8 +1733,20 @@ Infrastructure
             tb.close()
         self._derived["num_chan_per_spw"] = num_chan
         self._derived["nspw"] = nspw
-        # Use the first spw's channel count for chavg width (matches original AJISAI)
-        self._derived["chavg_width"] = num_chan[0]
+
+        # --- Frequency range and correlations of the target field (used by
+        #     the post-tclean checks and the signal-free noise image) ---
+        setup = self._spectral_setup(cfg.vis, int(self._derived["resolved_field_id"]))
+        self._derived["data_fmin_hz"] = setup["fmin_hz"]
+        self._derived["data_fmax_hz"] = setup["fmax_hz"]
+        self._derived["noise_stokes"] = _noise_stokes(setup["corr_types"])
+        self.justification["derived"]["spectral_setup"] = {
+            **setup,
+            "noise_stokes": self._derived["noise_stokes"],
+            "reason": ("frequency range = channel edges of the field's spws (the band "
+                       "every MFS image must cover); noise_stokes = the signal-free "
+                       "Stokes image of the parallel hands ((XX-YY)/2 = Q, (RR-LL)/2 = V)"),
+        }
 
         if cfg.verbose:
             print(f"[AJISAI] integration time      : {inttime_sec:.2f} s")
@@ -1131,6 +1755,69 @@ Infrastructure
             print(f"[AJISAI] median frequency      : "
                   f"{(self._derived.get('median_freq_hz') or 0)/1e9:.3f} GHz")
             print(f"[AJISAI] spectral windows      : {nspw} (channels: {num_chan})")
+
+    def _prepare_working_vis(self) -> None:
+        """Choose the MS that the pipeline reads; never write to the input MS.
+
+        The input MS (``cfg.vis``) is opened read-only by every task. With
+        ``relabel_j2000_to_icrs=True`` (default) and J2000 frame codes in the
+        input, a copy ``intermediate/input_icrs.ms`` is relabelled J2000 ->
+        ICRS (frame code only) and used instead; otherwise the input itself
+        is the working MS (stage 0).
+        """
+        cfg = self.cfg
+        assert self.workdir is not None
+        working = cfg.vis
+        if not cfg.relabel_j2000_to_icrs:
+            reason = "relabel_j2000_to_icrs=False: the input MS is used as it is (read-only)"
+        elif not _ms_needs_relabel(cfg.vis):
+            reason = "no J2000 frame code in the input; it is used as it is (read-only)"
+        else:
+            copy = self.workdir / "intermediate" / "input_icrs.ms"
+            _safe_rmtree_path(copy)
+            _copy_ms(cfg.vis, copy)
+            relabel_J2000_to_ICRS(str(copy), verbose=cfg.verbose)
+            working = str(copy)
+            reason = ("the input carries J2000 frame codes; a copy was relabelled "
+                      "J2000 -> ICRS (frame code only, coordinates unchanged) so that the "
+                      "input MS is never written")
+        self._derived["input_vis"] = cfg.vis
+        self._derived["working_vis"] = working
+        self.justification["derived"]["working_vis"] = {
+            "input_vis": cfg.vis,
+            "working_vis": working,
+            "relabel_j2000_to_icrs": cfg.relabel_j2000_to_icrs,
+            "reason": reason,
+        }
+        if cfg.verbose:
+            print(f"[AJISAI] working MS            : {working}")
+
+    @staticmethod
+    def _spectral_setup(vis: str, field_id: int) -> Dict[str, Any]:
+        """Frequency range (channel edges) and correlation types of a field's spws."""
+        msmd = casatools.msmetadata()
+        msmd.open(vis)
+        try:
+            spws = sorted(int(x) for x in msmd.spwsforfield(field_id))
+            lo: List[float] = []
+            hi: List[float] = []
+            corr: List[List[int]] = []
+            for spw in spws:
+                f = np.asarray(msmd.chanfreqs(spw), dtype=float)
+                w = np.abs(np.asarray(msmd.chanwidths(spw), dtype=float))
+                lo.append(float((f - w / 2.0).min()))
+                hi.append(float((f + w / 2.0).max()))
+                for dd in msmd.datadescids(spw=spw):
+                    pol = msmd.polidfordatadesc(int(dd))
+                    corr.append([int(c) for c in msmd.corrtypesforpol(int(pol))])
+        finally:
+            msmd.close()
+        return {
+            "spws": spws,
+            "fmin_hz": min(lo) if lo else None,
+            "fmax_hz": max(hi) if hi else None,
+            "corr_types": corr,
+        }
 
     def _validate_field(self) -> None:
         """Validate cfg.field exists in MAIN table; auto-detect if None."""
@@ -1187,21 +1874,25 @@ Infrastructure
     # _compute_imaging_params: cellsize, imsize, multiscale scales, MRS
     # ----------------------------------------------------------------------
     def _compute_imaging_params(self) -> None:
-        """Determine cellsize, imsize, multiscale scales from baseline statistics.
+        """Determine cell size and image size (scales follow the dirty image).
 
-        Uses ajisai_ms_utils (native casatools-based replacement for
-        analysisUtils.pickCellSize and getBaselineStats).
+        - Cell: ``ImagingConfig.cell`` if given; otherwise ``cell_rule``:
+          ``"umax"`` (default) = 1/(5 u_max) with u_max from the longest
+          unflagged baseline at the highest frequency, or ``"percentile"``
+          (legacy v0.2 rule, beam from the 90th-percentile baseline /
+          ``cellpix``).
+        - Image size: ``ImagingConfig.imsize`` if given; otherwise the
+          primary beam down to 20 % of the smallest dish in
+          ``ANTENNA/DISH_DIAMETER`` (12 m only as a fallback), rounded up to
+          a 5-smooth size.
         """
-        if not _HAS_MS_UTILS:
-            raise RuntimeError(
-                "ajisai_ms_utils is not importable. Place ajisai_ms_utils.py "
-                "alongside AJISAI_v2.py on sys.path."
-            )
         cfg = self.cfg
+        img = cfg.imaging
+        vis = self._derived["working_vis"]
 
         # --- MRS from 5th-percentile shortest baseline (ALMA Tech Handbook Eq 7.7) ---
         try:
-            short_baseline_m = get_baseline_at_percentile(cfg.vis, percentile=5)
+            short_baseline_m = get_baseline_at_percentile(vis, percentile=5)
             freq_hz = self._derived["median_freq_hz"]
             wavelength_m = 2.99792458e8 / freq_hz
             mrs_arcsec = (0.983 * 180 * 3600 / np.pi) * wavelength_m / short_baseline_m
@@ -1215,62 +1906,93 @@ Infrastructure
                        "ALMA Technical Handbook Eq 7.7"),
         }
 
-        # --- cellsize, imsize (uvtaper-aware) ---
-        cellpix = cfg.imaging.cellpix
-        cell_info = pick_cell_imsize(
-            cfg.vis,
-            npix_per_beam=cellpix,
-            max_baseline_percentile=90,
-            pb_level=0.2,
-            uvtaper=cfg.imaging.uvtaper,
-        )
-        cell_arcsec = cell_info["cell_arcsec"]
-        imsize_xy = cell_info["imsize_xy"]
+        # --- cell size and image size ---
+        cell_info: Optional[Dict[str, Any]] = None
+        if img.cell is None or img.imsize is None:
+            cell_info = pick_cell_imsize(
+                vis,
+                npix_per_beam=img.cellpix,
+                max_baseline_percentile=90,
+                pb_level=0.2,
+                uvtaper=img.uvtaper,
+                rule=img.cell_rule,
+                field=self._derived["resolved_field_id"],
+            )
+        if img.cell is not None:
+            cell_arcsec = _cell_to_arcsec(img.cell)
+            cell = img.cell if isinstance(img.cell, str) else f"{cell_arcsec}arcsec"
+            cell_reason = "ImagingConfig.cell given by the caller"
+        else:
+            assert cell_info is not None
+            cell_arcsec = cell_info["cell_arcsec"]
+            cell = cell_info["cell"]
+            cell_reason = cell_info["justification"]["description"]
+
+        if img.imsize is not None:
+            imsize_xy = _imsize_list(img.imsize)
+            imsize_reason = "ImagingConfig.imsize given by the caller"
+        else:
+            assert cell_info is not None
+            offset = cell_info["justification"]["gaussian_offset_at_pblevel_arcsec"]
+            n = _smallest_5_smooth_at_least(int(math.ceil(2 * offset / cell_arcsec)))
+            imsize_xy = [n, n]
+            imsize_reason = (
+                f"covers down to 20% primary-beam attenuation (Baars taper) of the "
+                f"{cell_info['dish_diameter_m']:g} m dish ({cell_info['dish']['source']}) at "
+                f"{cell_info['pb_freq_hz'] / 1e9:.4f} GHz; rounded to smallest 5-smooth integer"
+            )
+
+        if cell_info is not None:
+            dish = cell_info["dish"]
+            pb_arcsec = cell_info["primary_beam_arcsec"]
+            beam_arcsec = cell_info["beam_fwhm_arcsec"]
+            taper_arcsec = cell_info["taper_image_fwhm_arcsec"]
+            predicted = cell_info["predicted_effective_beam_arcsec"]
+        else:
+            dish = get_dish_diameter_m(vis)
+            freq_hz = self._derived.get("median_freq_hz") or 0.0
+            pb_arcsec = (_primary_beam_fwhm_arcsec(freq_hz, diameter_m=dish["diameter_m"])
+                         if freq_hz > 0 else None)
+            beam_arcsec = None
+            taper_arcsec = 0.0
+            predicted = 0.0   # no prediction -> the beam check is skipped
+
         self._derived["cell_arcsec"] = cell_arcsec
-        self._derived["cell"] = cell_info["cell"]
+        self._derived["cell"] = cell
         self._derived["imsize"] = imsize_xy
-        self._derived["fov_arcsec"] = cell_info["fov_arcsec"]
-        self._derived["primary_beam_arcsec"] = cell_info["primary_beam_arcsec"]
-        self._derived["untapered_beam_arcsec"] = cell_info["beam_fwhm_arcsec"]
-        self._derived["taper_image_fwhm_arcsec"] = cell_info["taper_image_fwhm_arcsec"]
-        self._derived["predicted_effective_beam_arcsec"] = (
-            cell_info["predicted_effective_beam_arcsec"]
-        )
+        self._derived["fov_arcsec"] = imsize_xy[0] * cell_arcsec
+        self._derived["dish_diameter_m"] = dish["diameter_m"]
+        self._derived["primary_beam_arcsec"] = pb_arcsec
+        self._derived["untapered_beam_arcsec"] = beam_arcsec
+        self._derived["taper_image_fwhm_arcsec"] = taper_arcsec
+        self._derived["predicted_effective_beam_arcsec"] = predicted
         self.justification["derived"]["cellsize"] = {
             "value_arcsec": cell_arcsec,
-            "reason": cell_info["justification"]["description"],
+            "rule": "given" if img.cell is not None else img.cell_rule,
+            "uv_max": (cell_info or {}).get("uv_max"),
+            "reason": cell_reason,
         }
         self.justification["derived"]["imsize"] = {
             "value": imsize_xy,
-            "reason": (f"covers down to {0.2:.0%} primary-beam attenuation "
-                       f"(Baars taper); rounded to smallest 5-smooth integer"),
+            "reason": imsize_reason,
         }
-
-        # --- multiscale scales: [0, 1, 3] * effective beam in pixels ---
-        # When uvtaper widens the beam, the scales (in pixels) stay the same
-        # because cell size scales with the beam.
-        scales = [0, cellpix, 3 * cellpix]
-        self._derived["scales"] = scales
-        self.justification["derived"]["scales"] = {
-            "value": scales,
-            "reason": "[0, 1, 3] * synthesized beam (in pixels); "
-                      "Cornwell 2008 multiscale recommendation",
-        }
+        self.justification["derived"]["dish_diameter"] = dish
 
         if cfg.verbose:
-            print(f"[AJISAI] cell                  : {cell_arcsec:.5f} arcsec")
+            print(f"[AJISAI] cell                  : {cell_arcsec:.6g} arcsec "
+                  f"({self.justification['derived']['cellsize']['rule']})")
             print(f"[AJISAI] imsize                : {imsize_xy}")
             print(f"[AJISAI] FoV                   : {self._derived['fov_arcsec']:.2f} arcsec")
-            print(f"[AJISAI] primary beam (FWHM)   : {cell_info['primary_beam_arcsec']:.2f} arcsec")
-            print(f"[AJISAI] untapered beam        : {cell_info['beam_fwhm_arcsec']:.4f} arcsec")
-            if cell_info["taper_image_fwhm_arcsec"] > 0.0:
-                print(f"[AJISAI] uvtaper input         : {list(cfg.imaging.uvtaper)}")
-                print(f"[AJISAI] taper image FWHM      : "
-                      f"{cell_info['taper_image_fwhm_arcsec']:.4f} arcsec")
-                print(f"[AJISAI] predicted eff. beam   : "
-                      f"{cell_info['predicted_effective_beam_arcsec']:.4f} arcsec "
+            print(f"[AJISAI] dish diameter         : {dish['diameter_m']:g} m ({dish['source']})")
+            if pb_arcsec:
+                print(f"[AJISAI] primary beam (FWHM)   : {pb_arcsec:.2f} arcsec")
+            if beam_arcsec:
+                print(f"[AJISAI] untapered beam        : {beam_arcsec:.4f} arcsec")
+            if taper_arcsec > 0.0:
+                print(f"[AJISAI] uvtaper input         : {list(img.uvtaper)}")
+                print(f"[AJISAI] taper image FWHM      : {taper_arcsec:.4f} arcsec")
+                print(f"[AJISAI] predicted eff. beam   : {predicted:.4f} arcsec "
                       f"(actual will be verified after dirty image)")
-            print(f"[AJISAI] multiscale scales     : {scales} pix")
             if mrs_arcsec is not None:
                 print(f"[AJISAI] MRS                   : {mrs_arcsec:.2f} arcsec")
 
@@ -1309,8 +2031,8 @@ Infrastructure
         on the shifted MS.
         """
         cfg = self.cfg
-        # Default: working_vis is the original input MS.
-        # (Set unconditionally here so downstream methods can always use it.)
+        # Default: working_vis is the input MS (or its relabelled copy), set
+        # by _prepare_working_vis; set here too so this method can run alone.
         self._derived.setdefault("working_vis", cfg.vis)
 
         if not cfg.phase_shift:
@@ -1329,7 +2051,7 @@ Infrastructure
             frame = frame.upper()
             source_label = "user-specified"
         else:
-            dirty_image = self.workdir / "intermediate" / "dirty.image"
+            dirty_image = Path(_image_name(self.workdir / "intermediate" / "dirty", 1))
             if not dirty_image.exists():
                 raise RuntimeError(
                     "Phase shift auto-detection requires the dirty image, "
@@ -1360,7 +2082,7 @@ Infrastructure
         shifted_vis = str(self.workdir / "intermediate" / "phaseshifted.ms")
         _safe_rmtree_path(shifted_vis)
         casatasks.phaseshift(
-            vis=cfg.vis,
+            vis=self._derived["working_vis"],
             outputvis=shifted_vis,
             keepmms=True,
             field=self._derived["resolved_field_id"],
@@ -1381,7 +2103,8 @@ Infrastructure
         )
 
         # === Restore ICRS label on the shifted MS (CASA hygiene) ===
-        relabel_J2000_to_ICRS(shifted_vis, verbose=cfg.verbose)
+        if cfg.relabel_j2000_to_icrs:
+            relabel_J2000_to_ICRS(shifted_vis, verbose=cfg.verbose)
 
         # === Update state ===
         self._derived["working_vis"] = shifted_vis
@@ -1396,8 +2119,8 @@ Infrastructure
             "shifted_vis": shifted_vis,
             "reason": (
                 f"shifted source to phase center; source location was "
-                f"{source_label}; fixplanets called in J2000 then MS frame "
-                f"label restored to ICRS"
+                f"{source_label}; fixplanets called in J2000"
+                + ("; MS frame label restored to ICRS" if cfg.relabel_j2000_to_icrs else "")
             ),
         }
 
@@ -1411,37 +2134,15 @@ Infrastructure
     # _make_dirty_image: initial RMS reference (no CLEAN, niter=0)
     # ----------------------------------------------------------------------
     def _make_dirty_image(self) -> None:
-        """Run tclean(niter=0) to estimate initial RMS for threshold setting."""
+        """Run tclean(niter=0): dirty-image peak, RMS and the synthesized beam."""
         cfg = self.cfg
         assert self.workdir is not None
         base = self.workdir / "intermediate" / "dirty"
         _safe_rmtree_glob(self.workdir / "intermediate", "dirty.*")
 
-        casatasks.tclean(
-            vis=cfg.vis,
-            imagename=str(base),
-            datacolumn="data",
-            specmode="mfs",
-            niter=0,
-            threshold="0mJy",
-            deconvolver="hogbom",
-            gridder=cfg.imaging.gridder,
-            interactive=False,
-            imsize=self._derived["imsize"],
-            cell=self._derived["cell"],
-            weighting=cfg.imaging.weighting,
-            robust=cfg.imaging.robust,
-            uvtaper=list(cfg.imaging.uvtaper),
-            pbcor=cfg.imaging.pbcor,
-            parallel=cfg.imaging.parallel,
-            field=self._derived["resolved_field_id"],
-        )
+        self._tclean(self._derived["working_vis"], base, niter=0, threshold_jy=0.0, dirty=True)
         fits_path = self.workdir / "intermediate" / "dirty.fits"
-        if fits_path.exists():
-            fits_path.unlink()
-        casatasks.exportfits(imagename=str(base) + ".image",
-                             fitsimage=str(fits_path), history=False)
-        stats = self.compute_image_stats(str(fits_path))
+        stats = self._export_and_stats(base, 1, fits_path)
         self._derived["dirty_rms"] = stats["rms_jy_beam"]
         self._derived["dirty_peak"] = stats["peak_jy_beam"]
         self._derived["dirty_dr"] = stats["dynamic_range"]
@@ -1469,10 +2170,10 @@ Infrastructure
                     f"actual dirty-image beam ({actual_beam_arcsec:.4f} arcsec) "
                     f"differs from predicted effective beam "
                     f"({predicted:.4f} arcsec) by {rel_diff*100:.0f}%. "
-                    f"Current cell size = {self._derived['cell_arcsec']:.4f} arcsec "
-                    f"is based on the prediction. For tighter pixel sampling, "
-                    f"consider overriding ImagingConfig.cellpix or providing "
-                    f"explicit cell/imsize."
+                    f"Current cell size = {self._derived['cell_arcsec']:.4g} arcsec. "
+                    f"With cell_rule='percentile' the cell is based on the prediction; "
+                    f"for tighter pixel sampling use cell_rule='umax' (default) or "
+                    f"give ImagingConfig.cell/imsize explicitly."
                 )
                 warnings.warn(f"[AJISAI] {msg}")
                 if cfg.verbose:
@@ -1489,62 +2190,164 @@ Infrastructure
                       f"({100*actual_beam_arcsec/predicted:.0f}% of prediction)")
 
     # ----------------------------------------------------------------------
-    # _make_initial_clean: pre-selfcal CLEAN image (Iter 0), saves model
+    # _measure_noise: thermal noise from a signal-free dirty image
     # ----------------------------------------------------------------------
+    def _measure_noise(self) -> None:
+        """Measure sigma_th, the thermal noise, once on a signal-free image.
+
+        The dirty image of ``(XX - YY)/2`` (Stokes Q, linear feeds) or
+        ``(RR - LL)/2`` (Stokes V, circular feeds) has the noise of the
+        Stokes I image but no total-intensity signal or sidelobes, so its
+        off-source RMS is a pure-noise estimate. It sets the absolute CLEAN
+        threshold of every self-cal image (``threshold_nsigma x sigma_th``,
+        the same in every iteration) and the depth stages of the final
+        image. Without a parallel-hand pair the Stokes I dirty-image RMS is
+        used and the fallback is recorded.
+        """
+        cfg = self.cfg
+        assert self.workdir is not None
+        stokes = self._derived.get("noise_stokes")
+        if stokes is None:
+            sigma = float(self._derived["dirty_rms"])
+            info: Dict[str, Any] = {
+                "value_jy_beam": sigma,
+                "stokes": "I",
+                "image": _image_name(self.workdir / "intermediate" / "dirty", 1),
+                "reason": ("no parallel-hand pair (XX,YY or RR,LL) for a signal-free image; "
+                           "off-source RMS of the Stokes I dirty image used instead (includes "
+                           "source sidelobes, so it can overestimate the noise)"),
+            }
+            if cfg.imaging.threshold_mode == "pure_noise":
+                warnings.warn(f"[AJISAI] {info['reason']}")
+        else:
+            interm = self.workdir / "intermediate"
+            base = interm / f"noise_{stokes}"
+            _safe_rmtree_glob(interm, f"noise_{stokes}.*")
+            self._tclean(self._derived["working_vis"], base, niter=0, threshold_jy=0.0,
+                         dirty=True, stokes=stokes)
+            fits_path = interm / f"noise_{stokes}.fits"
+            stats = self._export_and_stats(base, 1, fits_path)
+            sigma = float(stats["rms_jy_beam"])
+            info = {
+                "value_jy_beam": sigma,
+                "stokes": stokes,
+                "image": _image_name(base, 1),
+                "rms_info": stats["rms_info"],
+                "reason": (f"off-source RMS of the Stokes {stokes} dirty image "
+                           f"({'(XX-YY)/2' if stokes == 'Q' else '(RR-LL)/2'}): signal-free, "
+                           f"same weighting, cell and imsize as the Stokes I images"),
+            }
+        if not (np.isfinite(sigma) and sigma > 0):
+            raise RuntimeError(f"sigma_th is not positive ({sigma!r}); cannot set CLEAN thresholds")
+        self._derived["sigma_th"] = sigma
+        self.justification["derived"]["sigma_th"] = info
+        if cfg.verbose:
+            print(f"[AJISAI] sigma_th              : {sigma * 1e6:.3f} uJy/bm "
+                  f"(Stokes {info['stokes']} dirty image)")
+
+    # ----------------------------------------------------------------------
+    # _compute_scales: multiscale scales from the beam and the mask region
+    # ----------------------------------------------------------------------
+    def _compute_scales(self) -> None:
+        """Multiscale scales (pixels) used by every multiscale/mtmfs tclean.
+
+        ``ImagingConfig.scales`` if given; otherwise 0, b, 3b, 9b, ... with
+        ``b`` the dirty-image beam FWHM in pixels, up to the largest scale
+        that fits inside the user mask region (CRTF rasterised on the image
+        grid); without a user mask, 0, b, 3b.
+        """
+        cfg = self.cfg
+        img = cfg.imaging
+        if img.scales is not None:
+            scales = [int(x) for x in img.scales]
+            reason = "ImagingConfig.scales given by the caller"
+        else:
+            dirty = self.justification["derived"].get("dirty_image") or {}
+            beam_as = math.sqrt((dirty.get("bmaj_arcsec") or 0.0) * (dirty.get("bmin_arcsec") or 0.0))
+            beam_pix = beam_as / self._derived["cell_arcsec"] if beam_as > 0 else 0.0
+            region = self._user_mask_region()
+            scales, reason = multiscale_scales(beam_pix, region)
+        used = int(img.nterms) > 1 or img.deconvolver in ("multiscale", "mtmfs")
+        self._derived["scales"] = scales
+        self.justification["derived"]["scales"] = {
+            "value": scales,
+            "used": used,
+            "deconvolver": _deconvolver_kwargs(img.deconvolver, img.nterms, scales)["deconvolver"],
+            "reason": reason,
+        }
+        if cfg.verbose:
+            print(f"[AJISAI] multiscale scales     : {scales} pix"
+                  + ("" if used else " (not used by this deconvolver)"))
+
+    def _user_mask_region(self) -> Optional[np.ndarray]:
+        """The user mask (CRTF or mask image) on the dirty-image grid, or None."""
+        cfg = self.cfg
+        if cfg.imaging.mask_mode != "user" or not cfg.imaging.user_mask:
+            return None
+        assert self.workdir is not None
+        path = cfg.imaging.user_mask
+        dirty = _image_name(self.workdir / "intermediate" / "dirty", 1)
+        try:
+            if os.path.isdir(path):
+                region = _read_image_plane(path)
+                if region.shape != _read_image_plane(dirty).shape:
+                    warnings.warn(f"[AJISAI] user mask {path} is not on the image grid; "
+                                  f"scales are not bounded by it")
+                    return None
+            else:
+                out = self.workdir / "intermediate" / "user_mask_on_grid.mask"
+                _safe_rmtree_path(out)
+                casatasks.makemask(mode="copy", inpimage=dirty, inpmask=path,
+                                   output=str(out), overwrite=True)
+                region = _read_image_plane(out)
+        except Exception as e:  # scales fall back to (0, b, 3b)
+            warnings.warn(f"[AJISAI] could not rasterise user mask {path}: {e}")
+            return None
+        return np.asarray(region) > 0.5
+
+    # ----------------------------------------------------------------------
+    # _make_initial_clean: pre-selfcal CLEAN image (Iter 0)
+    # ----------------------------------------------------------------------
+    def _loop_threshold_jy(self, previous_rms: float) -> float:
+        """CLEAN threshold of a self-cal image (initial CLEAN and every iteration)."""
+        img = self.cfg.imaging
+        if img.threshold_mode == "pure_noise":
+            return float(img.threshold_nsigma * self._derived["sigma_th"])
+        return float(img.threshold_factor * previous_rms)
+
+    def _threshold_reason(self) -> str:
+        img = self.cfg.imaging
+        if img.threshold_mode == "pure_noise":
+            return (f"{img.threshold_nsigma:g} x sigma_th (absolute, the same for every "
+                    f"self-cal image)")
+        return f"{img.threshold_factor:g} x off-source RMS of the previous image (legacy)"
+
     def _make_initial_clean(self) -> None:
         """Run the first CLEAN to establish the model for the first gaincal.
 
-        Operates on ``self._derived['working_vis']``, which is either the
-        original input MS (default) or the phase-shifted MS produced by
-        :meth:`_apply_phase_shift_if_requested`.
+        Operates on ``self._derived['working_vis']`` (the input MS, its
+        relabelled copy, or the phase-shifted MS) with ``savemodel='none'``:
+        the working MS is never written. The model is predicted into a
+        temporary copy at the first self-cal iteration.
         """
         cfg = self.cfg
         assert self.workdir is not None
         working_vis = self._derived["working_vis"]
-        base = self.workdir / "intermediate" / "clean_iter0"
-        _safe_rmtree_glob(self.workdir / "intermediate", "clean_iter0.*")
+        interm = self.workdir / "intermediate"
+        base = interm / "clean_iter0"
+        _safe_rmtree_glob(interm, "clean_iter0.*")
 
-        threshold_jy = cfg.imaging.threshold_factor * self._derived["dirty_rms"]
+        threshold_jy = self._loop_threshold_jy(self._derived["dirty_rms"])
         # ``usemask_kwargs`` carries everything mask-related INCLUDING the
         # ``interactive`` flag. For mask_mode='interactive', interactive=True
         # is set here; in all other modes (and in subsequent self-cal
         # iterations), interactive=False.
         usemask_kwargs = self._build_usemask_kwargs()
+        nterms = self._tclean(working_vis, base, niter=cfg.imaging.niter,
+                              threshold_jy=threshold_jy, mask_kwargs=usemask_kwargs)
 
-        # First run: actual CLEAN with model save
-        casatasks.tclean(
-            vis=working_vis,
-            imagename=str(base),
-            datacolumn="data",
-            specmode="mfs",
-            niter=cfg.imaging.niter,
-            gain=cfg.imaging.gain,
-            threshold=f"{threshold_jy}Jy",
-            deconvolver=cfg.imaging.deconvolver,
-            scales=self._derived["scales"] if cfg.imaging.deconvolver == "multiscale" else [],
-            gridder=cfg.imaging.gridder,
-            cyclefactor=cfg.imaging.cyclefactor,
-            imsize=self._derived["imsize"],
-            cell=self._derived["cell"],
-            weighting=cfg.imaging.weighting,
-            robust=cfg.imaging.robust,
-            uvtaper=list(cfg.imaging.uvtaper),
-            pbcor=cfg.imaging.pbcor,
-            savemodel="modelcolumn",
-            parallel=cfg.imaging.parallel,
-            field=self._derived["resolved_field_id"],
-            **usemask_kwargs,
-        )
-        # Verify model column was populated; if not, rerun with niter=0 + savemodel
-        self._ensure_model_column(working_vis, base, threshold_jy)
-
-        # Export FITS + compute stats
-        fits_path = self.workdir / "intermediate" / "clean_iter0.fits"
-        if fits_path.exists():
-            fits_path.unlink()
-        casatasks.exportfits(imagename=str(base) + ".image",
-                             fitsimage=str(fits_path), history=False)
-        stats = self.compute_image_stats(str(fits_path))
+        fits_path = interm / "clean_iter0.fits"
+        stats = self._export_and_stats(base, nterms, fits_path)
 
         # Record as iteration 0
         rec = {
@@ -1552,178 +2355,239 @@ Infrastructure
             "label": "no_selfcal",
             "calmode": "-",
             "solint": "-",
+            "solint_s": None,
             "peak_jy_beam": stats["peak_jy_beam"],
             "rms_jy_beam": stats["rms_jy_beam"],
             "snr": stats["snr"],
             "dynamic_range": stats["dynamic_range"],
             "bmaj_arcsec": stats["bmaj_arcsec"],
             "bmin_arcsec": stats["bmin_arcsec"],
+            "threshold_jy": threshold_jy,
             "n_gaincal_solutions": None,
             "status": "ok",
             "failure_reason": None,
-            "image_path": str(base) + ".image",
+            "image_path": _image_name(base, nterms),
+            "image_base": str(base),
             "fits_path": str(fits_path),
+            "caltable": None,
+            "selfcal_ms": None,
         }
         self.metrics.append(rec)
         self.justification["iterations"].append(rec)
+        self._add_stage({
+            "stage": 0,
+            "label": "no_selfcal",
+            "status": "ok",
+            "data_ms": str(working_vis),
+            "stage_ms": None,
+            "image_base": str(base),
+            "image": _image_name(base, nterms),
+            "nterms": nterms,
+            "model_image": _model_images(base, nterms),
+            "threshold_jy": threshold_jy,
+            "threshold_reason": self._threshold_reason(),
+            "solve": None,
+        })
 
-        # Initial state for the iteration chain. good_vis is the MS that the
-        # first gaincal will run against (= the working MS, possibly shifted).
+        # Initial state for the iteration chain. good_vis is the MS whose
+        # temporary copy the first gaincal/applycal will run on; its MODEL
+        # column does not hold this model yet (the working MS is read-only).
         self._derived["good_vis"] = str(working_vis)
+        self._derived["good_vis_model_from"] = None
+        self._derived["last_image_base"] = str(base)
+        self._derived["last_nterms"] = nterms
         self._derived["last_dr"] = stats["dynamic_range"]
         self._derived["last_rms"] = stats["rms_jy_beam"]
-        self._derived["initial_mask_path"] = str(base) + ".mask"
+        self._derived["initial_mask_path"] = _image_name(base, nterms, "mask")
 
         if cfg.verbose:
             print(f"[AJISAI] iter 0 (no selfcal)   : DR={stats['dynamic_range']:.1f}, "
                   f"peak={stats['peak_jy_beam']*1e3:.3f} mJy/bm, "
-                  f"RMS={stats['rms_jy_beam']*1e6:.2f} uJy/bm")
+                  f"RMS={stats['rms_jy_beam']*1e6:.2f} uJy/bm "
+                  f"(threshold {threshold_jy*1e6:.2f} uJy)")
 
     # ----------------------------------------------------------------------
-    # _run_iteration: one self-cal iteration (gaincal + applycal + split + tclean)
+    # _run_iteration: one self-cal iteration
     # ----------------------------------------------------------------------
     def _run_iteration(self, idx: int, step: SelfcalStep) -> None:
-        """Run one self-cal iteration with failure detection."""
+        """Run one self-cal iteration with failure detection.
+
+        Data hygiene (the caller's MS and earlier stage MSs are never
+        written):
+
+        1. copy the previous stage's MS to a temporary MS;
+        2. predict the previous image's model into the copy if the previous
+           stage MS does not already carry it (``ft``, checked);
+        3. gaincal on the copy; applycal on the copy;
+        4. split CORRECTED of the copy -> ``intermediate/selfcal_<idx>.ms``
+           (DATA only) and delete the copy;
+        5. image ``selfcal_<idx>.ms`` (``savemodel='none'``) and predict that
+           image's model into its MODEL column (checked). The stage MS then
+           holds DATA + MODEL and is not modified again.
+        """
         cfg = self.cfg
         assert self.workdir is not None
         interm = self.workdir / "intermediate"
         caltable = interm / f"sc{idx}.pcal"
         out_vis = interm / f"selfcal_{idx}.ms"
+        tmp_vis = interm / f"selfcal_{idx}_applycal.tmp.ms"
         clean_base = interm / f"clean_sc{idx}"
         fits_path = interm / f"clean_sc{idx}.fits"
 
         # Cleanup any stale files from previous run (safe: only within workdir)
         _safe_rmtree_path(caltable)
         _safe_rmtree_path(out_vis)
-        _safe_rmtree_path(interm / f"selfcal_{idx}_avg.ms")
+        _safe_rmtree_path(tmp_vis)
         _safe_rmtree_glob(interm, f"clean_sc{idx}.*")
 
         # Resolve solint expression like "6*IT"
         solint_str = self._resolve_solint(step.solint)
         field_id = self._derived["resolved_field_id"]
         refant = self._derived["refant"]
-        input_vis = self._derived["good_vis"]
+        prev_vis = self._derived["good_vis"]
+        prev_base = self._derived["last_image_base"]
+        prev_nterms = self._derived["last_nterms"]
 
         if cfg.verbose:
             print(f"[AJISAI] --- iter {idx} ({step.label}) "
                   f"calmode={step.calmode} solint={solint_str} ---")
 
-        # === 1. gaincal ===
-        n_solutions, gaincal_ok = self._run_gaincal(
-            input_vis=input_vis,
-            caltable=str(caltable),
-            solint=solint_str,
-            step=step,
-            field_id=field_id,
-            refant=refant,
-        )
-        if not gaincal_ok or n_solutions == 0:
-            # No usable solutions: applycal cannot run, no new MS can be made.
-            # This is the one case where the iteration is structurally unable
-            # to produce output. Record it and move on; next iteration tries
-            # with its own solint against the same input_vis (good_vis unchanged
-            # because nothing was produced to update it to).
-            self._record_skipped_iteration(
-                idx, step, solint_str,
-                reason=f"gaincal returned 0 solutions (all below minsnr={cfg.gaincal.minsnr})",
+        # === 1-4. solve and apply on a temporary copy of the previous stage MS ===
+        _copy_ms(prev_vis, tmp_vis)
+        try:
+            if self._derived.get("good_vis_model_from") != prev_base:
+                model_info = self._predict_model(tmp_vis, prev_base, prev_nterms)
+            else:
+                model_info = {"model_image": _model_images(prev_base, prev_nterms),
+                              "nterms": prev_nterms,
+                              "reffreq_hz": self._derived.get("good_vis_model_reffreq_hz")}
+
+            n_solutions, gaincal_ok = self._run_gaincal(
+                input_vis=str(tmp_vis),
+                caltable=str(caltable),
+                solint=solint_str,
+                step=step,
+                field_id=field_id,
+                refant=refant,
             )
-            return
+            if not gaincal_ok or n_solutions == 0:
+                # No usable solutions: applycal cannot run, no new MS can be made.
+                # This is the one case where the iteration is structurally unable
+                # to produce output. Record it and move on; next iteration tries
+                # with its own solint against the same good_vis.
+                self._record_skipped_iteration(
+                    idx, step, solint_str,
+                    reason=(f"gaincal returned 0 solutions (all below "
+                            f"minsnr={cfg.gaincal.minsnr})"),
+                )
+                return
 
-        # === 2. plot the gain table (justification artifact) ===
-        self._plot_gain_table(str(caltable), idx, step)
+            # === plot the gain table (justification artifact) ===
+            self._plot_gain_table(str(caltable), idx, step)
 
-        # === 3. applycal ===
-        casatasks.applycal(
-            vis=input_vis,
-            gaintable=[str(caltable)],
-            spwmap=[],
-            calwt=cfg.gaincal.calwt,
-            interp=cfg.gaincal.applycal_interp,
-            applymode=cfg.gaincal.applymode,
-        )
+            # === applycal on the copy, then split corrected -> stage MS ===
+            self._applycal(tmp_vis, caltable)
+            casatasks.split(
+                vis=str(tmp_vis),
+                outputvis=str(out_vis),
+                datacolumn="corrected",
+            )
+        finally:
+            _safe_rmtree_path(tmp_vis)
 
-        # === 4. split corrected → new MS ===
-        casatasks.split(
-            vis=input_vis,
-            outputvis=str(out_vis),
-            datacolumn="corrected",
-        )
+        solution_stats = self._caltable_solution_stats(str(caltable))
 
-        # === 4b. frequency-averaged (1 ch/spw) copy for continuum inspection ===
-        # Byproduct only: NOT fed back into the self-cal loop (step 5 uses out_vis).
-        avg_vis = self._make_chanavg_ms(out_vis, idx)
-
-        # === 5. tclean of the new MS, save model for next iteration ===
-        # Self-cal iterations ALWAYS reuse the mask produced by the initial
-        # CLEAN (interactive=False even when mask_mode='interactive').
-        threshold_jy = cfg.imaging.threshold_factor * self._derived["last_rms"]
+        # === 5. image the new stage MS (read-only), then store its model ===
+        # Self-cal iterations reuse the mask of the initial CLEAN (or the
+        # user's CRTF in mask_mode='user'); interactive=False always.
+        threshold_jy = self._loop_threshold_jy(self._derived["last_rms"])
         usemask_kwargs = self._build_usemask_kwargs(
             existing_mask=self._derived.get("initial_mask_path"),
         )
-        casatasks.clearcal(vis=str(out_vis))
-        casatasks.tclean(
-            vis=str(out_vis),
-            imagename=str(clean_base),
-            datacolumn="data",
-            specmode="mfs",
-            niter=cfg.imaging.niter,
-            gain=cfg.imaging.gain,
-            threshold=f"{threshold_jy}Jy",
-            deconvolver=cfg.imaging.deconvolver,
-            scales=self._derived["scales"] if cfg.imaging.deconvolver == "multiscale" else [],
-            gridder=cfg.imaging.gridder,
-            cyclefactor=cfg.imaging.cyclefactor,
-            imsize=self._derived["imsize"],
-            cell=self._derived["cell"],
-            weighting=cfg.imaging.weighting,
-            robust=cfg.imaging.robust,
-            uvtaper=list(cfg.imaging.uvtaper),
-            pbcor=cfg.imaging.pbcor,
-            savemodel="modelcolumn",
-            parallel=cfg.imaging.parallel,
-            field=field_id,
-            **usemask_kwargs,
-        )
-        self._ensure_model_column(str(out_vis), clean_base, threshold_jy)
+        nterms = self._tclean(out_vis, clean_base, niter=cfg.imaging.niter,
+                              threshold_jy=threshold_jy, mask_kwargs=usemask_kwargs)
+        own_model = self._predict_model(out_vis, clean_base, nterms)
 
-        # === 6. compute image stats (DR-based) ===
-        if fits_path.exists():
-            fits_path.unlink()
-        casatasks.exportfits(imagename=str(clean_base) + ".image",
-                             fitsimage=str(fits_path), history=False)
-        stats = self.compute_image_stats(str(fits_path))
+        # === 6. compute image stats (DR-based) on the tt0 image ===
+        stats = self._export_and_stats(clean_base, nterms, fits_path)
 
         # === 7. anomaly detection (informational only — does NOT alter flow) ===
         is_anomaly, anomaly_reason = self._detect_iter_anomaly(stats, n_solutions)
 
-        # === 8. record metrics ===
+        # === 8. record metrics and the solve information ===
+        g = cfg.gaincal
+        solve = build_solve_info(
+            table=str(caltable),
+            solint=solint_str,
+            solint_s=solint_seconds(solint_str, self._derived.get("avg_int_time_sec")),
+            combine=g.combine,
+            refant=refant,
+            calmode=step.calmode,
+            gaintype=g.gaintype,
+            minsnr=g.minsnr,
+            minblperant=g.minblperant,
+            solnorm=step.solnorm,
+            interp=g.applycal_interp,
+            applymode=g.applymode,
+            calwt=g.calwt,
+            spwmap=g.spwmap,
+            model_image=model_info["model_image"],
+            model_nterms=model_info["nterms"],
+            model_reffreq_hz=model_info.get("reffreq_hz"),
+            solved_on=str(prev_vis),
+            stage_ms=str(out_vis),
+            n_solutions=n_solutions,
+            flagged_solution_fraction=solution_stats,
+        )
         rec = {
             "iteration": idx,
             "label": step.label,
             "calmode": step.calmode,
             "solint": solint_str,
+            "solint_s": solve["solint_s"],
             "peak_jy_beam": stats["peak_jy_beam"],
             "rms_jy_beam": stats["rms_jy_beam"],
             "snr": stats["snr"],
             "dynamic_range": stats["dynamic_range"],
             "bmaj_arcsec": stats["bmaj_arcsec"],
             "bmin_arcsec": stats["bmin_arcsec"],
+            "threshold_jy": threshold_jy,
             "n_gaincal_solutions": n_solutions,
             "status": "anomaly" if is_anomaly else "ok",
             "anomaly_reason": anomaly_reason,
-            "image_path": str(clean_base) + ".image",
+            "image_path": _image_name(clean_base, nterms),
+            "image_base": str(clean_base),
             "fits_path": str(fits_path),
+            "caltable": str(caltable),
             "selfcal_ms": str(out_vis),
-            "selfcal_avg_ms": str(avg_vis),
         }
         self.metrics.append(rec)
         self.justification["iterations"].append(rec)
+        self._add_stage({
+            "stage": idx,
+            "label": step.label,
+            "status": rec["status"],
+            "data_ms": str(out_vis),
+            "stage_ms": str(out_vis),
+            "stage_ms_columns": "DATA + MODEL (model of this stage's image)",
+            "image_base": str(clean_base),
+            "image": _image_name(clean_base, nterms),
+            "nterms": nterms,
+            "model_image": own_model["model_image"],
+            "threshold_jy": threshold_jy,
+            "threshold_reason": self._threshold_reason(),
+            "solve": solve,
+        })
 
         # === 9. ALWAYS update good_vis (all iterations complete by design) ===
         # AJISAI design: anomalies are logged but do NOT trigger fallback.
         # The MS chain is always continuous. Best-iteration selection at the
         # end handles cases where an anomaly degraded the result.
         self._derived["good_vis"] = str(out_vis)
+        self._derived["good_vis_model_from"] = str(clean_base)
+        self._derived["good_vis_model_reffreq_hz"] = own_model.get("reffreq_hz")
+        self._derived["last_image_base"] = str(clean_base)
+        self._derived["last_nterms"] = nterms
         self._derived["last_dr"] = stats["dynamic_range"]
         self._derived["last_rms"] = stats["rms_jy_beam"]
 
@@ -1743,54 +2607,44 @@ Infrastructure
     # ----------------------------------------------------------------------
     # Helper methods for iteration
     # ----------------------------------------------------------------------
-    def _make_chanavg_ms(self, src_vis, idx: int):
-        """Create a fully frequency-averaged copy of a self-cal MS.
+    def _add_stage(self, stage: Dict[str, Any]) -> None:
+        """Append a per-stage record (also to justification.json)."""
+        self.stages.append(stage)
+        self.justification["stages"].append(stage)
 
-        Every channel in each spectral window is averaged into a single
-        output channel (``width`` = the per-spw channel count), i.e. a
-        continuum "1 channel per spw" measurement set. The result is written
-        next to the input as ``<workdir>/intermediate/selfcal_<idx>_avg.ms``.
+    def _stage(self, index: int) -> Optional[Dict[str, Any]]:
+        for st in self.stages:
+            if st["stage"] == index:
+                return st
+        return None
 
-        This is a byproduct for quick inspection and downstream continuum
-        analysis; it is NOT fed back into the self-cal loop (the loop keeps
-        using the full-resolution ``selfcal_<idx>.ms``).
-
-        Parameters
-        ----------
-        src_vis : path-like
-            The per-iteration self-cal MS (``selfcal_<idx>.ms``). It is itself
-            a split of the corrected column, so its calibrated visibilities
-            live in the DATA column and ``datacolumn='data'`` is used here.
-        idx : int
-            Iteration index, used to name the output MS.
-
-        Returns
-        -------
-        pathlib.Path
-            Path to the averaged MS.
-        """
-        interm = self.workdir / "intermediate"
-        avg_vis = interm / f"selfcal_{idx}_avg.ms"
-        _safe_rmtree_path(avg_vis)
-
-        # One width entry per selected spw so EVERY spw collapses to exactly one
-        # channel, regardless of whether the spws share the same channel count.
-        # Falls back to the scalar chavg_width (first spw's NUM_CHAN) if the
-        # per-spw list is unavailable.
-        width = self._derived.get("num_chan_per_spw")
-        if not width:
-            width = self._derived.get("chavg_width", 1)
-
-        casatasks.split(
-            vis=str(src_vis),
-            outputvis=str(avg_vis),
-            datacolumn="data",
-            width=width,
+    def _applycal(self, vis, caltable) -> None:
+        """applycal of one self-cal table on an AJISAI-owned temporary MS."""
+        g = self.cfg.gaincal
+        spwmap = [int(x) for x in g.spwmap]
+        casatasks.applycal(
+            vis=str(vis),
+            gaintable=[str(caltable)],
+            spwmap=[spwmap] if spwmap else [],
+            calwt=g.calwt,
+            interp=g.applycal_interp,
+            applymode=g.applymode,
         )
-        if self.cfg.verbose:
-            print(f"[AJISAI]   channel-averaged MS   : {avg_vis.name} "
-                  f"(width={width}, 1 ch/spw)")
-        return avg_vis
+
+    @staticmethod
+    def _caltable_solution_stats(caltable: str) -> List[Dict[str, Any]]:
+        """Flagged-solution fraction per observation and spw of a gain table."""
+        tb = casatools.table()
+        tb.open(caltable)
+        try:
+            if tb.nrows() == 0:
+                return []
+            obs = tb.getcol("OBSERVATION_ID")
+            spw = tb.getcol("SPECTRAL_WINDOW_ID")
+            flag = tb.getcol("FLAG")
+        finally:
+            tb.close()
+        return flagged_solution_fractions(obs, spw, flag)
 
     def _resolve_solint(self, solint: str) -> str:
         """Resolve solint expressions: '6*IT' → '36.30s' (6 * avg integration time)."""
@@ -1859,6 +2713,12 @@ Infrastructure
     def _plot_gain_table(self, caltable: str, idx: int, step: SelfcalStep) -> None:
         """Save a per-iteration gain plot for the justification log."""
         assert self.workdir is not None
+        if casaplotms is None:
+            if not self._derived.get("warned_no_casaplotms"):
+                warnings.warn("[AJISAI] casaplotms is not importable; gain-table plots "
+                              "are skipped")
+                self._derived["warned_no_casaplotms"] = True
+            return
         diag_dir = self.workdir / "diagnostics"
         diag_dir.mkdir(exist_ok=True)
         phase_png = diag_dir / f"iter{idx}_{step.label}_phasegain.png"
@@ -1891,49 +2751,200 @@ Infrastructure
                 plotfile=str(amp_png),
             )
 
-    def _ensure_model_column(self, vis: str, imagebase, threshold_jy: float) -> None:
-        """Verify MODEL_DATA was written; if not, rerun tclean(niter=0, savemodel)."""
+    # ----------------------------------------------------------------------
+    # tclean, model prediction and their consistency checks
+    # ----------------------------------------------------------------------
+    def _tclean(
+        self,
+        vis,
+        imagename,
+        *,
+        niter: int,
+        threshold_jy: float,
+        mask_kwargs: Optional[Dict[str, Any]] = None,
+        savemodel: str = "none",
+        dirty: bool = False,
+        check: bool = True,
+        **extra,
+    ) -> int:
+        """Every tclean of a run goes through here.
+
+        Uses the run's cell, imsize, weighting, gridder, reffreq and the
+        deconvolver/nterms/scales of ``ImagingConfig`` (``mtmfs`` when
+        ``nterms > 1``); ``dirty=True`` makes a ``hogbom`` niter=0 image.
+        ``savemodel`` defaults to ``'none'``: tclean never writes to the MS
+        (models are predicted explicitly by :meth:`_predict_model`). After
+        the call the image is checked (:meth:`_check_imaging_consistency`).
+        Returns the number of Taylor terms of the products (1 or nterms).
+        """
         cfg = self.cfg
+        img = cfg.imaging
+        kw: Dict[str, Any] = dict(
+            vis=str(vis),
+            imagename=str(imagename),
+            datacolumn="data",
+            specmode="mfs",
+            niter=int(niter),
+            gain=img.gain,
+            threshold=f"{threshold_jy}Jy",
+            gridder=img.gridder,
+            cyclefactor=img.cyclefactor,
+            imsize=list(self._derived["imsize"]),
+            cell=self._derived["cell"],
+            weighting=img.weighting,
+            robust=img.robust,
+            uvtaper=list(img.uvtaper),
+            pbcor=img.pbcor,
+            savemodel=savemodel,
+            parallel=img.parallel,
+            field=self._derived["resolved_field_id"],
+            interactive=False,
+        )
+        if img.reffreq:
+            kw["reffreq"] = img.reffreq
+        if dirty:
+            kw["deconvolver"] = "hogbom"
+        else:
+            kw.update(_deconvolver_kwargs(img.deconvolver, img.nterms,
+                                          self._derived.get("scales")))
+        kw.update(mask_kwargs or {})
+        kw.update(extra)
+        if kw.get("interactive") and cfg.caller == "asebi":
+            raise ValueError("tclean(interactive=True) is refused when caller='asebi' "
+                             "(viewer-free operation)")
+        casatasks.tclean(**kw)
+        nterms = int(kw.get("nterms", 1)) if kw.get("deconvolver") == "mtmfs" else 1
+        if check:
+            self._check_imaging_consistency(imagename, nterms)
+        return nterms
+
+    def _check_imaging_consistency(self, imagebase, nterms: int) -> None:
+        """Post-tclean check: frequency axis covers the data, sumwt > 0.
+
+        Raises RuntimeError on failure (an image made from a subset of the
+        channels, or from no data, must never feed a self-cal solve).
+        """
+        image = _image_name(imagebase, nterms, "image")
+        sumwt_image = _image_name(imagebase, nterms, "sumwt")
+        ref_hz, width_hz = _image_spectral_axis(image)
+        sumwt = float(np.nansum(_read_image_plane(sumwt_image)))
+        problems = imaging_consistency_problems(
+            ref_hz, width_hz, sumwt,
+            self._derived.get("data_fmin_hz"), self._derived.get("data_fmax_hz"),
+        )
+        self.justification["checks"].append({
+            "kind": "tclean",
+            "image": image,
+            "ref_freq_hz": ref_hz,
+            "width_hz": width_hz,
+            "data_fmin_hz": self._derived.get("data_fmin_hz"),
+            "data_fmax_hz": self._derived.get("data_fmax_hz"),
+            "sumwt": sumwt,
+            "ok": not problems,
+            "problems": problems,
+        })
+        if problems:
+            raise RuntimeError(f"[AJISAI] imaging consistency check failed for {image}: "
+                               + "; ".join(problems))
+
+    def _predict_model(self, vis, imagebase, nterms: int) -> Dict[str, Any]:
+        """Write the model of ``imagebase`` into MODEL_DATA of an AJISAI-owned MS.
+
+        Standard gridder: ``ft`` of the Taylor model images with ``nterms`` and
+        the model's reference frequency. Other gridders (e.g. mosaic, which
+        needs the primary beam that ``ft`` does not apply): tclean prediction
+        from the existing model (``niter=0``, ``calcres=calcpsf=False``,
+        ``savemodel='modelcolumn'``). Then :meth:`_check_model_column`.
+        """
+        cfg = self.cfg
+        models = _model_images(imagebase, nterms)
+        reffreq_hz = _image_spectral_axis(models[0])[0] if nterms > 1 else None
+        if cfg.imaging.gridder == "standard":
+            casatasks.ft(
+                vis=str(vis),
+                field=self._derived["resolved_field_id"],
+                model=models if nterms > 1 else models[0],
+                nterms=int(nterms),
+                reffreq=f"{reffreq_hz}Hz" if reffreq_hz else "",
+                usescratch=True,
+            )
+            method = "ft"
+        else:
+            self._tclean(vis, imagebase, niter=0, threshold_jy=0.0, savemodel="modelcolumn",
+                         calcpsf=False, calcres=False, check=False)
+            method = "tclean(savemodel='modelcolumn')"
+        problems = self._check_model_column(vis)
+        self.justification["checks"].append({
+            "kind": "model_prediction",
+            "vis": str(vis),
+            "method": method,
+            "model_image": models,
+            "nterms": int(nterms),
+            "reffreq_hz": reffreq_hz,
+            "ok": not problems,
+            "problems": problems,
+        })
+        if problems:
+            raise RuntimeError(f"[AJISAI] model prediction check failed for {vis}: "
+                               + "; ".join(problems))
+        return {"model_image": models, "nterms": int(nterms), "reffreq_hz": reffreq_hz,
+                "method": method}
+
+    def _check_model_column(self, vis) -> List[str]:
+        """MODEL_DATA must be non-zero on every unflagged channel of the field."""
+        fid = int(self._derived["resolved_field_id"])
         tb = casatools.table()
-        tb.open(vis)
+        tb.open(str(vis) + "/DATA_DESCRIPTION")
         try:
-            if "MODEL_DATA" not in tb.colnames():
-                model_amp = None
-            else:
-                dats = tb.getcol("MODEL_DATA")
-                model_amp = float(np.abs(dats).mean()) if dats.size else None
+            dd_spw = tb.getcol("SPECTRAL_WINDOW_ID")
         finally:
             tb.close()
-        # Original AJISAI's heuristic: amp ~ 1.0 or 0.0 → not populated
-        needs_rerun = model_amp is None or np.isclose(model_amp, 1.0) or np.isclose(model_amp, 0.0)
-        if needs_rerun:
-            if cfg.verbose:
-                print("[AJISAI]   model column not populated; rerunning tclean(niter=0)")
-            casatasks.tclean(
-                vis=vis,
-                imagename=str(imagebase),
-                datacolumn="data",
-                specmode="mfs",
-                niter=0,
-                calcpsf=False,
-                calcres=False,
-                gain=cfg.imaging.gain,
-                threshold=f"{threshold_jy}Jy",
-                deconvolver=cfg.imaging.deconvolver,
-                scales=self._derived["scales"] if cfg.imaging.deconvolver == "multiscale" else [],
-                gridder=cfg.imaging.gridder,
-                cyclefactor=cfg.imaging.cyclefactor,
-                interactive=False,
-                imsize=self._derived["imsize"],
-                cell=self._derived["cell"],
-                weighting=cfg.imaging.weighting,
-                robust=cfg.imaging.robust,
-                uvtaper=list(cfg.imaging.uvtaper),
-                pbcor=cfg.imaging.pbcor,
-                savemodel="modelcolumn",
-                parallel=cfg.imaging.parallel,
-                field=self._derived["resolved_field_id"],
-            )
+        problems: List[str] = []
+        tb.open(str(vis))
+        try:
+            if "MODEL_DATA" not in tb.colnames():
+                return ["no MODEL_DATA column after the model prediction"]
+            any_model = False
+            for dd in range(len(dd_spw)):
+                sub = tb.query(f"DATA_DESC_ID=={dd} && FIELD_ID=={fid}",
+                               columns="MODEL_DATA,FLAG")
+                try:
+                    nrow = sub.nrows()
+                    if nrow == 0:
+                        continue
+                    npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
+                    chunk = max(1, _CHUNK_SAMPLES // max(1, npol * nchan))
+                    absmax = np.zeros(nchan)
+                    count = np.zeros(nchan, dtype=np.int64)
+                    for start in range(0, nrow, chunk):
+                        nr = min(chunk, nrow - start)
+                        amp = np.abs(sub.getcol("MODEL_DATA", start, nr))
+                        unflagged = ~np.asarray(sub.getcol("FLAG", start, nr), dtype=bool)
+                        amp = np.where(np.isfinite(amp), amp, 0.0)
+                        absmax = np.maximum(absmax, np.where(unflagged, amp, 0.0).max(axis=(0, 2)))
+                        count += unflagged.sum(axis=(0, 2))
+                    any_model = any_model or bool((absmax > 0).any())
+                    bad = model_zero_channels(absmax, count)
+                    if bad:
+                        problems.append(f"spw {int(dd_spw[dd])} (data description {dd}): "
+                                        f"MODEL_DATA = 0 on unflagged channels {bad}")
+                finally:
+                    sub.close()
+        finally:
+            tb.close()
+        if problems and not any_model:
+            problems.insert(0, "the model is empty (no CLEAN components above the threshold); "
+                               "self-calibration needs a model")
+        return problems
+
+    def _export_and_stats(self, imagebase, nterms: int, fits_path) -> Dict[str, Any]:
+        """Export the (tt0) restored image to FITS and compute its statistics."""
+        fits_path = Path(fits_path)
+        if fits_path.exists():
+            fits_path.unlink()
+        casatasks.exportfits(imagename=_image_name(imagebase, nterms),
+                             fitsimage=str(fits_path), history=False)
+        return self.compute_image_stats(str(fits_path))
 
     def _build_usemask_kwargs(self, existing_mask: Optional[str] = None) -> Dict[str, Any]:
         """Construct tclean mask kwargs based on cfg.imaging.mask_mode.
@@ -1946,6 +2957,13 @@ Infrastructure
         """
         cfg = self.cfg
         mode = cfg.imaging.mask_mode
+        # A user mask (CRTF region file or mask image) is passed as it is to
+        # every tclean: initial CLEAN, each iteration and the final image.
+        if mode == "user":
+            if not cfg.imaging.user_mask:
+                raise ValueError("mask_mode='user' but user_mask is None")
+            return {"mask": cfg.imaging.user_mask, "usemask": "user",
+                    "interactive": False}
         # If a mask file already exists from a previous step (e.g. the
         # initial CLEAN saved one), reuse it as a user mask. This branch
         # also covers the second-and-later iterations of mask_mode='interactive'.
@@ -1963,6 +2981,9 @@ Infrastructure
                 "growiterations": cfg.imaging.growiterations,
             }
         elif mode == "interactive":
+            if cfg.caller == "asebi":
+                raise ValueError("mask_mode='interactive' is refused when caller='asebi' "
+                                 "(viewer-free operation)")
             # First tclean call only: open the CASA viewer for the user to
             # draw a mask. tclean saves it as <imagebase>.mask, which we
             # then reuse for every subsequent self-cal iteration via the
@@ -1976,11 +2997,6 @@ Infrastructure
                 print("[AJISAI] mask_mode='interactive': opening CASA viewer "
                       "for mask drawing. Requires CASA <= 6.6.")
             return {"usemask": "user", "interactive": True}
-        elif mode == "user":
-            if not cfg.imaging.user_mask:
-                raise ValueError("mask_mode='user' but user_mask is None")
-            return {"mask": cfg.imaging.user_mask, "usemask": "user",
-                    "interactive": False}
         elif mode == "none":
             return {"mask": "", "usemask": "user", "interactive": False}
         else:
@@ -2051,6 +3067,18 @@ Infrastructure
         }
         self.metrics.append(rec)
         self.justification["iterations"].append(rec)
+        self._add_stage({
+            "stage": idx,
+            "label": step.label,
+            "status": "skipped",
+            "data_ms": None,
+            "stage_ms": None,
+            "image_base": None,
+            "image": None,
+            "model_image": None,
+            "solve": None,
+            "reason": reason,
+        })
         warnings.warn(f"[AJISAI] iter {idx} ({step.label}) SKIPPED: {reason}. "
                       f"Pipeline continues to next iteration.")
 
@@ -2076,8 +3104,183 @@ Infrastructure
             print(f"[AJISAI] best iteration: #{best_i}, "
                   f"{metric_key} = {self.best_metric_value}")
 
+    # ----------------------------------------------------------------------
+    # Final products: DATA-only MS of the selected stage, final deep image
+    # ----------------------------------------------------------------------
+    def _selected_stage(self) -> Optional[Dict[str, Any]]:
+        """The stage record of the iteration chosen by :meth:`select_best_iteration`."""
+        best = (self.justification.get("best") or {}).get("iteration")
+        if best is None or not 0 <= int(best) < len(self.metrics):
+            return None
+        return self._stage(int(self.metrics[int(best)]["iteration"]))
+
+    def _write_final_ms(self) -> None:
+        """Split the selected stage's DATA into ``<results_dir>/final_selfcal.ms``.
+
+        The product holds the self-calibrated visibilities in DATA only (no
+        MODEL/CORRECTED); for stage 0 it is a DATA-only copy of the working MS.
+        """
+        assert self.workdir is not None
+        stage = self._selected_stage()
+        if stage is None or not stage.get("data_ms"):
+            self.justification["final_ms"] = {
+                "path": None,
+                "reason": "no stage with an image was selected; no final MS written",
+            }
+            return
+        src = stage["data_ms"]
+        out = self.workdir / "final_selfcal.ms"
+        _safe_rmtree_path(out)
+        casatasks.split(vis=str(src), outputvis=str(out), datacolumn="data")
+        self.final_ms = str(out)
+        self.justification["final_ms"] = {
+            "path": str(out),
+            "stage": stage["stage"],
+            "source_ms": str(src),
+            "columns": "DATA",
+            "reason": ("DATA column of the selected stage (self-calibrated visibilities), "
+                       "split without MODEL/CORRECTED"),
+        }
+        if self.cfg.verbose:
+            print(f"[AJISAI] final MS              : {out} (stage {stage['stage']}, DATA only)")
+
+    def _make_final_image(self) -> None:
+        """One deeper CLEAN of the selected stage's data, with a flux stop rule.
+
+        Made on ``final_selfcal.ms`` with the run's imaging rules (cell,
+        imsize, nterms, reffreq, scales, mask). The threshold steps through
+        ``ImagingConfig.final_depth`` x sigma_th (default 3, 2, 1, 0.5),
+        continuing the same CLEAN (no new PSF). After each step, inside the
+        aperture: ``F_corr = F_model + F_unc`` with ``F_unc = sum(residual) /
+        Omega_R``; stop when ``|F_unc| <= max(3 sigma_F, 0.01 F_corr)`` or
+        ``F_corr`` changed by no more than that since the previous step
+        (:func:`final_depth_decision`). The restored-flux bias
+        ``F_unc (Omega_R/Omega_clean - 1)`` is recorded and warned about
+        when it exceeds the same width. The self-cal loop images are never
+        CLEANed deeper than ``threshold_nsigma x sigma_th``.
+        """
+        cfg = self.cfg
+        depth = tuple(cfg.imaging.final_depth)
+        if not depth or self.final_ms is None:
+            self.justification["final_image"] = {
+                "made": False,
+                "reason": ("ImagingConfig.final_depth is empty" if not depth
+                           else "no stage was selected"),
+            }
+            return
+        assert self.workdir is not None
+        interm = self.workdir / "intermediate"
+        base = interm / "final_clean"
+        _safe_rmtree_glob(interm, "final_clean.*")
+        sigma = float(self._derived["sigma_th"])
+        mask_kwargs = self._build_usemask_kwargs(
+            existing_mask=self._derived.get("initial_mask_path"),
+        )
+        steps: List[Dict[str, Any]] = []
+        prev_f_corr: Optional[float] = None
+        nterms = 1
+        converged = False
+        for k, nsig in enumerate(depth):
+            thr = float(nsig) * sigma
+            restart = {} if k == 0 else {"calcpsf": False, "calcres": False}
+            nterms = self._tclean(self.final_ms, base, niter=cfg.imaging.niter,
+                                  threshold_jy=thr, mask_kwargs=mask_kwargs, **restart)
+            terms = self._final_flux_terms(base, nterms)
+            decision = final_depth_decision(terms["f_model_jy"], terms["f_unc_jy"],
+                                            terms["sigma_f_jy"], prev_f_corr)
+            steps.append({"nsigma": float(nsig), "threshold_jy": thr, **terms, **decision})
+            if cfg.verbose:
+                print(f"[AJISAI] final image {nsig:g} sigma : F_model={terms['f_model_jy']*1e3:.3f}, "
+                      f"F_unc={terms['f_unc_jy']*1e3:.3f}, F_corr={decision['f_corr_jy']*1e3:.3f} mJy "
+                      f"-> {'stop' if decision['stop'] else 'continue'} ({decision['reason']})")
+            prev_f_corr = decision["f_corr_jy"]
+            if decision["stop"]:
+                converged = True
+                break
+        last = steps[-1]
+        warnings_list: List[str] = []
+        if not converged:
+            warnings_list.append(
+                f"final image: the aperture flux did not converge at the deepest step "
+                f"({depth[-1]:g} sigma_th): {last['reason']}")
+        if abs(last["restored_bias_jy"]) > last["width_jy"]:
+            warnings_list.append(
+                f"final image: the restored image over-counts the residual flux by "
+                f"{last['restored_bias_jy'] * 1e3:.3g} mJy (F_unc x (Omega_R/Omega_clean - 1)), "
+                f"more than max(3 sigma_F, 1% F_corr) = {last['width_jy'] * 1e3:.3g} mJy; "
+                f"use F_corr = {last['f_corr_jy'] * 1e3:.4g} mJy for the flux")
+        for w in warnings_list:
+            warnings.warn(f"[AJISAI] {w}")
+
+        fits_path = self.workdir / "intermediate" / "final_clean.fits"
+        stats = self._export_and_stats(base, nterms, fits_path)
+        self.final_image = _image_name(base, nterms)
+        self.final_fits = str(fits_path)
+        products = {name: _image_name(base, nterms, name)
+                    for name in ("image", "model", "residual", "psf", "pb", "mask")}
+        if nterms > 1:
+            products.update({"image_tt1": _image_name(base, nterms, "image", 1),
+                             "alpha": _image_name(base, nterms, "alpha"),
+                             "alpha_error": _image_name(base, nterms, "alpha.error")})
+        self.justification["final_image"] = {
+            "made": True,
+            "stage": (self._selected_stage() or {}).get("stage"),
+            "vis": self.final_ms,
+            "image_base": str(base),
+            "image": self.final_image,
+            "fits": str(fits_path),
+            "products": products,
+            "nterms": nterms,
+            "sigma_th_jy": sigma,
+            "depth_schedule": [float(d) for d in depth],
+            "steps": steps,
+            "converged": converged,
+            "stop_nsigma": last["nsigma"],
+            "aperture": self._derived.get("final_aperture"),
+            "stats": stats,
+            "warnings": warnings_list,
+            "rule": ("stop when |F_unc| <= max(3 sigma_F, 0.01 F_corr) or |Delta F_corr| <= "
+                     "the same width; F_corr = F_model + sum(residual)/Omega_R in the aperture"),
+        }
+
+    def _final_flux_terms(self, imagebase, nterms: int) -> Dict[str, Any]:
+        """Aperture flux bookkeeping of the final image after one depth step."""
+        model = _read_image_plane(_image_name(imagebase, nterms, "model"))
+        residual = _read_image_plane(_image_name(imagebase, nterms, "residual"))
+        psf = _read_image_plane(_image_name(imagebase, nterms, "psf"))
+        geom = _image_beam_cell(_image_name(imagebase, nterms, "image"))
+        aperture = self._final_aperture(imagebase, nterms, residual.shape, geom)
+        return aperture_flux_terms(model, residual, psf, aperture, geom["cell_arcsec"],
+                                   geom["bmaj_arcsec"], geom["bmin_arcsec"],
+                                   float(self._derived["sigma_th"]))
+
+    def _final_aperture(self, imagebase, nterms: int, shape, geom: Dict[str, Any]) -> np.ndarray:
+        """Aperture for the final-image flux: explicit radius, CLEAN mask, or 5 beams."""
+        cfg = self.cfg
+        cell = geom["cell_arcsec"]
+        mask_path = _image_name(imagebase, nterms, "mask")
+        if cfg.imaging.final_aperture_arcsec is None and os.path.isdir(mask_path):
+            region = _read_image_plane(mask_path) > 0.5
+            if region.shape == tuple(shape) and region.any():
+                self._derived["final_aperture"] = {
+                    "kind": "clean_mask", "path": mask_path, "npix": int(region.sum())}
+                return region
+        if cfg.imaging.final_aperture_arcsec is not None:
+            radius_as = float(cfg.imaging.final_aperture_arcsec)
+            kind = "final_aperture_arcsec"
+        else:
+            beam = math.sqrt(geom["bmaj_arcsec"] * geom["bmin_arcsec"])
+            radius_as = cfg.rms_exclude_beam_factor * beam
+            kind = f"circle of rms_exclude_beam_factor ({cfg.rms_exclude_beam_factor:g}) x beam"
+        cx, cy = geom["refpix"]
+        ix, iy = np.indices(tuple(shape))
+        region = np.hypot(ix - cx, iy - cy) <= radius_as / cell
+        self._derived["final_aperture"] = {"kind": kind, "radius_arcsec": radius_as,
+                                           "npix": int(region.sum())}
+        return region
+
     def _write_summary(self) -> None:
-        """Write metrics CSV, summary and gallery PNGs, and copy best image to top of workdir."""
+        """Write metrics CSV, summary and gallery PNGs, and copy the final image to the workdir."""
         if not self.metrics or self.workdir is None:
             return
 
@@ -2088,23 +3291,26 @@ Infrastructure
         # --- summary plot (DR, peak, RMS, beam over iterations) ---
         self._plot_summary(df)
 
-        # --- Copy best image to top-level workdir for easy access ---
-        if self.best_fits is not None and os.path.exists(self.best_fits):
+        # --- Copy the final image (or, without one, the best iteration's
+        #     image) to the top-level workdir for easy access (tt0 for mtmfs) ---
+        src_fits = self.final_fits or self.best_fits
+        src_image = self.final_image or self.best_image
+        if src_fits is not None and os.path.exists(src_fits):
             try:
                 final_fits = self.workdir / "final.fits"
                 if final_fits.exists():
                     final_fits.unlink()
-                shutil.copy2(self.best_fits, final_fits)
+                shutil.copy2(src_fits, final_fits)
             except Exception as e:
-                warnings.warn(f"Could not copy best FITS: {e}")
-        if self.best_image is not None and os.path.exists(self.best_image):
+                warnings.warn(f"Could not copy final FITS: {e}")
+        if src_image is not None and os.path.exists(src_image):
             try:
                 final_image = self.workdir / "final.image"
                 if final_image.exists():
                     shutil.rmtree(final_image, ignore_errors=True)
-                shutil.copytree(self.best_image, final_image)
+                shutil.copytree(src_image, final_image)
             except Exception as e:
-                warnings.warn(f"Could not copy best image: {e}")
+                warnings.warn(f"Could not copy final image: {e}")
 
         # --- gallery of the CLEAN image of every iteration ---
         try:
@@ -2179,6 +3385,96 @@ def _casa_version_string() -> str:
         return casatasks.version_string()
     except Exception:
         return "unknown"
+
+
+def _copy_ms(src, dst) -> None:
+    """Exact copy of an MS directory (all columns and subtables, no reindexing)."""
+    shutil.copytree(str(src), str(dst), symlinks=True)
+
+
+def _ms_needs_relabel(msfile: str) -> bool:
+    """Read-only check: would :func:`relabel_J2000_to_ICRS` change ``msfile``?"""
+    _require_casa()
+    tb = casatools.table()
+    tb.open(msfile + "/FIELD")
+    try:
+        cols = [tb.getcol(c) for c in ("PhaseDir_Ref", "DelayDir_Ref", "RefDir_Ref")
+                if c in tb.colnames()]
+    finally:
+        tb.close()
+    source_ref = None
+    if os.path.isdir(msfile + "/SOURCE"):
+        tb.open(msfile + "/SOURCE")
+        try:
+            try:
+                source_ref = tb.getcolkeywords("DIRECTION").get("MEASINFO", {}).get("Ref")
+            except Exception:
+                source_ref = None
+        finally:
+            tb.close()
+    return _relabel_needed(cols, source_ref)
+
+
+def _read_image_plane(path) -> np.ndarray:
+    """Pixel values of a CASA image with degenerate axes dropped ([x, y] for a plane)."""
+    _require_casa()
+    ia = casatools.image()
+    ia.open(str(path))
+    try:
+        arr = np.asarray(ia.getchunk(dropdeg=True), dtype=float)
+    finally:
+        ia.close()
+    while arr.ndim > 2:
+        arr = arr[..., 0]
+    return arr
+
+
+def _image_spectral_axis(path) -> Tuple[float, float]:
+    """(reference frequency, increment) of a CASA image's spectral axis, in Hz."""
+    _require_casa()
+    ia = casatools.image()
+    ia.open(str(path))
+    try:
+        cs = ia.coordsys()
+        try:
+            names = list(cs.names())
+            units = list(cs.units())
+            i = names.index("Frequency")
+            ref = float(cs.referencevalue()["numeric"][i])
+            inc = float(cs.increment()["numeric"][i])
+            scale = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9}.get(units[i], 1.0)
+        finally:
+            cs.done()
+    finally:
+        ia.close()
+    return ref * scale, inc * scale
+
+
+def _image_beam_cell(path) -> Dict[str, Any]:
+    """Restoring beam (arcsec), cell (arcsec) and reference pixel of a CASA image."""
+    _require_casa()
+    ia = casatools.image()
+    qa = casatools.quanta()
+    ia.open(str(path))
+    try:
+        beam = ia.restoringbeam()
+        if "major" not in beam and "beams" in beam:      # per-plane beams: take the first
+            beam = beam["beams"]["*0"]["*0"]
+        cs = ia.coordsys()
+        try:
+            inc = cs.increment(format="q", type="direction")["quantity"]
+            cell = abs(float(qa.convert(inc["*1"], "arcsec")["value"]))
+            refpix = [float(x) for x in cs.referencepixel()["numeric"][:2]]
+        finally:
+            cs.done()
+    finally:
+        ia.close()
+    return {
+        "bmaj_arcsec": float(qa.convert(beam["major"], "arcsec")["value"]),
+        "bmin_arcsec": float(qa.convert(beam["minor"], "arcsec")["value"]),
+        "cell_arcsec": cell,
+        "refpix": refpix,
+    }
 
 
 # ============================================================================

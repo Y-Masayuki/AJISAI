@@ -24,6 +24,10 @@ AJISAI is a fully automated, reproducible, and explainable self-calibration pipe
    + 1 amplitude iteration by default) runs to completion; the best image is
    selected by dynamic range at the end. No adaptive rollback that would
    make the result depend on run-order.
+4. **Read-only input.** The input measurement set is never written. Each
+   self-calibration stage works on a temporary copy of the previous stage's
+   data and keeps its own measurement set; the result is delivered as a
+   separate DATA-only `final_selfcal.ms`.
 
 
 ## Installation
@@ -35,6 +39,19 @@ source; a PyPI release is planned for a future version.
 ```bash
 pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main"
 ```
+
+To update an existing installation (for example on a compute server, where
+the https URL works without SSH keys), force the reinstall: the version
+string does not change between commits on `main`, so a plain `pip install`
+would report "already satisfied" and keep the old code.
+
+```bash
+pip install --upgrade --force-reinstall --no-deps "git+https://github.com/Y-Masayuki/AJISAI.git@main"
+pip freeze | grep -i ajisai     # shows the installed commit: ajisai @ git+https://...@<hash>
+```
+
+Use the `pip` of the Python that runs CASA (for monolithic CASA, its own
+`pip`; see the [installation guide](https://ajisai.readthedocs.io/en/latest/installation.html)).
 
 For development (editable install with tests):
 
@@ -96,9 +113,12 @@ from ajisai import AJISAI, AJISAIConfig
 cfg = AJISAIConfig(vis="/path/to/data.ms")
 aj = AJISAI(cfg).run()
 
-print(aj.best_image)         # path to the best CLEAN image
+print(aj.best_image)         # path to the best iteration's CLEAN image
 print(aj.best_metric_value)  # the dynamic range achieved
-print(aj.metrics)            # per-iteration metrics (DataFrame)
+print(aj.final_image)        # the final (deeper) image of the best iteration
+print(aj.final_ms)           # final_selfcal.ms: self-calibrated DATA only
+print(aj.metrics)            # per-iteration metrics (list of dicts)
+print(aj.stages)             # per-stage MS, image, model and solve information
 print(aj.justification)      # full structured rationale
 ```
 
@@ -111,10 +131,13 @@ ajisai_<projname>/
   selfcal_summary.png            # 4-panel diagnostic plot
   selfcal_images.png             # CLEAN image of every iteration, side by side
   justification.json             # structured rationale for every decision
-  final.image / final.fits       # the best CLEAN image
-  intermediate/                  # all intermediate MS files and images
+  final.image / final.fits       # the final image (tt0 when nterms > 1)
+  final_selfcal.ms               # self-calibrated visibilities (DATA only)
+  intermediate/                  # stage MSs (selfcal_<N>.ms), images, gain tables
   diagnostics/                   # per-iteration gain plots
 ```
+
+The input measurement set is only read; nothing in it is changed.
 
 ## Multi-field workflow
 
@@ -154,7 +177,7 @@ cfg = AJISAIConfig(
     phase_center=("16:25:45.0", "-24:12:23.0", "ICRS"),
     # Sub-configs
     imaging=ImagingConfig(robust=0.5, mask_mode="auto-multithresh"),
-    gaincal=GainCalConfig(minsnr=1.5, gaintype="T"),
+    gaincal=GainCalConfig(minsnr=3.0, gaintype="T"),
     schedule=SelfcalSchedule(steps=(
         SelfcalStep("p", "inf",  label="phase_inf"),
         SelfcalStep("p", "6*IT", label="phase_6IT"),

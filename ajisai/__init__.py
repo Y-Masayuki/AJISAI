@@ -12,6 +12,8 @@ pipeline for ALMA continuum data. It is designed around three principles:
     3. Deterministic:      a fixed self-cal schedule (3 phase + 1 amp by default),
                            never adaptive rollback - all iterations complete and
                            the best by dynamic range is selected at the end.
+    4. Read-only input:    the input MS is never written; every stage works on
+                           copies, and each stage's MS is kept.
 
 Quick start
 -----------
@@ -60,6 +62,10 @@ from .core import (
     select_refant,
     # Coordinate frame utility
     relabel_J2000_to_ICRS,
+    # Self-cal bookkeeping and the final-image depth rule (pure functions)
+    SOLVE_INFO_KEYS,
+    final_depth_decision,
+    aperture_flux_terms,
 )
 # Diagnostic figures (CASA-independent; see ajisai.plotting).
 from .plotting import (
@@ -78,12 +84,15 @@ from .ms_utils import (
     get_baseline_lengths,
     get_antenna_positions,
     get_antenna_flag_stats,
+    get_dish_diameter_m,
+    get_uv_max,
+    cell_from_umax,
     pick_cell_imsize,
     rad_to_radec_from_imfit,
     icrs_to_j2000,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0.dev0"
 
 __all__ = [
     "AJISAI",
@@ -101,6 +110,9 @@ __all__ = [
     "get_baseline_lengths",
     "get_antenna_positions",
     "get_antenna_flag_stats",
+    "get_dish_diameter_m",
+    "get_uv_max",
+    "cell_from_umax",
     "pick_cell_imsize",
     "rad_to_radec_from_imfit",
     "icrs_to_j2000",
@@ -113,5 +125,8 @@ __all__ = [
     "plot_selfcal_images",
     "plot_from_workdir",
     "relabel_J2000_to_ICRS",
+    "SOLVE_INFO_KEYS",
+    "final_depth_decision",
+    "aperture_flux_terms",
     "__version__",
 ]

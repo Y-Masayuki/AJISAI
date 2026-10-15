@@ -39,6 +39,18 @@ Cell size and image size
 
 .. autofunction:: ajisai.ms_utils.pick_cell_imsize
 
+.. autofunction:: ajisai.ms_utils.get_uv_max
+
+.. autofunction:: ajisai.ms_utils.cell_from_umax
+
+.. autofunction:: ajisai.ms_utils.uv_max_from_maxima
+
+.. autofunction:: ajisai.ms_utils.max_uv_of_unflagged_rows
+
+.. autofunction:: ajisai.ms_utils.get_dish_diameter_m
+
+.. autofunction:: ajisai.ms_utils.smallest_dish_diameter
+
 .. autofunction:: ajisai.ms_utils.test_pick_cell_imsize
 
 

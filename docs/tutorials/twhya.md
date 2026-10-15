@@ -109,9 +109,12 @@ print(f"Working directory: {aj.workdir}")
 ```
 
 While AJISAI runs, you will see a banner, then progress messages. The
-reference run produced the following (exact numbers may vary slightly with
-CASA version and the random initialization of the deconvolver, but the
-magnitudes match closely):
+reference run (AJISAI v0.2.1) produced the following (exact numbers may vary
+slightly with CASA version and the random initialization of the deconvolver,
+but the magnitudes match closely). From v0.3 the default cell is
+1/(5 u_max) instead of beam/10 of the 90th-percentile baseline, the CLEAN
+threshold is 3 sigma_th, and a final image is added, so the cell, image
+size and the per-iteration numbers differ from this v0.2.1 log:
 
 ```
 [AJISAI] refant = DA42 (hybrid: nearest to XY geometric center among
@@ -146,7 +149,8 @@ ajisai_TWHya_demo/
 ├── selfcal_summary.png             ← 4-panel diagnostic plot
 ├── selfcal_images.png              ← CLEAN image of every iteration, side by side
 ├── justification.json              ← every parameter choice + reason
-├── final.image  / final.fits       ← the best image AJISAI produced
+├── final.image  / final.fits       ← the final image (made from the best iteration's data)
+├── final_selfcal.ms                ← the best iteration's self-calibrated visibilities (DATA only)
 ├── intermediate/                   ← all intermediate MS and image products
 └── diagnostics/                    ← per-iteration phase/amp gain plots
 ```
@@ -282,8 +286,8 @@ cleaner background (much less side-lobe structure).
 
 **The summary plot shows DR decreasing late in the run.** AJISAI always
 runs all iterations to completion and picks the best by DR at the end, so
-this is fine. The `final.image` will be from the iteration that achieved
-peak DR, not the last iteration. The decreasing later iterations are
+this is fine. The `final.image` (and `final_selfcal.ms`) will be made from
+the iteration that achieved peak DR, not the last iteration. The decreasing later iterations are
 recorded as `status="anomaly"` in `justification.json` for inspection.
 
 **Gain calibration produced zero solutions in one iteration.** That
@@ -294,10 +298,12 @@ solution intervals; try lengthening solints or relaxing `minsnr`.
 
 **Actual dirty-image beam differs from predicted by more than 20%.**
 This warning appears when AJISAI's predicted effective beam (especially
-under uvtaper) is significantly off from what CASA actually produces. The
-cell size is based on the prediction, so it might be too coarse or fine.
-Override `ImagingConfig.cellpix` (more pixels per beam) or specify cell
-and imsize explicitly to fix.
+under uvtaper) is significantly off from what CASA actually produces. With
+the default `cell_rule="umax"` the cell (1/(5 u_max)) does not depend on
+the prediction. With the legacy `cell_rule="percentile"` the cell is based
+on the prediction, so it might be too coarse or fine: override
+`ImagingConfig.cellpix` (more pixels per beam) or specify `cell` and
+`imsize` explicitly.
 
 ## Next steps
 

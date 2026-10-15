@@ -59,14 +59,32 @@ def test_default_imaging_config():
     assert cfg.mask_mode == "auto-multithresh"
     assert cfg.cellpix == 10
     assert cfg.uvtaper == ()
+    # v0.3: geometry derived from the data unless given
+    assert cfg.cell is None and cfg.imsize is None
+    assert cfg.cell_rule == "umax"
+    assert cfg.reffreq is None and cfg.scales is None
+    # loop CLEAN at an absolute 3 sigma_th; final image 3 -> 2 -> 1 -> 0.5 sigma_th
+    assert cfg.threshold_mode == "pure_noise"
+    assert cfg.threshold_nsigma == 3.0
+    assert cfg.final_depth == (3.0, 2.0, 1.0, 0.5)
+    assert cfg.final_aperture_arcsec is None
 
 
 def test_default_gaincal_config():
     cfg = GainCalConfig()
     assert cfg.minblperant == 4
-    assert cfg.minsnr == 1.5
+    assert cfg.minsnr == 3.0                 # v0.3 (was 1.5)
     assert cfg.gaintype == "T"
     assert cfg.applymode == "calonly"
+    assert cfg.calwt is False                # v0.3 (was True): self-cal never moves WEIGHT
+    assert cfg.applycal_interp == "linearPDperobs"
+    assert cfg.spwmap == ()
+
+
+def test_default_data_hygiene_options(existing_vis):
+    cfg = AJISAIConfig(vis=existing_vis)
+    assert cfg.caller == "user"
+    assert cfg.relabel_j2000_to_icrs is True
 
 
 def test_default_schedule_is_three_phase_one_amp():
@@ -192,6 +210,63 @@ def test_mask_mode_user_with_path_ok(existing_vis):
         imaging=ImagingConfig(mask_mode="user", user_mask="/path/to/some.mask"),
     )
     AJISAI(cfg)._validate_inputs()
+
+
+def test_mask_mode_user_accepts_crtf_file(existing_vis, tmp_path):
+    crtf = tmp_path / "region.crtf"
+    crtf.write_text("#CRTFv0\ncircle[[16h00m00s, -30d00m00s], 2arcsec]\n")
+    cfg = AJISAIConfig(vis=existing_vis,
+                       imaging=ImagingConfig(mask_mode="user", user_mask=str(crtf)))
+    AJISAI(cfg)._validate_inputs()
+
+
+def test_mask_mode_user_rejects_non_crtf_file(existing_vis, tmp_path):
+    bad = tmp_path / "region.txt"
+    bad.write_text("circle 1 2 3\n")
+    cfg = AJISAIConfig(vis=existing_vis,
+                       imaging=ImagingConfig(mask_mode="user", user_mask=str(bad)))
+    with pytest.raises(ValueError, match="CRTF"):
+        AJISAI(cfg)._validate_inputs()
+
+
+def test_interactive_refused_when_caller_is_asebi(existing_vis):
+    cfg = AJISAIConfig(vis=existing_vis, caller="asebi",
+                       imaging=ImagingConfig(mask_mode="interactive"))
+    with pytest.raises(ValueError, match="viewer-free"):
+        AJISAI(cfg)._validate_inputs()
+
+
+def test_unknown_caller_rejected(existing_vis):
+    with pytest.raises(ValueError, match="caller"):
+        AJISAI(AJISAIConfig(vis=existing_vis, caller="pipeline"))._validate_inputs()
+
+
+@pytest.mark.parametrize("imaging, match", [
+    (ImagingConfig(cell_rule="beam"), "cell_rule"),
+    (ImagingConfig(cell="tiny"), "cell"),
+    (ImagingConfig(imsize=(0,)), "imsize"),
+    (ImagingConfig(nterms=0), "nterms"),
+    (ImagingConfig(scales=(0, -3)), "scales"),
+    (ImagingConfig(threshold_mode="nsigma"), "threshold_mode"),
+    (ImagingConfig(threshold_nsigma=0.0), "threshold_nsigma"),
+    (ImagingConfig(final_depth=(2.0, 3.0)), "final_depth"),
+    (ImagingConfig(final_depth=(3.0, 0.0)), "final_depth"),
+    (ImagingConfig(final_aperture_arcsec=-1.0), "final_aperture_arcsec"),
+])
+def test_invalid_imaging_options_rejected(existing_vis, imaging, match):
+    with pytest.raises(ValueError, match=match):
+        AJISAI(AJISAIConfig(vis=existing_vis, imaging=imaging))._validate_inputs()
+
+
+@pytest.mark.parametrize("imaging", [
+    ImagingConfig(cell="6.2mas", imsize=(4320,), nterms=2, reffreq="227.0GHz",
+                  scales=(0, 13, 39, 118, 353)),
+    ImagingConfig(cell_rule="percentile", threshold_mode="image_rms"),
+    ImagingConfig(final_depth=()),
+    ImagingConfig(final_depth=(3.0, 2.0), final_aperture_arcsec=2.35),
+])
+def test_valid_imaging_options_accepted(existing_vis, imaging):
+    AJISAI(AJISAIConfig(vis=existing_vis, imaging=imaging))._validate_inputs()
 
 
 def test_mask_mode_interactive_warns(existing_vis):

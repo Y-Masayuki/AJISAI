@@ -6,8 +6,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Development version `0.3.0.dev0`. The changes below make AJISAI usable as the
+self-calibration engine of a larger pipeline (ASEBI) and fix data-hygiene
+issues; defaults stay usable for standalone runs, and the previous rules
+remain available as explicit options (`cell_rule="percentile"`,
+`threshold_mode="image_rms"`, `final_depth=()`).
+
 ### Added
 
+- **Image geometry and Taylor terms from the caller.** `ImagingConfig` gains
+  `cell`, `imsize`, `reffreq` and `scales`; when given they are used for
+  every `tclean` of the run (dirty image, initial CLEAN, each iteration,
+  final image). `nterms > 1` selects `deconvolver="mtmfs"` (multiscale scales
+  kept), and `reffreq` is passed to every `tclean`.
+- **Final deep image.** After the best iteration is selected, its data are
+  split (DATA only) to `<results_dir>/final_selfcal.ms` and imaged once more
+  with a deeper CLEAN: the threshold steps through
+  `ImagingConfig.final_depth` × sigma_th (default 3, 2, 1, 0.5), continuing
+  the same CLEAN without a new PSF. After each step, inside the aperture
+  (the CLEAN mask; `final_aperture_arcsec` or 5 beams otherwise),
+  `F_corr = F_model + sum(residual)/Omega_R` is measured and the CLEAN stops
+  when `|F_unc| <= max(3 sigma_F, 0.01 F_corr)` or when `F_corr` changed by
+  no more than that width since the previous step. The restored-image flux
+  bias `F_unc (Omega_R/Omega_clean - 1)` is recorded and warned about when it
+  exceeds the same width. `final.image` / `final.fits` now come from this
+  image (Taylor term 0 for mtmfs); `final_depth=()` restores the previous
+  behaviour. Steps, fluxes and the stop reason are in
+  `justification.json["final_image"]`.
+- **Per-stage solve information.** `AJISAI.stages` (and
+  `justification.json["stages"]`) records for every stage the data MS, the
+  stage MS, the image, the model and, for self-cal stages, `solve`: gain
+  table, solint (string and seconds), combine, refant, calmode, gaintype,
+  minsnr, minblperant, solnorm, the applycal interp/applymode/calwt/spwmap,
+  the model image(s) the solve used (with nterms and reference frequency),
+  the MS solved on, the stage MS, and the flagged-solution fraction per
+  observation and spw (`ajisai.SOLVE_INFO_KEYS`).
+- **Post-tclean and post-prediction checks.** After every `tclean` the MFS
+  frequency axis must be finite and cover the data's frequency range (within
+  the LSRK/TOPO Doppler offset) and `sumwt` must be positive; after every
+  model prediction `MODEL_DATA` must be non-zero on every unflagged channel
+  of the field. A failure raises `RuntimeError`; all results are listed in
+  `justification.json["checks"]`.
+- **Thermal noise from a signal-free image.** sigma_th is measured once on
+  the dirty image of `(XX-YY)/2` (Stokes Q; `(RR-LL)/2` = V for circular
+  feeds), which has the noise of the Stokes I image but no source signal or
+  sidelobes (`justification.json["derived"]["sigma_th"]`).
+- `GainCalConfig.spwmap` (passed to `applycal`), `AJISAIConfig.caller`
+  (`"user"` or `"asebi"`; interactive masking is refused for `"asebi"`),
+  `AJISAIConfig.relabel_j2000_to_icrs`.
+- `ms_utils.get_dish_diameter_m`, `ms_utils.get_uv_max`,
+  `ms_utils.cell_from_umax`; `get_array_info` also returns the dish
+  diameters.
 - `examples/full_config_template.py`: every configuration option with its
   default value and the allowed alternatives in the comments. Running it
   unchanged (after setting `vis`) is equivalent to the defaults. Shown on
@@ -19,9 +68,70 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The input MS is never written.** Previously the initial CLEAN saved its
+  model into the input MS, the first iteration ran `applycal` on it (creating
+  CORRECTED_DATA) and the J2000 -> ICRS relabelling edited it in place. Now
+  every task opens the input read-only: each iteration copies the previous
+  stage's MS to a temporary MS, predicts the model into it when needed,
+  runs `gaincal` and `applycal` on the copy, splits CORRECTED into
+  `intermediate/selfcal_<N>.ms` and deletes the copy. The relabelling is
+  applied to a copy (`intermediate/input_icrs.ms`) only when the input has
+  J2000 frame codes. `tclean` never writes a model (`savemodel="none"`); the
+  `clearcal` on the new MS is gone.
+- **Stage MSs are kept and immutable.** `intermediate/selfcal_<N>.ms` holds
+  DATA (the self-calibrated visibilities) and MODEL (the model of that
+  stage's image, which the next stage solves against) and is not modified
+  after it is made.
+- **Model prediction from the Taylor models.** Models are written with `ft`
+  of all Taylor-term model images, with `nterms` and the model's reference
+  frequency (standard gridder); other gridders use a `tclean` prediction.
+  This replaces the old heuristic that re-ran `tclean` when the mean model
+  amplitude looked like 0 or 1.
+- **Cell from u_max.** The default cell is `1/(5 u_max)`, with `u_max` from
+  the longest unflagged baseline at the highest frequency (truncated to 4
+  significant figures); the image covers the primary beam down to 20 % at
+  the lowest frequency. The v0.2 rule (90th-percentile baseline at the
+  median frequency, beam / `cellpix`) is kept as
+  `ImagingConfig.cell_rule="percentile"` and in `pick_cell_imsize(rule=...)`.
+- **Dish diameter from the MS.** The primary beam uses the smallest dish in
+  `ANTENNA/DISH_DIAMETER` (the largest primary beam); 12 m is only the
+  fallback for an MS without the column (`pick_cell_imsize(diameter_m=None)`).
+- **Multiscale scales from the beam and the mask.** `0, b, 3b, 9b, ...` (b =
+  dirty-image beam in pixels) up to the largest scale whose support fits
+  inside the user mask region, so that CASA no longer ignores scales that are
+  too large for the mask; without a user mask, `0, b, 3b` as before.
+- **Absolute CLEAN threshold in the self-cal loop.** Every self-cal image is
+  CLEANed to `threshold_nsigma × sigma_th` (3 sigma_th), the same absolute
+  threshold in every iteration, instead of `threshold_factor ×` the RMS of
+  the previous image (still available as `threshold_mode="image_rms"`).
+- **Statistics on Taylor term 0.** All image names go through one helper;
+  with `nterms > 1` the statistics, FITS exports and gallery use
+  `.image.tt0`. Metrics rows gain `image_base`, `threshold_jy`, `solint_s`
+  and `caltable`.
+- **CRTF user masks.** `mask_mode="user"` accepts a CRTF region file (first
+  line `#CRTF...`) or a CASA mask image, and passes it to every `tclean`
+  (initial, each iteration, final) instead of reusing the initial `.mask`.
+- `GainCalConfig.calwt` default `False` (an amplitude step must not rescale
+  the weights), `GainCalConfig.minsnr` default `3` (was 1.5), and
+  `GainCalConfig.applycal_interp` default `"linearPDperobs"` (time
+  interpolation never crosses an observation boundary of a concatenated MS;
+  ignored by CASA for a single observation).
+- `casaplotms` is optional: without it the gain-table plots are skipped with
+  a warning instead of disabling CASA support.
 - The install instructions (README, documentation) give a single command
   that installs the latest version from the `main` branch; the per-release
-  tag is no longer quoted.
+  tag is no longer quoted. Updating on a compute server uses
+  `pip install --upgrade --force-reinstall --no-deps "git+https://...@main"`
+  (the version string does not change between commits on `main`).
+
+### Removed
+
+- The channel-averaged by-product `intermediate/selfcal_<idx>_avg.ms`
+  (`AJISAI._make_chanavg_ms`, the `selfcal_avg_ms` metrics column and its
+  tests). Averaging every spw to one channel smears the longest baselines,
+  and nothing used the copy.
+- `AJISAI._ensure_model_column` (replaced by the explicit model prediction
+  and its check).
 
 ### Fixed
 

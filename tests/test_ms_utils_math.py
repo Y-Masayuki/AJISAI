@@ -15,17 +15,27 @@ import math
 
 import pytest
 
+import numpy as np
+
 from ajisai.ms_utils import (
+    ALMA_DISH_DIAMETER_M,
     ARCSEC_PER_RAD,
+    CELL_SAMPLES_PER_UMAX,
     SPEED_OF_LIGHT_M_S,
     _UVTAPER_FWHM_PRODUCT,
     _baars_taper_factor,
     _central_obscuration_factor,
+    _floor_to_sig_figs,
     _gaussian_offset_for_pb_level,
     _parse_uvtaper_to_image_fwhm,
     _primary_beam_fwhm_arcsec,
     _round_to_sig_figs,
     _smallest_5_smooth_at_least,
+    cell_from_umax,
+    get_dish_diameter_m,
+    max_uv_of_unflagged_rows,
+    smallest_dish_diameter,
+    uv_max_from_maxima,
 )
 
 
@@ -332,3 +342,117 @@ def test_icrs_to_j2000_accepts_space_form():
     ra_out, dec_out = out.split()
     assert ra_out.count(":") == 2
     assert dec_out.startswith("-34.17.38")
+
+
+# ---------------------------------------------------------------------------
+# Cell from u_max (default rule since v0.3)
+# ---------------------------------------------------------------------------
+def test_cell_from_umax_definition():
+    """cell = 1/(5 u_max) radians, in arcsec."""
+    assert CELL_SAMPLES_PER_UMAX == 5.0
+    u_max = 11_596e3  # J16011549 TM1 spw19: 11 596 klambda
+    cell = cell_from_umax(u_max)
+    assert cell == pytest.approx(ARCSEC_PER_RAD / (5 * u_max))
+    assert cell * 1e3 == pytest.approx(3.557, abs=0.001)   # 3.557 mas (P13 I2)
+
+
+def test_cell_from_umax_samples_argument():
+    assert cell_from_umax(1e6, samples=10) == pytest.approx(cell_from_umax(1e6) / 2)
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_cell_from_umax_rejects_bad_umax(bad):
+    with pytest.raises(ValueError):
+        cell_from_umax(bad)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0.0035579, 0.003557),     # truncated, never rounded up
+    (0.0062, 0.0062),          # exact decimals survive
+    (0.35385, 0.3538),
+    (123.456, 123.4),
+])
+def test_floor_to_sig_figs(value, expected):
+    assert _floor_to_sig_figs(value, 4) == pytest.approx(expected, rel=1e-12)
+    assert _floor_to_sig_figs(value, 4) <= value
+
+
+def test_max_uv_of_unflagged_rows_ignores_flagged_rows():
+    uvw = np.array([[100.0, 3000.0, 400.0],
+                    [0.0, 4000.0, 300.0],
+                    [5.0, 0.0, 0.0]])
+    flag = np.zeros((2, 4, 3), bool)
+    flag[:, :, 1] = True              # the longest row (5 km) is fully flagged
+    flag[:, 3, :] = True              # last channel flagged everywhere
+    m, chan_ok = max_uv_of_unflagged_rows(uvw, flag)
+    assert m == pytest.approx(500.0)  # hypot(400, 300)
+    assert chan_ok.tolist() == [True, True, True, False]
+
+
+def test_max_uv_of_unflagged_rows_flag_row_and_all_flagged():
+    uvw = np.array([[100.0, 200.0], [0.0, 0.0], [0.0, 0.0]])
+    flag = np.zeros((1, 2, 2), bool)
+    m, _ = max_uv_of_unflagged_rows(uvw, flag, flag_row=np.array([False, True]))
+    assert m == pytest.approx(100.0)
+    m, chan_ok = max_uv_of_unflagged_rows(uvw, np.ones((1, 2, 2), bool))
+    assert m == 0.0 and not chan_ok.any()
+
+
+def test_uv_max_from_maxima_uses_each_spw_highest_frequency():
+    """u_max = max over spw of |uv|_max * f_max / c: the high-frequency spw can win
+    with a shorter baseline."""
+    res = uv_max_from_maxima({0: 1000.0, 1: 990.0}, {0: 224e9, 1: 241e9})
+    assert res["spw"] == 1
+    assert res["u_max_lambda"] == pytest.approx(990.0 * 241e9 / SPEED_OF_LIGHT_M_S)
+    assert res["baseline_m"] == 990.0 and res["freq_hz"] == 241e9
+
+
+def test_uv_max_from_maxima_all_flagged_raises():
+    with pytest.raises(ValueError):
+        uv_max_from_maxima({0: 0.0}, {0: 230e9})
+    with pytest.raises(ValueError):
+        uv_max_from_maxima({0: 100.0}, {})
+
+
+# ---------------------------------------------------------------------------
+# Dish diameter from ANTENNA (smallest dish -> largest primary beam)
+# ---------------------------------------------------------------------------
+def _fake_reader(tables):
+    calls = []
+
+    def reader(table_path, column):
+        calls.append((table_path, column))
+        if (table_path, column) not in tables:
+            raise KeyError(column)
+        return np.asarray(tables[(table_path, column)])
+    reader.calls = calls
+    return reader
+
+
+def test_dish_diameter_from_antenna_takes_smallest():
+    reader = _fake_reader({("x.ms/ANTENNA", "DISH_DIAMETER"): [12.0, 12.0, 7.0, 12.0]})
+    d = get_dish_diameter_m("x.ms", table_reader=reader)
+    assert reader.calls == [("x.ms/ANTENNA", "DISH_DIAMETER")]
+    assert d["diameter_m"] == 7.0
+    assert d["source"] == "ANTENNA/DISH_DIAMETER"
+    assert d["unique_diameters_m"] == [7.0, 12.0]
+    assert d["n_antennas"] == 4
+
+
+def test_dish_diameter_falls_back_to_12m_without_column():
+    d = get_dish_diameter_m("x.ms", table_reader=_fake_reader({}))
+    assert d["diameter_m"] == ALMA_DISH_DIAMETER_M == 12.0
+    assert d["source"] == "fallback"
+
+
+def test_dish_diameter_ignores_zero_and_nan():
+    reader = _fake_reader({("x.ms/ANTENNA", "DISH_DIAMETER"): [0.0, float("nan"), 25.0]})
+    assert get_dish_diameter_m("x.ms", table_reader=reader)["diameter_m"] == 25.0
+    assert smallest_dish_diameter([0.0, -1.0])["source"] == "fallback"
+
+
+def test_smaller_dish_gives_larger_primary_beam():
+    """7 m dish: the primary beam (and so the imaged field) is 12/7 times larger."""
+    pb12 = _primary_beam_fwhm_arcsec(230e9, diameter_m=12.0)
+    pb7 = _primary_beam_fwhm_arcsec(230e9, diameter_m=7.0)
+    assert pb7 / pb12 == pytest.approx(12.0 / 7.0, rel=0.01)
