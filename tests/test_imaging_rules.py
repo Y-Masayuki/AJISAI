@@ -347,3 +347,22 @@ def test_restored_bias_v1094_ratio():
     ratio = 458.6 / 175.0 - 1.0
     assert ratio == pytest.approx(1.62, abs=0.01)
     assert 6.6 * ratio == pytest.approx(10.7, abs=0.1)     # +11 mJy at 2 sigma
+
+
+# ---------------------------------------------------------------------------
+# Model prediction: the model's spectral range must cover the data (ft)
+# ---------------------------------------------------------------------------
+def test_spectral_cover_widens_only_when_the_image_misses_a_channel():
+    """DG Tau B, 2015 EB: tclean's mfs range began at 219.5245 GHz while the data's lowest edge
+    (a descending spw) was 219.5046 GHz, so ft wrote no model there. The widened increment keeps
+    the reference frequency, keeps the sign, and covers the data plus the LSRK/TOPO margin."""
+    from ajisai.core import spectral_cover_increment, _DOPPLER_TOLERANCE
+    ref, inc = 226.20413e9, 13.359292e9
+    lo, hi = 219.504590e9, 232.862603e9
+    new = spectral_cover_increment(ref, inc, lo, hi)
+    assert new is not None and new > abs(inc)
+    assert ref - new / 2 <= lo * (1 - _DOPPLER_TOLERANCE) + 1.0
+    assert ref + new / 2 >= hi * (1 + _DOPPLER_TOLERANCE) - 1.0
+    assert spectral_cover_increment(ref, -inc, lo, hi) < 0          # sign of the axis kept
+    # an axis that already covers the data with the margin is left alone
+    assert spectral_cover_increment(ref, 2.0 * (hi * 1.001 - ref), lo, hi) is None

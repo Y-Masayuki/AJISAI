@@ -202,6 +202,15 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **Model prediction missed an edge channel (ft and the LSRK/TOPO offset).** tclean sets an mfs
+  image's frequency range to the data's range in LSRK, and `ft` compares the TOPO channel
+  frequencies with it: when the LSRK/TOPO offset exceeds half of the outermost channel, that
+  channel gets MODEL_DATA = 0 (DG Tau B, a 2015 EB with 19.5 MHz channels at the low edge and a
+  +20 MHz offset; the model check stopped the run). `ft` now gets temporary copies of the model
+  images with only the spectral increment widened to cover the data plus the largest offset
+  (`spectral_cover_increment`); the predicted values are unchanged and the originals are never
+  modified. Recorded as `spectral_cover` in the `model_prediction` check. Test:
+  `tests/test_casa_predict_cover.py` reproduces the dropped channel on a simulated MS.
 - **Multiscale scales the data cannot see; empty initial CLEAN.** A scale is
   now used only when its scale-PSF (the dirty PSF convolved twice with CASA's
   multiscale component, as `MatrixCleaner` computes it) has its largest

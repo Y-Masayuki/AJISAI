@@ -991,6 +991,31 @@ def build_solve_info(
 _DOPPLER_TOLERANCE = 2.0e-4
 
 
+def spectral_cover_increment(ref_hz: float, inc_hz: float, lo_hz: float, hi_hz: float,
+                             rtol: float = _DOPPLER_TOLERANCE) -> Optional[float]:
+    """Spectral increment, centred on ``ref_hz``, that covers the data's channel edges.
+
+    tclean sets an mfs image's frequency range from the data, and with a
+    descending spw (negative channel width) at an edge of the band it was found
+    to drop the outermost channel (DG Tau B, 2015 EB: range from 219.5245 GHz,
+    data from 219.5046 GHz); ``ft`` then writes no model into that channel.
+    Returns the increment (sign of ``inc_hz``) whose range ``ref +- |inc|/2``
+    covers ``[lo (1 - rtol), hi (1 + rtol)]``, the data's TOPO edges widened by
+    the largest LSRK/TOPO offset, or None when the axis already covers it.
+    Widening the axis does not change the predicted values: the model is the
+    same at every frequency for nterms = 1, and the Taylor terms are evaluated
+    about the reference frequency given to ``ft``.
+    """
+    lo_m = float(lo_hz) * (1.0 - rtol)
+    hi_m = float(hi_hz) * (1.0 + rtol)
+    half = 0.5 * abs(float(inc_hz))
+    ref = float(ref_hz)
+    if ref - half <= lo_m and ref + half >= hi_m:
+        return None
+    need = 2.0 * max(ref - lo_m, hi_m - ref)
+    return math.copysign(need, float(inc_hz) if float(inc_hz) != 0.0 else 1.0)
+
+
 def imaging_consistency_problems(
     ref_freq_hz: float,
     width_hz: float,
@@ -3584,15 +3609,22 @@ Infrastructure
         cfg = self.cfg
         models = _model_images(imagebase, nterms)
         reffreq_hz = _image_spectral_axis(models[0])[0] if nterms > 1 else None
+        cover: Optional[Dict[str, Any]] = None
         if cfg.imaging.gridder == "standard":
-            casatasks.ft(
-                vis=str(vis),
-                field=self._derived["resolved_field_id"],
-                model=models if nterms > 1 else models[0],
-                nterms=int(nterms),
-                reffreq=f"{reffreq_hz}Hz" if reffreq_hz else "",
-                usescratch=True,
-            )
+            ft_models, cover = _models_covering_data(models, vis)
+            try:
+                casatasks.ft(
+                    vis=str(vis),
+                    field=self._derived["resolved_field_id"],
+                    model=ft_models if nterms > 1 else ft_models[0],
+                    nterms=int(nterms),
+                    reffreq=f"{reffreq_hz}Hz" if reffreq_hz else "",
+                    usescratch=True,
+                )
+            finally:
+                for m in ft_models:
+                    if m not in models:
+                        _safe_rmtree_path(m)
             method = "ft"
         else:
             self._tclean(vis, imagebase, niter=0, threshold_jy=0.0, savemodel="modelcolumn",
@@ -3606,6 +3638,7 @@ Infrastructure
             "model_image": models,
             "nterms": int(nterms),
             "reffreq_hz": reffreq_hz,
+            "spectral_cover": cover,
             "ok": not problems,
             "problems": problems,
         })
@@ -4258,6 +4291,76 @@ def _image_spectral_axis(path) -> Tuple[float, float]:
     finally:
         ia.close()
     return ref * scale, inc * scale
+
+
+def _data_frequency_edges(vis) -> Tuple[float, float]:
+    """(lowest, highest) channel-edge frequency (Hz, the MS's own frame) of the spws that hold rows."""
+    _require_casa()
+    tb = casatools.table()
+    tb.open(str(vis))
+    try:
+        ddids = sorted(set(int(x) for x in np.unique(tb.getcol("DATA_DESC_ID"))))
+    finally:
+        tb.close()
+    tb.open(str(vis) + "/DATA_DESCRIPTION")
+    try:
+        spws = sorted(set(int(tb.getcell("SPECTRAL_WINDOW_ID", d)) for d in ddids))
+    finally:
+        tb.close()
+    tb.open(str(vis) + "/SPECTRAL_WINDOW")
+    try:
+        lo, hi = math.inf, -math.inf
+        for s in spws:
+            f = np.asarray(tb.getcell("CHAN_FREQ", s), dtype=float)
+            w = np.abs(np.asarray(tb.getcell("CHAN_WIDTH", s), dtype=float))
+            lo = min(lo, float(np.min(f - 0.5 * w)))
+            hi = max(hi, float(np.max(f + 0.5 * w)))
+    finally:
+        tb.close()
+    return lo, hi
+
+
+def _models_covering_data(models: List[str], vis) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """Model images for ``ft`` whose spectral range covers every channel of ``vis``.
+
+    When the model's range does not cover the data (see
+    :func:`spectral_cover_increment`), temporary copies with only the spectral
+    increment widened are returned; the originals are never changed (tclean
+    restarts and callers re-solving a stage read them). Returns the paths for
+    ``ft`` and a record of the check.
+    """
+    ref, inc = _image_spectral_axis(models[0])
+    lo, hi = _data_frequency_edges(vis)
+    new_inc = spectral_cover_increment(ref, inc, lo, hi)
+    rec: Dict[str, Any] = {"image_ref_hz": ref, "image_increment_hz": inc,
+                           "data_lo_hz": lo, "data_hi_hz": hi, "widened_increment_hz": new_inc}
+    if new_inc is None:
+        return list(models), rec
+    out: List[str] = []
+    ia = casatools.image()
+    for m in models:
+        tmp = str(m) + ".ft_cover"
+        _safe_rmtree_path(tmp)
+        shutil.copytree(str(m), tmp)
+        ia.open(tmp)
+        try:
+            cs = ia.coordsys()
+            try:
+                names = list(cs.names())
+                i = names.index("Frequency")
+                incs = cs.increment()
+                scale = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9}.get(list(cs.units())[i], 1.0)
+                incs["numeric"][i] = new_inc / scale
+                cs.setincrement(incs)
+                ia.setcoordsys(cs.torecord())
+            finally:
+                cs.done()
+        finally:
+            ia.close()
+        out.append(tmp)
+    rec["note"] = ("the model's spectral range did not cover the data; ft used copies with the spectral "
+                   "increment widened (values unchanged)")
+    return out, rec
 
 
 def _image_beam_cell(path) -> Dict[str, Any]:
