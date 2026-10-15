@@ -274,7 +274,13 @@ the lines you need.
     the largest scale whose support (radius = scale) fits inside the user
     mask region (`mask_mode="user"`), i.e. half the region size for a round
     region; without a user mask, `0, b, 3b`. Larger scales would be ignored
-    by CASA ("too large to fit within the mask").
+    by CASA ("too large to fit within the mask"). Then, given or derived,
+    every scale whose scale-PSF (the dirty PSF convolved twice with CASA's
+    component) does not peak at the component's own position is dropped:
+    the uv coverage has no baseline short enough to see it, and when its
+    largest sidelobe is negative CASA's multiscale minor cycle refuses to
+    start and the CLEAN leaves no component. Dropped scales are recorded
+    (`derived.scales.psf_check`); a dropped given scale is warned about.
 
 ### Masking
 

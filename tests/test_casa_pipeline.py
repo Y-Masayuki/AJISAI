@@ -118,8 +118,11 @@ def test_mtmfs_names_and_checks(run):
     assert all(st["image"].endswith(".image.tt0") for st in aj.stages)
     assert all(os.path.isdir(st["image"]) for st in aj.stages)
     checks = aj.justification["checks"]
-    assert {c["kind"] for c in checks} == {"tclean", "model_prediction"}
+    assert {c["kind"] for c in checks} == {"tclean", "clean_model", "model_prediction"}
     assert all(c["ok"] for c in checks)
+    # the initial CLEAN (mtmfs) left a model: checked once, on its Taylor terms
+    model_check = [c for c in checks if c["kind"] == "clean_model"]
+    assert len(model_check) == 1 and model_check[0]["n_model_pixels"] > 0
 
 
 def test_solve_information(run):

@@ -741,6 +741,115 @@ def multiscale_scales(
                     f"extent {extent:.0f} pix)")
 
 
+# Rational approximation of the prolate spheroidal function used by CASA's
+# multiscale components (MatrixCleaner::spheroidal): numerator p, denominator
+# q, for 0 <= nu < 0.75 (column 0) and 0.75 <= nu <= 1 (column 1).
+_SPHEROIDAL_P = np.array([[8.203343e-2, 4.028559e-3],
+                          [-3.644705e-1, -3.697768e-2],
+                          [6.278660e-1, 1.021332e-1],
+                          [-5.335581e-1, -1.201436e-1],
+                          [2.312756e-1, 6.412774e-2]])
+_SPHEROIDAL_Q = np.array([[1.0, 1.0],
+                          [8.212018e-1, 9.599102e-1],
+                          [2.078043e-1, 2.918724e-1]])
+
+
+def _casa_spheroidal(nu) -> np.ndarray:
+    """CASA's ``MatrixCleaner::spheroidal``: 1 at nu <= 0, 0 at nu >= 1."""
+    nu = np.asarray(nu, dtype=float)
+    out = np.zeros_like(nu)
+    parts = (((nu >= 0.0) & (nu < 0.75), 0.75), ((nu >= 0.75) & (nu < 1.0), 1.0))
+    for part, (inside, end) in enumerate(parts):
+        d = nu[inside] ** 2 - end ** 2
+        top = sum(_SPHEROIDAL_P[k, part] * d ** k for k in range(_SPHEROIDAL_P.shape[0]))
+        bot = sum(_SPHEROIDAL_Q[k, part] * d ** k for k in range(_SPHEROIDAL_Q.shape[0]))
+        out[inside] = top / bot
+    out[nu <= 0.0] = 1.0
+    return out
+
+
+def casa_scale_kernel(scale_pix: float, shape) -> np.ndarray:
+    """CASA's multiscale component of size ``scale_pix`` on a grid of ``shape``.
+
+    Mirrors ``MatrixCleaner::makeScale``: ``(1 - r^2) x spheroidal(r)`` with
+    ``r`` = distance / scale (support radius = scale), centred on pixel
+    ``(n0 // 2, n1 // 2)`` and normalised to unit sum; scale 0 is a single
+    pixel.
+    """
+    n0, n1 = (int(x) for x in shape)
+    out = np.zeros((n0, n1))
+    c0, c1 = n0 // 2, n1 // 2
+    s = float(scale_pix)
+    if s <= 0.0:
+        out[c0, c1] = 1.0
+        return out
+    r = int(math.ceil(s))
+    i0, i1 = max(0, c0 - r), min(n0, c0 + r + 1)
+    j0, j1 = max(0, c1 - r), min(n1, c1 + r + 1)
+    ii, jj = np.mgrid[i0:i1, j0:j1]
+    rad2 = ((ii - c0) / s) ** 2 + ((jj - c1) / s) ** 2
+    inside = rad2 < 1.0
+    out[i0:i1, j0:j1] = np.where(inside, (1.0 - rad2) * _casa_spheroidal(np.sqrt(rad2)), 0.0)
+    return out / out.sum()
+
+
+def scale_psf_response(psf, scales) -> List[Dict[str, Any]]:
+    """The scale-PSF of each multiscale component, as CASA's minor cycle computes it.
+
+    ``psf`` is the PSF plane of the run (peak 1). The scale-PSF is the PSF
+    convolved twice with the component (CASA's ``MatrixCleaner::makePsfScales``:
+    FFT(psf) x FFT(scale)^2, a circular convolution on the image grid): the
+    response of the scale-smoothed residual to a component of that scale.
+    For each scale: ``centre``, its value at the PSF peak, i.e. the component's
+    own position (= sum over the samples of w |FT(scale)|^2 / sum w: the part
+    of the scale's power that the uv coverage samples; the diagonal of the
+    Hessian that CASA's mtmfs logs); ``max_abs``, the value of largest
+    magnitude anywhere, with its sign, and its pixel ``max_abs_at``;
+    ``ok``: the scale-PSF has its largest magnitude at the centre.
+
+    A scale is not ``ok`` when its sampled power falls below the smoothed
+    sidelobes of the PSF, i.e. no baseline is short enough to see it.
+    CASA normalises each scale by ``max_abs`` and its ``MatrixCleaner::clean``
+    refuses to start when ``max_abs`` of any scale is negative ("As Peak of
+    PSF is negative, you should setscales again with a smaller scale size"):
+    tclean then ends with no CLEAN component at all. When ``max_abs`` is
+    positive but away from the centre, CASA runs but normalises the scale by
+    a sidelobe, not by the component's own response. Which of the two
+    happens depends on the sign of the largest sidelobe; ``ok`` covers both.
+    """
+    psf = np.asarray(psf, dtype=float)
+    while psf.ndim > 2:
+        psf = psf[..., 0]
+    c = np.unravel_index(int(np.argmax(psf)), psf.shape)
+    psf_ft = None
+    out: List[Dict[str, Any]] = []
+    for s in scales:
+        if float(s) <= 0.0:
+            conv = psf
+        else:
+            if psf_ft is None:
+                psf_ft = np.fft.rfft2(psf)
+            kernel_ft = np.fft.rfft2(np.fft.ifftshift(casa_scale_kernel(s, psf.shape)))
+            conv = np.fft.irfft2(psf_ft * kernel_ft * kernel_ft, psf.shape)
+        mag = np.abs(conv)
+        k = np.unravel_index(int(np.argmax(mag)), conv.shape)
+        centre = float(conv[c])
+        out.append({"scale": int(s), "centre": centre, "max_abs": float(conv[k]),
+                    "max_abs_at": [int(k[0]), int(k[1])],
+                    "ok": bool(centre > 0.0 and centre >= float(mag[k]) * (1.0 - 1e-9))})
+    return out
+
+
+def psf_supported_scales(psf, scales) -> Tuple[List[int], List[Dict[str, Any]]]:
+    """Scales whose scale-PSF peaks at the component's own position (:func:`scale_psf_response`).
+
+    Returns ``(kept, response)``; scale 0 is always kept.
+    """
+    response = scale_psf_response(psf, scales)
+    kept = [int(r["scale"]) for r in response if r["ok"] or int(r["scale"]) == 0]
+    return kept, response
+
+
 # CASA Stokes codes of the correlation products (casacore Stokes enum).
 _CORR_RR, _CORR_LL = 5, 8
 _CORR_XX, _CORR_YY = 9, 12
@@ -925,6 +1034,41 @@ def model_zero_channels(absmax_by_chan, n_unflagged_by_chan) -> List[int]:
     n = np.asarray(n_unflagged_by_chan)
     bad = (n > 0) & ~(np.isfinite(a) & (a > 0))
     return [int(i) for i in np.flatnonzero(bad)]
+
+
+def empty_model_problem(models, residual, mask, threshold_jy: float,
+                        scales=None, casa_log: Optional[str] = None) -> Optional[str]:
+    """Why a CLEAN left no component; None when the model is not empty.
+
+    ``models`` are the model planes (one per Taylor term), ``residual`` the
+    residual (tt0) plane and ``mask`` the CLEAN mask plane (None: the whole
+    image). With the residual peak inside the mask above the threshold the
+    minor cycle did not run; otherwise the mask holds no emission above the
+    threshold.
+    """
+    for m in models:
+        m = np.asarray(m, dtype=float)
+        if np.any(np.isfinite(m) & (m != 0.0)):
+            return None
+    res = np.abs(np.asarray(residual, dtype=float))
+    if mask is None:
+        inside, where = np.isfinite(res), "the image"
+    else:
+        inside, where = (np.asarray(mask, dtype=float) > 0.5) & np.isfinite(res), "the mask"
+    if not inside.any():
+        return f"the CLEAN model is empty and {where} has no pixel to CLEAN"
+    peak = float(res[inside].max())
+    thr = float(threshold_jy)
+    if peak > thr:
+        log = f" ({casa_log})" if casa_log else ""
+        return (f"the CLEAN model is empty although the residual peak inside {where} "
+                f"({peak * 1e3:.4g} mJy/beam) is {peak / thr:.1f} x the threshold "
+                f"({thr * 1e6:.4g} uJy): the minor cycle did not run. See the CASA log{log} "
+                f"of this tclean, e.g. MatrixCleaner 'As Peak of PSF is negative' for a "
+                f"multiscale scale the uv coverage cannot see (scales {list(scales or [])})")
+    return (f"the CLEAN model is empty: the residual peak inside {where} ({peak * 1e6:.4g} uJy/beam) "
+            f"is not above the threshold ({thr * 1e6:.4g} uJy); there is no emission to "
+            f"self-calibrate on")
 
 
 def psf_volume_within(psf, radius_pix: float) -> float:
@@ -1394,6 +1538,7 @@ class AJISAI:
         self.justification: Dict[str, Any] = {
             "ajisai_version": __version__,
             "casa_version": _casa_version_string(),
+            "casa_log": _casa_log_path(),
             "started_at": None,
             "finished_at": None,
             "input_config": asdict(config),
@@ -2333,10 +2478,20 @@ Infrastructure
         ``b`` the dirty-image beam FWHM in pixels, up to the largest scale
         that fits inside the user mask region (CRTF rasterised on the image
         grid); without a user mask, 0, b, 3b.
+
+        Then, when the deconvolver uses scales, every scale (given or
+        derived) whose scale-PSF, from the dirty image's PSF (the PSF of every
+        CLEAN of the run), does not peak at the component's own position is
+        dropped: the uv coverage does not see that scale, and when the
+        largest sidelobe is negative CASA's multiscale minor cycle refuses to
+        start and the CLEAN ends with an empty model
+        (:func:`scale_psf_response`). A dropped given scale is warned about;
+        both are recorded.
         """
         cfg = self.cfg
         img = cfg.imaging
-        if img.scales is not None:
+        given = img.scales is not None
+        if given:
             scales = [int(x) for x in img.scales]
             reason = "ImagingConfig.scales given by the caller"
         else:
@@ -2346,16 +2501,46 @@ Infrastructure
             region = self._user_mask_region()
             scales, reason = multiscale_scales(beam_pix, region)
         used = int(img.nterms) > 1 or img.deconvolver in ("multiscale", "mtmfs")
+        candidates = list(scales)
+        psf_check: Optional[Dict[str, Any]] = None
+        if used and any(int(s) > 0 for s in scales):
+            assert self.workdir is not None
+            psf_path = _image_name(self.workdir / "intermediate" / "dirty", 1, "psf")
+            scales, response = psf_supported_scales(_read_image_plane(psf_path), scales)
+            dropped = [r["scale"] for r in response if not r["ok"] and r["scale"] > 0]
+            psf_check = {
+                "psf": psf_path,
+                "response": response,
+                "dropped": dropped,
+                "rule": ("a scale is kept when its scale-PSF (the dirty PSF convolved twice with "
+                         "CASA's component, MatrixCleaner::makeScale/makePsfScales) has its "
+                         "largest magnitude at the PSF peak, the component's own position; "
+                         "otherwise the uv coverage does not see the scale, and with a negative "
+                         "largest sidelobe CASA's multiscale minor cycle refuses to start and "
+                         "no component is CLEANed"),
+            }
+            if dropped:
+                reason += (f"; scales {dropped} dropped: their scale-PSF does not peak at the "
+                           f"component's position (no baseline short enough to see them)")
+                if given:
+                    warnings.warn(f"[AJISAI] ImagingConfig.scales {candidates}: scales {dropped} "
+                                  f"dropped, their scale-PSF does not peak at the component's "
+                                  f"position (with a negative sidelobe peak CASA's multiscale "
+                                  f"minor cycle would not start); using {scales}")
         self._derived["scales"] = scales
         self.justification["derived"]["scales"] = {
             "value": scales,
             "used": used,
             "deconvolver": _deconvolver_kwargs(img.deconvolver, img.nterms, scales)["deconvolver"],
             "reason": reason,
+            "candidates": candidates,
+            "psf_check": psf_check,
         }
         if cfg.verbose:
             print(f"[AJISAI] multiscale scales     : {scales} pix"
-                  + ("" if used else " (not used by this deconvolver)"))
+                  + ("" if used else " (not used by this deconvolver)")
+                  + (f" (dropped {psf_check['dropped']}: the uv coverage does not see them)"
+                     if psf_check and psf_check["dropped"] else ""))
 
     def _user_mask_region(self) -> Optional[np.ndarray]:
         """The user mask (CRTF or mask image) on the dirty-image grid, or None."""
@@ -2423,6 +2608,8 @@ Infrastructure
         usemask_kwargs = self._build_usemask_kwargs()
         nterms = self._tclean(working_vis, base, niter=cfg.imaging.niter,
                               threshold_jy=threshold_jy, mask_kwargs=usemask_kwargs)
+        # Self-calibration needs this model: stop here, with the reason, if it is empty.
+        self._check_clean_model(base, nterms, threshold_jy, "initial CLEAN (iteration 0)")
 
         fits_path = interm / "clean_iter0.fits"
         stats = self._export_and_stats(base, nterms, fits_path)
@@ -3317,6 +3504,34 @@ Infrastructure
             self._check_imaging_consistency(imagename, nterms)
         return nterms
 
+    def _check_clean_model(self, imagebase, nterms: int, threshold_jy: float, label: str) -> None:
+        """A CLEAN whose model feeds self-calibration must not leave an empty model.
+
+        Run right after the tclean, before anything uses the model; raises
+        RuntimeError with the reason (:func:`empty_model_problem`) and records
+        the check.
+        """
+        models = [_read_image_plane(p) for p in _model_images(imagebase, nterms)]
+        n_model = int(sum(np.count_nonzero(np.isfinite(m) & (m != 0.0)) for m in models))
+        problem = None
+        if n_model == 0:
+            mask_path = _image_name(imagebase, nterms, "mask")
+            problem = empty_model_problem(
+                models, _read_image_plane(_image_name(imagebase, nterms, "residual")),
+                _read_image_plane(mask_path) if os.path.isdir(mask_path) else None,
+                threshold_jy, self._derived.get("scales"), _casa_log_path())
+        self.justification["checks"].append({
+            "kind": "clean_model",
+            "label": label,
+            "image_base": str(imagebase),
+            "n_model_pixels": n_model,
+            "threshold_jy": float(threshold_jy),
+            "ok": problem is None,
+            "problems": [problem] if problem else [],
+        })
+        if problem:
+            raise RuntimeError(f"[AJISAI] {label} of {imagebase}: {problem}")
+
     def _check_imaging_consistency(self, imagebase, nterms: int) -> None:
         """Post-tclean check: frequency axis covers the data, sumwt > 0.
 
@@ -3432,8 +3647,9 @@ Infrastructure
         finally:
             tb.close()
         if problems and not any_model:
-            problems.insert(0, "the model is empty (no CLEAN components above the threshold); "
-                               "self-calibration needs a model")
+            problems.insert(0, "the model is empty (the CLEAN left no component: no emission "
+                               "above the threshold, or a minor cycle that did not run; see the "
+                               "CASA log); self-calibration needs a model")
         return problems
 
     def _export_and_stats(self, imagebase, nterms: int, fits_path) -> Dict[str, Any]:
@@ -3695,8 +3911,13 @@ Infrastructure
         for k, nsig in enumerate(depth):
             thr = float(nsig) * sigma
             restart = {} if k == 0 else {"calcpsf": False, "calcres": False}
+            step_mask = mask_kwargs
+            if k > 0 and mask_kwargs and mask_kwargs.get("mask") and (Path(str(base) + ".mask")).exists():
+                # tclean refuses a restart that supplies a mask while the run's .mask image already
+                # exists; the first step wrote the same mask into that image, so reuse it
+                step_mask = dict(mask_kwargs, mask="")
             nterms = self._tclean(self.final_ms, base, niter=cfg.imaging.niter,
-                                  threshold_jy=thr, mask_kwargs=mask_kwargs, **restart)
+                                  threshold_jy=thr, mask_kwargs=step_mask, **restart)
             terms = self._final_flux_terms(base, nterms)
             decision = final_depth_decision(terms["f_model_jy"], terms["f_unc_jy"],
                                             terms["sigma_f_jy"], prev_f_corr)
@@ -3953,6 +4174,16 @@ def _casa_version_string() -> str:
         return casatasks.version_string()
     except Exception:
         return "unknown"
+
+
+def _casa_log_path() -> Optional[str]:
+    """The file the CASA logger writes to (None without CASA)."""
+    if not _HAS_CASA:
+        return None
+    try:
+        return str(casatasks.casalog.logfile())
+    except Exception:
+        return None
 
 
 def _copy_ms(src, dst) -> None:

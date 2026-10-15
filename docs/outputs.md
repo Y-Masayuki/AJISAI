@@ -171,6 +171,9 @@ decision AJISAI made. Top-level keys:
 `ajisai_version`, `casa_version`
 :   Software versions used.
 
+`casa_log`
+:   The file the CASA logger wrote to during the run.
+
 `started_at`, `finished_at`
 :   ISO 8601 timestamps in UTC.
 
@@ -192,7 +195,9 @@ decision AJISAI made. Top-level keys:
       `ANTENNA/DISH_DIAMETER`.
     - `spectral_setup`: spws, frequency range and correlations of the field.
     - `sigma_th`: thermal noise from the signal-free dirty image.
-    - `scales`: multiscale scales and how they were bounded.
+    - `scales`: multiscale scales and how they were bounded: `candidates`
+      (from the beam and the mask, or given) and `psf_check` (per scale the
+      scale-PSF `centre` and `max_abs`, the scales `dropped` and the rule).
     - `mrs_arcsec`: maximum recoverable scale.
     - `avg_int_time_sec`, `onsource_time_sec`, `median_freq_hz`: MS
       properties relevant to imaging and self-cal.
@@ -266,7 +271,8 @@ decision AJISAI made. Top-level keys:
 
 `checks`
 :   The consistency check after every `tclean` (the image's frequency band
-    covers the data's frequency range; `sumwt > 0`) and every model
+    covers the data's frequency range; `sumwt > 0`), the model check of the
+    initial CLEAN (`clean_model`: the model has a component) and every model
     prediction (`MODEL_DATA` non-zero on every unflagged channel). A failed
     check stops the run with `RuntimeError`.
 
