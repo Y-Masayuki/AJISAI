@@ -4363,6 +4363,14 @@ def _models_covering_data(models: List[str], vis) -> Tuple[List[str], Optional[D
     return out, rec
 
 
+def models_covering_data(models: List[str], vis) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """Public form of :func:`_models_covering_data` for callers that run ``ft`` themselves (ASEBI).
+
+    The caller removes the returned paths that are not among ``models`` after ``ft``.
+    """
+    return _models_covering_data(list(models), vis)
+
+
 def _image_beam_cell(path) -> Dict[str, Any]:
     """Restoring beam (arcsec), cell (arcsec) and reference pixel of a CASA image."""
     _require_casa()
