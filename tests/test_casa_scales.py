@@ -27,6 +27,7 @@ pytestmark = pytest.mark.casa
 
 CELL = "0.35arcsec"
 IMSIZE = 128
+LADDER = [0, 5, 14, 43]   # 0, b, 3b, 9b (b = 4.79 pix): the ladder up to the size of this mask
 
 
 @pytest.fixture(scope="module")
@@ -83,10 +84,12 @@ def test_initial_clean_has_a_model_with_the_unseen_scales_dropped(sim):
     cfg = AJISAIConfig(
         vis=sim["ms"], results_dir=str(work / "out"),
         imaging=ImagingConfig(cell=CELL, imsize=IMSIZE, mask_mode="user", user_mask=sim["crtf"],
-                              niter=200, final_depth=()),
+                              niter=200, final_depth=(), scales=tuple(LADDER)),
         schedule=SelfcalSchedule(mode="fixed", steps=()),
         relabel_j2000_to_icrs=False, show_banner=False, verbose=False)
-    aj = AJISAI(cfg).run()
+    # the scales a caller gives (the ladder up to the mask size): the unseen ones are dropped with a warning
+    with pytest.warns(UserWarning, match="dropped"):
+        aj = AJISAI(cfg).run()
     rec = aj.justification["derived"]["scales"]
     dropped = rec["psf_check"]["dropped"]
     assert dropped and dropped[-1] == rec["candidates"][-1], rec
@@ -95,7 +98,7 @@ def test_initial_clean_has_a_model_with_the_unseen_scales_dropped(sim):
     assert len(check) == 1 and check[0]["ok"] and check[0]["n_model_pixels"] > 0
     assert aj.justification["casa_log"]
 
-    # The same initial CLEAN with the ladder bounded by the mask only (before the fix): CASA
+    # The same initial CLEAN with the given ladder unchecked (before the fix): CASA
     # refuses the scales with a negative sidelobe peak and leaves no component.
     negative = [r["scale"] for r in rec["psf_check"]["response"] if r["max_abs"] < 0]
     assert negative, rec["psf_check"]

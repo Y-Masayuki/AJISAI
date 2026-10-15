@@ -188,10 +188,10 @@ AJISAI(cfg).run() pipeline order:
     - verify actual vs predicted beam (uvtaper check)
  6. apply phase shift if requested (off by default)
  7. measure sigma_th on the (XX-YY)/2 dirty image (signal-free noise)
- 8. multiscale scales: 0, b, 3b, ... up to the largest that fits the mask;
-    then only those whose scale-PSF peaks at the component's position
+ 8. multiscale scales: [0, 1, 3] x beam unless given; then only those whose
+    scale-PSF peaks at the component's position
  9. make initial CLEAN (iteration 0) to 3 sigma_th; no model is saved;
-    stop with the reason if it leaves an empty model
+    stop with the reason if it leaves an empty model (niter > 0)
 10. self-calibration stages (schedule.mode="data", at most 3):
     - read DATA, MODEL, WEIGHT, FLAG of the current stage once
       (a temporary copy with the model predicted, for stage 1)

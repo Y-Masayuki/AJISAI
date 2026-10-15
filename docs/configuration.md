@@ -270,11 +270,11 @@ the lines you need.
 
 `scales: Optional[Tuple[int, ...]] = None`
 :   Multiscale scales in pixels for every multiscale/mtmfs tclean. `None`:
-    `0, b, 3b, 9b, ...` with `b` the dirty-image beam FWHM in pixels, up to
-    the largest scale whose support (radius = scale) fits inside the user
-    mask region (`mask_mode="user"`), i.e. half the region size for a round
-    region; without a user mask, `0, b, 3b`. Larger scales would be ignored
-    by CASA ("too large to fit within the mask"). Then, given or derived,
+    `[0, 1, 3] x b` with `b` the dirty-image beam FWHM in pixels. Which
+    scales serve a source best depends on its structure; a caller that knows
+    the source gives its own (e.g. `ajisai.core.multiscale_scales`, the ladder
+    `0, b, 3b, 9b, ...` up to the largest scale that fits a mask region; CASA
+    ignores scales too large for the mask). Then, given or derived,
     every scale whose scale-PSF (the dirty PSF convolved twice with CASA's
     component) does not peak at the component's own position is dropped:
     the uv coverage has no baseline short enough to see it, and when its

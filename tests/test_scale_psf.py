@@ -189,13 +189,28 @@ def _scales_pipeline(tmp_path, monkeypatch, psf, imaging):
     return aj, tasks, reads
 
 
-def test_derived_scales_that_the_data_cannot_see_never_reach_tclean(tmp_path, monkeypatch):
-    """The V1094 Sco failure: the mask allows 0, 3, 9, 27, 81 pix; 81 has a negative scale-PSF peak."""
+def test_default_scales_are_0_1_3_beams_whatever_the_mask(tmp_path, monkeypatch):
+    """Without ImagingConfig.scales the v0.2 rule [0, 1, 3] x beam is used (beam 3 pix), not the
+    mask-bounded ladder (which would give 0, 3, 9, 27, 81 here); the scale-PSF check still runs."""
     psf, _ = _psf_from_weights(256, 4, 40, pad=1.2)
     aj, tasks, reads = _scales_pipeline(
         tmp_path, monkeypatch, psf,
         ImagingConfig(mask_mode="user", user_mask="/data/region.crtf"))
     aj._compute_scales()
+    rec = aj.justification["derived"]["scales"]
+    assert rec["candidates"] == [0, 3, 9] and rec["value"] == [0, 3, 9]
+    assert rec["psf_check"]["dropped"] == [] and "[0, 1, 3] x beam" in rec["reason"]
+
+
+def test_given_scales_that_the_data_cannot_see_never_reach_tclean(tmp_path, monkeypatch):
+    """The V1094 Sco failure: scales 0, 3, 9, 27, 81 pix (a ladder up to the mask size); 81 has a
+    negative scale-PSF peak and is dropped with a warning before tclean."""
+    psf, _ = _psf_from_weights(256, 4, 40, pad=1.2)
+    aj, tasks, reads = _scales_pipeline(
+        tmp_path, monkeypatch, psf,
+        ImagingConfig(mask_mode="user", user_mask="/data/region.crtf", scales=(0, 3, 9, 27, 81)))
+    with pytest.warns(UserWarning, match=r"scales \[81\] dropped"):
+        aj._compute_scales()
     rec = aj.justification["derived"]["scales"]
     assert rec["candidates"] == [0, 3, 9, 27, 81]
     assert rec["value"] == [0, 3, 9, 27] and aj._derived["scales"] == [0, 3, 9, 27]
@@ -267,4 +282,18 @@ def test_initial_clean_with_a_model_passes_the_check(tmp_path, monkeypatch):
     aj._make_initial_clean()
     check = aj.justification["checks"][-1]
     assert check["kind"] == "clean_model" and check["ok"] and check["n_model_pixels"] == 1
+    assert aj.metrics[0]["iteration"] == 0
+
+
+def test_initial_dirty_image_with_niter_0_is_not_checked_for_a_model(tmp_path, monkeypatch):
+    """niter = 0 makes a dirty image (ASEBI's bootstrap image through image()): no model is expected,
+    so the empty-model check must not stop it."""
+    aj, tasks, events, vis = _pipeline(tmp_path, monkeypatch, imaging=ImagingConfig(niter=0))
+    aj._tclean = lambda vis, base, **kw: 1
+    monkeypatch.setattr(core, "_read_image_plane", lambda path: np.zeros((8, 8)))
+    aj._export_and_stats = lambda base, nterms, fits: {
+        "peak_jy_beam": 1e-2, "rms_jy_beam": 1e-5, "snr": 1e3, "dynamic_range": 1e3,
+        "bmaj_arcsec": 0.2, "bmin_arcsec": 0.15}
+    aj._make_initial_clean()
+    assert not [c for c in aj.justification["checks"] if c["kind"] == "clean_model"]
     assert aj.metrics[0]["iteration"] == 0

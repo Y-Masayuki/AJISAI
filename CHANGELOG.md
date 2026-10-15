@@ -157,10 +157,14 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 - **Dish diameter from the MS.** The primary beam uses the smallest dish in
   `ANTENNA/DISH_DIAMETER` (the largest primary beam); 12 m is only the
   fallback for an MS without the column (`pick_cell_imsize(diameter_m=None)`).
-- **Multiscale scales from the beam and the mask.** `0, b, 3b, 9b, ...` (b =
-  dirty-image beam in pixels) up to the largest scale whose support fits
-  inside the user mask region, so that CASA no longer ignores scales that are
-  too large for the mask; without a user mask, `0, b, 3b` as before.
+- **Multiscale scales.** The default stays `[0, 1, 3] x b` (b = the measured
+  dirty-image beam in pixels; v0.2 used the configured pixels per beam).
+  `multiscale_scales()` builds the ladder `0, b, 3b, 9b, ...` up to the
+  largest scale whose support fits inside a mask region, for callers that
+  choose it (ASEBI's final image); it is not the default, because which
+  scales serve a source best depends on its structure, the ladder was tested
+  on one source only, and on a single long-baseline EB it reached scales the
+  uv coverage does not see (see Fixed).
 - **Absolute CLEAN threshold in the self-cal loop.** Every self-cal image is
   CLEANed to `threshold_nsigma × sigma_th` (3 sigma_th), the same absolute
   threshold in every iteration, instead of `threshold_factor ×` the RMS of
@@ -201,15 +205,17 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
   multiscale component, as `MatrixCleaner` computes it) has its largest
   magnitude at the component's own position; other scales, derived or given
   in `ImagingConfig.scales`, are dropped (a given one with a warning) and
-  recorded in `derived.scales` (`candidates`, `psf_check`). Before, the
-  ladder was bounded by the mask region only: on the 8.5 km baselines of
+  recorded in `derived.scales` (`candidates`, `psf_check`). With the
+  development default of that time (the ladder bounded by the mask region
+  only, since withdrawn), on the 8.5 km baselines of
   V1094 Sco (2017 TM1, cell 6.2 mas) it reached 628 pix, whose scale-PSF
   peaks at a negative sidelobe, CASA's multiscale minor cycle refused to
   start ("As Peak of PSF is negative"), the initial CLEAN ended with an
   all-zero model, and the run failed only at the model prediction of the
   first stage with a misleading "no CLEAN components above the threshold".
-  The initial CLEAN now stops at once (`RuntimeError`, check `clean_model`)
-  when its model is empty, saying whether the minor cycle did not run (peak
+  The initial CLEAN (with `niter > 0`; a `niter = 0` dirty image expects no
+  model) now stops at once (`RuntimeError`, check `clean_model`) when its
+  model is empty, saying whether the minor cycle did not run (peak
   inside the mask above the threshold) or there is no emission to CLEAN.
   `justification.json` records the CASA log file (`casa_log`).
 - `rms_method="annulus"` could not be used from `AJISAIConfig`: the pipeline

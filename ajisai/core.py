@@ -2474,10 +2474,14 @@ Infrastructure
     def _compute_scales(self) -> None:
         """Multiscale scales (pixels) used by every multiscale/mtmfs tclean.
 
-        ``ImagingConfig.scales`` if given; otherwise 0, b, 3b, 9b, ... with
-        ``b`` the dirty-image beam FWHM in pixels, up to the largest scale
-        that fits inside the user mask region (CRTF rasterised on the image
-        grid); without a user mask, 0, b, 3b.
+        ``ImagingConfig.scales`` if given; otherwise ``[0, 1, 3] x b`` with
+        ``b`` the dirty-image beam FWHM in pixels (the v0.2 rule, from CASA's
+        multiscale example). Which scales serve a source best depends on its
+        structure and there is no unique answer; a caller that knows the
+        source (ASEBI's final image) gives its own scales. The mask-bounded
+        ladder :func:`multiscale_scales` stays available to callers but is not
+        the default: tested on one source only, and on a single long-baseline
+        EB it reached scales the uv coverage does not see.
 
         Then, when the deconvolver uses scales, every scale (given or
         derived) whose scale-PSF, from the dirty image's PSF (the PSF of every
@@ -2498,8 +2502,9 @@ Infrastructure
             dirty = self.justification["derived"].get("dirty_image") or {}
             beam_as = math.sqrt((dirty.get("bmaj_arcsec") or 0.0) * (dirty.get("bmin_arcsec") or 0.0))
             beam_pix = beam_as / self._derived["cell_arcsec"] if beam_as > 0 else 0.0
-            region = self._user_mask_region()
-            scales, reason = multiscale_scales(beam_pix, region)
+            scales = scale_ladder(beam_pix, 3.0 * beam_pix * (1 + 1e-9))
+            reason = (f"[0, 1, 3] x beam (beam = {beam_pix:.2f} pix; the v0.2 rule); larger scales only "
+                      f"when the caller gives them")
         used = int(img.nterms) > 1 or img.deconvolver in ("multiscale", "mtmfs")
         candidates = list(scales)
         psf_check: Optional[Dict[str, Any]] = None
@@ -2609,7 +2614,9 @@ Infrastructure
         nterms = self._tclean(working_vis, base, niter=cfg.imaging.niter,
                               threshold_jy=threshold_jy, mask_kwargs=usemask_kwargs)
         # Self-calibration needs this model: stop here, with the reason, if it is empty.
-        self._check_clean_model(base, nterms, threshold_jy, "initial CLEAN (iteration 0)")
+        # niter = 0 is a dirty image (e.g. ASEBI's bootstrap image): no model is expected.
+        if int(cfg.imaging.niter) > 0:
+            self._check_clean_model(base, nterms, threshold_jy, "initial CLEAN (iteration 0)")
 
         fits_path = interm / "clean_iter0.fits"
         stats = self._export_and_stats(base, nterms, fits_path)
