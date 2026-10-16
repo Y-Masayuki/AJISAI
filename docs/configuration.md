@@ -380,9 +380,11 @@ the lines you need.
     scan boundaries within a solution interval). With `mode="data"` the time
     combination is chosen per stage (`"scan"` for one solution per EB, none
     for the scan and shorter intervals); only `"spw"` is taken from here:
-    `combine="scan,spw"` solves all spws together, and when `spwmap` is
-    empty AJISAI derives it (every spw of an observation mapped to its
-    lowest spw).
+    `combine="scan,spw"` solves all spws together, and AJISAI derives the
+    applycal spwmap from the spw labels gaincal wrote in the table, per
+    observation (all rows, flagged solutions included); when no single map
+    serves every observation, applycal runs per observation (ASEBI SPEC 9
+    item 3, D38 d).
 
 `gaincal_interp: str = "linear,linear"`
 :   Interpolation in time and frequency for the gain table.
@@ -413,8 +415,10 @@ the lines you need.
     amplitude step cannot rescale the weights by |g|².
 
 `spwmap: Tuple[int, ...] = ()`
-:   spwmap passed to applycal for every gain table, e.g. `(0, 0, 0, 0)` when
-    the schedule's `combine` includes `"spw"`. `()`: identity.
+:   spwmap passed to applycal for every gain table with `mode="fixed"`, e.g.
+    `(0, 0, 0, 0)` when `combine` includes `"spw"`. `()`: identity. With
+    `mode="data"` the map comes from the table's spw labels; a configured map
+    that disagrees with them is warned about and not used.
 
 ## `SelfcalSchedule`
 

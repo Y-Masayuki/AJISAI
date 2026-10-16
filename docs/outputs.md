@@ -226,8 +226,11 @@ decision AJISAI made. Top-level keys:
     gaincal minsnr, the acceptance rule, the stage-1 rule, the stage limit,
     the CASA loss table), `combine_spw`, `stages` (decision and reason of
     each stage), `accepted_stages`, `best_stage`, `stop_reason`,
-    `g2_split` (`"time"`: even/odd integrations; `"band"`: band halves) and
-    the `spwmap` used for combined-spw tables.
+    `g2_split` (`"time"`: even/odd integrations; `"band"`: band halves),
+    `time_geometry` (how the integrations were found: INTERVAL slots per
+    observation, the integration time and its source), the `spwmap` used for
+    combined-spw tables (`None` when it was applied per observation) and
+    `spwmap_record` (the spw labels in the table, the maps, relabelled rows).
 
 `stages`
 :   One record per stage (0 = no self-cal): `data_ms` (the MS imaged),
