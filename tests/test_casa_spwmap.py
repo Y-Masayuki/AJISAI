@@ -218,14 +218,18 @@ def test_several_labels_in_one_observation_are_relabelled(tmp_path):
     assert err_plain[early].max() > 0.5
 
 
-def test_data_mode_corrects_every_observation_of_merged_setups(tmp_path):
+def test_data_mode_corrects_every_observation_of_merged_setups(tmp_path, monkeypatch):
     """End to end (selfcal_measurement, combine='scan,spw'): two EBs of one setup with static
     antenna phase errors, concatenated (spws merged, labels 0 and 1). Stage 1 (one solution per
-    EB) must correct both observations: applycal runs per observation with the table's maps."""
+    EB) must correct both observations: applycal runs per observation with the table's maps.
+    Only stage 1 is run (MAX_PHASE_STAGES = 1) with a short CLEAN: on a loaded velox each major
+    cycle of this tiny image took ~1.6 min and three stages took 1 h 46 min."""
     import casatasks
     import casatools
     from ajisai import GainCalConfig, ImagingConfig, selfcal_measurement
+    from ajisai import solint as so
     from tests.casa_sim import simulate_ms
+    monkeypatch.setattr(so, "MAX_PHASE_STAGES", 1)
     kw = dict(KW, source=((0.06, 0.0, 0.0, 0.3, 0.3, 0.0),), noise="5mJy", scans=3, scan_s=90.0)
     ebs = []
     for k in range(2):
@@ -252,7 +256,7 @@ def test_data_mode_corrects_every_observation_of_merged_setups(tmp_path):
     crtf.write_text("#CRTFv0\ncircle[[16h00m00.0s, -30d00m00.0s], 3arcsec]\n")
     aj = selfcal_measurement(cat, results_dir=str(tmp_path / "out"),
                              gaincal=GainCalConfig(combine="scan,spw"),
-                             imaging=ImagingConfig(mask_mode="user", user_mask=str(crtf), niter=500,
+                             imaging=ImagingConfig(mask_mode="user", user_mask=str(crtf), niter=100,
                                                    final_depth=()))
     st1 = aj._stage(1)
     assert st1["status"] in ("ok", "anomaly")
