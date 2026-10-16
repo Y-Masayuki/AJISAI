@@ -302,8 +302,93 @@ def test_aperture_flux_terms_recovers_residual_flux():
     # Gaussian PSF = Gaussian CLEAN beam: no restored-flux bias.
     assert t["omega_clean_pix"] == pytest.approx(t["omega_r_pix"], rel=1e-3)
     assert abs(t["restored_bias_jy"]) < 1e-6
-    # sigma_F = sigma sqrt(N_pix / Omega_R)
-    assert t["sigma_f_jy"] == pytest.approx(1e-5 * math.sqrt(t["aperture_npix"] / t["omega_r_pix"]))
+    # sigma_F = sigma sqrt(N_pix Omega_beam) / Omega_R (ASEBI SPEC 10.4 item 9, D18 I3)
+    assert t["sigma_f_jy"] == pytest.approx(
+        1e-5 * math.sqrt(t["aperture_npix"] * t["omega_clean_pix"]) / t["omega_r_pix"], rel=1e-12)
+    assert t["sigma_source"] == "given" and t["residual_rms_jy"] == 1e-5
+
+
+# asebi.imaging (ASEBI 5cb9727) on _c8_fixed_input(), as casa_native.flux_terms calls it
+# (sigma = robust_rms(residual, exclude=mask), Omega_beam = beam_area_pix(bmaj, bmin, cell)):
+# local_runs/audit/ajisai_d38/c8_asebi_reference.py
+ASEBI_C8 = {
+    "F_model": 0.0042, "F_unc": 0.001737077431453104, "F_corr": 0.005937077431453104,
+    "omega_R_pix": 31.064537854891785, "n_pix": 444.0, "sigma_F": 9.215307298576333e-05,
+    "restored_bias": -0.0005825727410036254, "sigma": 1.9871884184057896e-05,
+    "omega_beam": 46.73996396259294,
+}
+
+
+def _c8_fixed_input():
+    """A fixed input for the flux bookkeeping: elliptical PSF (peak 1) with a negative sidelobe
+    ring, a residual source plus noise, two CLEAN components and an irregular, off-centre mask
+    (an ellipse and a small disk)."""
+    n, cell, bmaj, bmin = 128, 0.02, 0.15, 0.11
+    yy, xx = np.mgrid[:n, :n].astype(float)
+    sx = bmin / cell / (2 * math.sqrt(2 * math.log(2)))
+    sy = bmaj / cell / (2 * math.sqrt(2 * math.log(2)))
+    r = np.hypot(xx - 64, yy - 64)
+    psf = np.exp(-0.5 * (((xx - 64) / sx) ** 2 + ((yy - 64) / sy) ** 2))
+    psf -= 0.08 * np.exp(-0.5 * ((r - 12.0) / 2.5) ** 2)
+    psf[64, 64] = 1.0
+    rng = np.random.default_rng(42)
+    residual = (4e-4 * np.exp(-0.5 * (((xx - 70) / 6.0) ** 2 + ((yy - 52) / 4.0) ** 2))
+                + 2e-5 * rng.standard_normal((n, n)))
+    model = np.zeros((n, n))
+    model[50, 72] = 3e-3
+    model[55, 66] = 1.2e-3
+    u, v = xx - 69.8, yy - 51.3
+    ang = math.radians(30.0)
+    a = (u * math.cos(ang) + v * math.sin(ang)) / 14.0
+    b = (-u * math.sin(ang) + v * math.cos(ang)) / 9.0
+    mask = (a ** 2 + b ** 2 <= 1.0) | (np.hypot(xx - 80, yy - 40) <= 4.0)
+    return model, residual, psf, mask, cell, bmaj, bmin
+
+
+def test_aperture_flux_terms_gives_asebis_numbers():
+    """ASEBI SPEC 10.4 item 9 (D18 I3), one implementation with ASEBI's casa engine: on a fixed
+    input AJISAI gives the numbers of asebi.imaging.aperture_flux_terms + robust_rms +
+    beam_area_pix (ASEBI 5cb9727; local_runs/audit/ajisai_d38/c8_asebi_reference.py)."""
+    model, residual, psf, mask, cell, bmaj, bmin = _c8_fixed_input()
+    t = aperture_flux_terms(model, residual, psf, mask, cell, bmaj, bmin)
+    asebi = {"f_model_jy": ASEBI_C8["F_model"], "f_unc_jy": ASEBI_C8["F_unc"],
+             "f_corr_jy": ASEBI_C8["F_corr"], "omega_r_pix": ASEBI_C8["omega_R_pix"],
+             "aperture_npix": ASEBI_C8["n_pix"], "sigma_f_jy": ASEBI_C8["sigma_F"],
+             "restored_bias_jy": ASEBI_C8["restored_bias"], "residual_rms_jy": ASEBI_C8["sigma"],
+             "omega_clean_pix": ASEBI_C8["omega_beam"]}
+    for k, v in asebi.items():
+        assert t[k] == pytest.approx(v, rel=1e-12), k
+    # the transposed arrays (CASA images read as [x, y]) give the same numbers
+    tt = aperture_flux_terms(model.T, residual.T, psf.T, mask.T, cell, bmaj, bmin)
+    for k in asebi:
+        assert tt[k] == pytest.approx(t[k], rel=1e-12), k
+    # the previous rule: Omega_R over a circle of the mask's area about the PSF peak, and
+    # sigma sqrt(N_pix / Omega_R) (sigma_th = the residual rms here, to isolate the formula)
+    old_omega = psf_volume_within(psf, math.sqrt(t["aperture_npix"] / math.pi))
+    old = t["residual_rms_jy"] * math.sqrt(t["aperture_npix"] / old_omega)
+    assert old / t["sigma_f_jy"] == pytest.approx(0.80, abs=0.01)     # x1.6 on V1094 Sco
+
+
+def test_sigma_f_on_the_v1094_numbers():
+    """The SPEC's V1094 Sco numbers: residual rms 40.89 uJy, 1 690 757 pixels, beam 175.6 px,
+    Omega_R 458.6 px: 1.536 mJy (ASEBI), where AJISAI's previous formula gave 2.483 mJy."""
+    from ajisai.core import aperture_sigma_f
+    sf = aperture_sigma_f(4.089310917109791e-05, 1690757, 175.60688102090526, 458.63056445753966)
+    assert sf == pytest.approx(0.0015363794858863106, rel=1e-12)
+    old = 4.089310917109791e-05 * math.sqrt(1690757 / 458.63056445753966)
+    assert old == pytest.approx(2.483e-3, rel=1e-3)
+
+
+def test_residual_rms_clips_and_excludes_the_aperture():
+    from ajisai.core import residual_rms
+    rng = np.random.default_rng(1)
+    img = 1e-5 * rng.standard_normal((200, 200))
+    img[90:110, 90:110] += 1e-2                       # bright source, excluded by the aperture
+    ap = np.zeros(img.shape, bool)
+    ap[80:120, 80:120] = True
+    assert residual_rms(img, exclude=ap) == pytest.approx(1e-5, rel=0.03)
+    img[5, 5] = 1.0                                   # an outlier outside it is clipped
+    assert residual_rms(img, exclude=ap) == pytest.approx(1e-5, rel=0.03)
 
 
 def test_aperture_flux_terms_empty_aperture_raises():

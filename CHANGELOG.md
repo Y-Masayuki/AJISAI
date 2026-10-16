@@ -230,6 +230,19 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **Final-image flux bookkeeping as ASEBI SPEC 10.4 item 9 (D18 I3)**
+  (convention audit 2026-10-16, combine item 8). `aperture_flux_terms` took
+  Omega_R as the PSF volume within a circle of the aperture's area, sigma as
+  sigma_th, and `sigma_F = sigma sqrt(N_pix/Omega_R)`; on the SPEC's V1094 Sco
+  numbers that is 2.48 mJy where ASEBI's casa engine gives 1.54 mJy. Now, as
+  in ASEBI: Omega_R is the dirty beam summed over the aperture's own shape
+  (the CLEAN mask) carried so that its centroid falls on the PSF peak, sigma
+  is the residual rms outside the aperture (`residual_rms`: iterative 3-sigma
+  clipping about the median), and `sigma_F = sigma sqrt(N_pix Omega_beam) /
+  Omega_R` (`aperture_sigma_f`, `beam_area_pix`). On a fixed input AJISAI
+  gives ASEBI's numbers to the last digit (`tests/test_imaging_rules.py`).
+  The step records gain `residual_rms_jy`, `aperture_centre_pix`,
+  `aperture_shift_pix`, `sigma_source`; `aperture_radius_equiv_pix` is gone.
 - **The spwmap of a combined-spw table comes from the labels gaincal wrote**
   (ASEBI SPEC 9 item 3, D38 d; convention audit 2026-10-16, combine item 3
   and time item 3). `mode="data"` with `combine` containing `"spw"` mapped

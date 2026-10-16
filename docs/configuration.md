@@ -219,7 +219,9 @@ the lines you need.
     is made once, from the best iteration's data (`final_selfcal.ms`), and
     its CLEAN continues step by step (no new PSF) until the flux in the
     aperture has converged: after each step, `F_corr = F_model + F_unc` with
-    `F_unc = sum(residual)/Omega_R`; the CLEAN stops when
+    `F_unc = sum(residual)/Omega_R` (Omega_R: the dirty beam over the
+    aperture's shape) and `sigma_F = sigma sqrt(N_pix Omega_beam)/Omega_R`
+    (sigma: the residual rms outside the aperture); the CLEAN stops when
     `|F_unc| <= max(3 sigma_F, 0.01 F_corr)` or when `F_corr` changed by no
     more than that width since the previous step. A warning is issued if
     the last step is reached without convergence, and if the restored image

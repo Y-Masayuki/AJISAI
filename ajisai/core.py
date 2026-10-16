@@ -1128,8 +1128,9 @@ def empty_model_problem(models, residual, mask, threshold_jy: float,
 def psf_volume_within(psf, radius_pix: float) -> float:
     """Sum of the PSF (peak normalised to 1) within ``radius_pix`` of its peak.
 
-    This is Omega_R, the dirty-beam volume in pixels that converts a sum of
-    residual pixels (Jy/beam) inside an aperture of that size into Jy.
+    The dirty-beam volume in pixels of a circular aperture centred on the
+    source; :func:`aperture_flux_terms` sums the PSF over the aperture's own
+    shape instead (ASEBI SPEC 10.4 item 9, D18 I3).
     """
     p = np.asarray(psf, dtype=float)
     p = np.where(np.isfinite(p), p, 0.0)
@@ -1142,6 +1143,49 @@ def psf_volume_within(psf, radius_pix: float) -> float:
     return float(p[r2 <= radius_pix ** 2].sum() / peak)
 
 
+def residual_rms(residual, exclude=None, nsigma: float = 3.0, maxiter: int = 10) -> float:
+    """rms of a residual image: iterative ``nsigma``-clipped standard deviation about the median.
+
+    The finite pixels not in ``exclude`` (the aperture) are used; with fewer
+    than 10 of them, the standard deviation of the whole image. The sigma of
+    the aperture flux bookkeeping (ASEBI SPEC 10.4 item 9, D18 I3); the same
+    rule as ASEBI's casa engine, so that both engines give the same sigma_F.
+    """
+    x = np.asarray(residual, dtype=float)
+    m = np.isfinite(x)
+    if exclude is not None:
+        m &= ~np.asarray(exclude, dtype=bool)
+    if int(m.sum()) < 10:
+        return float(np.nanstd(x))
+    x = x[m]
+    for _ in range(int(maxiter)):
+        med = np.median(x)
+        sd = x.std()
+        keep = np.abs(x - med) <= nsigma * sd
+        if keep.all():
+            break
+        x = x[keep]
+    return float(x.std())
+
+
+def beam_area_pix(bmaj: float, bmin: float, cell: float) -> float:
+    """Volume of a Gaussian beam in pixels, ``pi bmaj bmin / (4 ln 2) / cell^2`` (any one unit)."""
+    return math.pi * float(bmaj) * float(bmin) / (4.0 * math.log(2.0)) / float(cell) ** 2
+
+
+def aperture_sigma_f(sigma: float, n_pix: float, beam_pix: float, omega_r_pix: float) -> float:
+    """``sigma_F = sigma sqrt(N_pix Omega_beam) / Omega_R``: the noise of ``F_unc``.
+
+    ASEBI SPEC 10.4 item 9 and 13 (D18 I3): a sum of ``N_pix`` residual
+    pixels with noise ``sigma`` (Jy/beam) correlated over one beam
+    (``Omega_beam`` pixels) has rms ``sigma sqrt(N_pix Omega_beam)``, and
+    ``F_unc`` divides that sum by ``Omega_R``. V1094 Sco (the SPEC's
+    numbers): 40.89 uJy, 1 690 757 pixels, 175.6, 458.6 -> 1.54 mJy (the
+    previous ``sigma sqrt(N_pix / Omega_R)`` gave 2.48 mJy).
+    """
+    return float(sigma) * math.sqrt(float(n_pix) * float(beam_pix)) / float(omega_r_pix)
+
+
 def aperture_flux_terms(
     model,
     residual,
@@ -1150,19 +1194,32 @@ def aperture_flux_terms(
     cell_arcsec: float,
     bmaj_arcsec: float,
     bmin_arcsec: float,
-    sigma_jy: float,
+    sigma_jy: Optional[float] = None,
+    centre=None,
 ) -> Dict[str, Any]:
-    """Flux bookkeeping of a CLEAN image inside an aperture.
+    """Flux bookkeeping of a CLEAN image inside an aperture (ASEBI SPEC 10.4 item 9, D18 I3).
 
-    - ``F_model`` = sum of the model (Jy/pixel) inside the aperture.
-    - ``Omega_R`` = PSF volume within the radius of a circle of the same
-      area as the aperture (pixels); ``F_unc = sum(residual)/Omega_R`` is the
-      flux not yet CLEANed; ``F_corr = F_model + F_unc``.
-    - ``sigma_F = sigma sqrt(N_pix / Omega_R)``: noise of ``F_unc`` for
-      residual noise sigma (Jy/beam) correlated over the dirty beam.
-    - ``Omega_clean`` = restoring-beam area (pixels); the restored image
-      counts the residual with the CLEAN beam, so its aperture flux is biased
-      by ``F_unc (Omega_R/Omega_clean - 1)`` (``restored_bias_jy``).
+    - The aperture is the CLEAN mask (a boolean image; AJISAI uses a circle
+      when there is no mask). ``F_model`` = model sum (Jy/pixel) in it.
+    - ``Omega_R`` = the dirty beam (peak 1) summed over the same aperture
+      carried so that its ``centre`` (default: the aperture's centroid; the
+      pixel indices of each axis) falls on the PSF peak, each axis shifted by
+      the rounded difference; ``F_unc = sum(residual)/Omega_R`` in the
+      aperture is the flux not yet CLEANed, ``F_corr = F_model + F_unc``.
+    - ``sigma`` = the residual rms outside the aperture
+      (:func:`residual_rms`), unless ``sigma_jy`` is given;
+      ``sigma_F = sigma sqrt(N_pix Omega_beam)/Omega_R``
+      (:func:`aperture_sigma_f`) with ``Omega_beam`` the restoring-beam
+      volume (pixels).
+    - The restored image counts the residual with the CLEAN beam, so its
+      aperture flux is biased by ``F_unc (Omega_R/Omega_clean - 1)``
+      (``restored_bias_jy``, ``Omega_clean = Omega_beam``).
+
+    One implementation with ASEBI's casa engine (asebi.imaging
+    aperture_flux_terms / casa_native.flux_terms at ASEBI 5cb9727): on the
+    same arrays both give the same numbers; the axis order of the arrays does
+    not matter. Before D38, AJISAI took Omega_R over a circle of the
+    aperture's area, sigma = sigma_th and ``sigma sqrt(N_pix/Omega_R)``.
     """
     ap = np.asarray(aperture, dtype=bool)
     n_pix = int(ap.sum())
@@ -1170,24 +1227,39 @@ def aperture_flux_terms(
         raise ValueError("empty aperture")
     model = np.asarray(model, dtype=float)
     residual = np.asarray(residual, dtype=float)
-    radius = math.sqrt(n_pix / math.pi)
-    omega_r = psf_volume_within(psf, radius)
+    p = np.asarray(psf, dtype=float)
+    if ap.shape != residual.shape or p.shape != residual.shape:
+        raise ValueError(f"aperture {ap.shape}, psf {p.shape} and residual {residual.shape} differ")
+    peak = np.unravel_index(int(np.nanargmax(p)), p.shape)
+    idx = np.nonzero(ap)
+    if centre is None:
+        centre = tuple(float(i.mean()) for i in idx)
+    shift = [int(round(float(pk) - float(c))) for pk, c in zip(peak, centre)]
+    moved = [i + d for i, d in zip(idx, shift)]
+    inside = np.ones(n_pix, dtype=bool)
+    for i, size in zip(moved, p.shape):
+        inside &= (i >= 0) & (i < size)
+    omega_r = float(np.nansum(p[tuple(i[inside] for i in moved)]) / p[peak])
     if not omega_r > 0:
-        raise ValueError(f"PSF volume within the aperture is not positive ({omega_r})")
+        raise ValueError(f"PSF volume over the aperture is not positive ({omega_r})")
     f_model = float(np.nansum(model[ap]))
     f_unc = float(np.nansum(residual[ap])) / omega_r
-    sigma_f = float(sigma_jy) * math.sqrt(n_pix / omega_r)
-    omega_clean = math.pi * bmaj_arcsec * bmin_arcsec / (4.0 * math.log(2.0)) / cell_arcsec ** 2
+    sigma = residual_rms(residual, exclude=ap) if sigma_jy is None else float(sigma_jy)
+    omega_beam = beam_area_pix(bmaj_arcsec, bmin_arcsec, cell_arcsec)
+    sigma_f = aperture_sigma_f(sigma, n_pix, omega_beam, omega_r)
     return {
         "aperture_npix": n_pix,
-        "aperture_radius_equiv_pix": radius,
+        "aperture_centre_pix": [float(c) for c in centre],
+        "aperture_shift_pix": shift,
         "omega_r_pix": omega_r,
-        "omega_clean_pix": omega_clean,
+        "omega_clean_pix": omega_beam,
+        "residual_rms_jy": sigma,
+        "sigma_source": "residual rms outside the aperture" if sigma_jy is None else "given",
         "f_model_jy": f_model,
         "f_unc_jy": f_unc,
         "f_corr_jy": f_model + f_unc,
         "sigma_f_jy": sigma_f,
-        "restored_bias_jy": f_unc * (omega_r / omega_clean - 1.0),
+        "restored_bias_jy": f_unc * (omega_r / omega_beam - 1.0),
     }
 
 
@@ -4324,7 +4396,10 @@ Infrastructure
             "stats": stats,
             "warnings": warnings_list,
             "rule": ("stop when |F_unc| <= max(3 sigma_F, 0.01 F_corr) or |Delta F_corr| <= "
-                     "the same width; F_corr = F_model + sum(residual)/Omega_R in the aperture"),
+                     "the same width; F_corr = F_model + sum(residual)/Omega_R in the aperture "
+                     "(Omega_R: the PSF over the aperture's shape centred on the PSF peak); "
+                     "sigma_F = sigma sqrt(N_pix Omega_beam)/Omega_R with sigma the residual rms "
+                     "outside the aperture (ASEBI SPEC 10.4 item 9, D18 I3)"),
         }
 
     def _final_flux_terms(self, imagebase, nterms: int) -> Dict[str, Any]:
@@ -4334,9 +4409,9 @@ Infrastructure
         psf = _read_image_plane(_image_name(imagebase, nterms, "psf"))
         geom = _image_beam_cell(_image_name(imagebase, nterms, "image"))
         aperture = self._final_aperture(imagebase, nterms, residual.shape, geom)
+        # sigma = the residual rms outside the aperture (ASEBI SPEC 10.4 item 9, D18 I3)
         return aperture_flux_terms(model, residual, psf, aperture, geom["cell_arcsec"],
-                                   geom["bmaj_arcsec"], geom["bmin_arcsec"],
-                                   float(self._derived["sigma_th"]))
+                                   geom["bmaj_arcsec"], geom["bmin_arcsec"])
 
     def _final_aperture(self, imagebase, nterms: int, shape, geom: Dict[str, Any]) -> np.ndarray:
         """Aperture for the final-image flux: explicit radius, CLEAN mask, or 5 beams."""

@@ -302,14 +302,19 @@ decision AJISAI made. Top-level keys:
 :   The final image: `vis`, `image`, `products`, `sigma_th_jy`, the
     `depth_schedule` and one entry per CLEAN depth step in `steps`
     (`nsigma`, `threshold_jy`, `f_model_jy`, `f_unc_jy`, `f_corr_jy`,
-    `sigma_f_jy`, `width_jy`, `omega_r_pix`, `omega_clean_pix`,
+    `sigma_f_jy`, `residual_rms_jy`, `width_jy`, `omega_r_pix`,
+    `omega_clean_pix`, `aperture_npix`, `aperture_shift_pix`,
     `restored_bias_jy`, `stop`, `reason`), `converged`, `stop_nsigma`, the
     `aperture` used, and `warnings`. Here `F_model` is the CLEAN model flux
-    in the aperture, `F_unc = sum(residual)/Omega_R` the flux left in the
-    residual (Omega_R = dirty-beam volume in pixels), `F_corr = F_model +
-    F_unc`, `sigma_F` the noise of `F_unc`, and `restored_bias_jy =
-    F_unc (Omega_R/Omega_clean - 1)` the amount by which the restored image
-    over-counts the residual flux. The CLEAN stops when `|F_unc| <=
+    in the aperture (the CLEAN mask), `F_unc = sum(residual)/Omega_R` the
+    flux left in the residual (Omega_R = the dirty beam summed over the
+    aperture's shape centred on the PSF peak, in pixels), `F_corr = F_model +
+    F_unc`, `sigma_F = sigma sqrt(N_pix Omega_beam)/Omega_R` the noise of
+    `F_unc` (sigma = the residual rms outside the aperture, Omega_beam = the
+    restoring-beam volume; ASEBI SPEC 10.4 item 9, the same implementation as
+    ASEBI's casa engine), and `restored_bias_jy = F_unc (Omega_R/Omega_clean -
+    1)` the amount by which the restored image over-counts the residual
+    flux. The CLEAN stops when `|F_unc| <=
     max(3 sigma_F, 0.01 F_corr)` or when `F_corr` changed by no more than
     that since the previous step; quote `F_corr` as the flux.
 
