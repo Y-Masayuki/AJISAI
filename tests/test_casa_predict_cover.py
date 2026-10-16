@@ -102,7 +102,9 @@ def test_ft_reaches_every_channel_with_the_widened_model(sim):
                 shutil.rmtree(m, ignore_errors=True)
     assert _model_zero_channels(fixed) == []
     assert _image_spectral_axis(base + ".model") == (ref, inc)          # original untouched
-    assert rec["data_lo_hz"] == pytest.approx(lo) and rec["data_hi_hz"] == pytest.approx(hi)
+    # Hz (~2e11): pytest.approx's default rel=1e-6 would allow 0.2 MHz; 1 Hz absolute only
+    assert rec["data_lo_hz"] == pytest.approx(lo, rel=0, abs=1.0)
+    assert rec["data_hi_hz"] == pytest.approx(hi, rel=0, abs=1.0)
     import casatools
     tb = casatools.table()
     tb.open(plain)

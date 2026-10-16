@@ -117,10 +117,16 @@ def test_predicted_solution_intervals_match_the_gaincal_tables(run):
             ant = tb.getcol("ANTENNA1")
         finally:
             tb.close()
+        # MJD seconds (~5e9): the default rtol would allow ~500 s, so absolute tolerances only.
+        # Chunks inside a scan agree to 1e-4 s (CASA 6.5.1). A solution over several scans
+        # ("scan" across a gap, "EB") is also weighted by the coherent amplitude of each scan's
+        # phase-only solve, which the model leaves out: 0.047 s here, far below the half
+        # integration (3 s) that a wrong chunk would show.
+        atol = 1e-3 if solve.cand["kind"] == "int" else 0.1 * geom.it_ref
         for sp in np.unique(spw):
             got = np.unique(t[(spw == sp) & (ant == 1)])
             want = np.sort(units.time[units.group == sp])
-            np.testing.assert_allclose(got, want, atol=1e-3)
+            np.testing.assert_allclose(got, want, rtol=0, atol=atol)
 
 
 def test_phase_tracking_between_stage_mss(run):
