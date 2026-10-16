@@ -350,11 +350,13 @@ class AJISAIConfig:
     # === Data hygiene ===
     # AJISAI never writes to the input MS (``vis``): every MODEL/CORRECTED
     # column and every relabelling lives in copies under results_dir. When
-    # this is True and the input carries J2000 frame codes, a copy
-    # (intermediate/input_icrs.ms) is relabelled J2000 -> ICRS (frame code
-    # only; coordinates are not converted) and used as the working MS. That
-    # is right for ALMA data observed before Cycle 3 (ICRS numbers labelled
-    # J2000); for other data a warning is recorded (relabel_caveat).
+    # this is True and the input carries J2000 frame codes on ALMA data
+    # observed before Cycle 3 (ICRS numbers labelled J2000, ALMA
+    # knowledgebase), a copy (intermediate/input_icrs.ms) is relabelled
+    # J2000 -> ICRS (frame code only; coordinates are not converted) and used
+    # as the working MS. Any other J2000 label is genuine J2000: it is kept
+    # and the reason is warned about and recorded (relabel_caveat). Same rule
+    # as ASEBI SPEC 4.1 item 10 (D37, decided by the author 2026-10-16).
     relabel_j2000_to_icrs: bool = True
     # Who drives this run: "user" (standalone) or "asebi" (the ASEBI pipeline).
     # With "asebi", interactive masking is refused (viewer-free operation).
@@ -1246,13 +1248,13 @@ ALMA_CYCLE3_START_MJD_S = float(
 
 
 def _relabel_caveat(telescope_names, start_mjd_s: Optional[float]) -> Optional[str]:
-    """Why a label-only J2000 -> ICRS relabel may be wrong for these data (None when it is right).
+    """Why a J2000 label must NOT be relabelled for these data (None when the relabel is right).
 
     The relabel changes the frame label and keeps the numbers. That is the
     correction for ALMA data observed before Cycle 3 (ICRS numbers labelled
     J2000); for any other data with a J2000 label the numbers are genuine
-    J2000 and the relabel moves every direction by the frame bias (up to
-    about 23 mas).
+    J2000 and the relabel would move every direction by the frame bias (up
+    to about 23 mas), so those labels are kept (ASEBI SPEC 4.1 item 10, D37).
     """
     names = sorted({str(n).strip().upper() for n in telescope_names})
     reasons = []
@@ -1264,10 +1266,10 @@ def _relabel_caveat(telescope_names, start_mjd_s: Optional[float]) -> Optional[s
         reasons.append("the observation starts on or after 2015-10-01 (ALMA Cycle 3)")
     if not reasons:
         return None
-    return ("the label-only J2000 -> ICRS relabel is only right for ALMA data observed "
-            "before Cycle 3 (ICRS numbers labelled J2000); here " + " and ".join(reasons)
-            + ", so J2000 numbers may be genuine and the relabel moves them by the frame "
-              "bias (up to about 23 mas)")
+    return ("the J2000 label is kept as genuine J2000: the label-only J2000 -> ICRS relabel is "
+            "only right for ALMA data observed before Cycle 3 (ICRS numbers labelled J2000); here "
+            + " and ".join(reasons) + " (relabelling genuine J2000 numbers would move them by the "
+              "frame bias, up to about 23 mas)")
 
 
 # ============================================================================
@@ -2128,17 +2130,20 @@ Infrastructure
         elif not _ms_needs_relabel(cfg.vis):
             reason = "no J2000 frame code in the input; it is used as it is (read-only)"
         else:
-            copy = self.workdir / "intermediate" / "input_icrs.ms"
-            _safe_rmtree_path(copy)
-            _copy_ms(cfg.vis, copy)
-            relabel_record = relabel_J2000_to_ICRS(str(copy), verbose=cfg.verbose)
-            working = str(copy)
-            reason = ("the input carries J2000 frame codes; a copy was relabelled "
-                      "J2000 -> ICRS (frame code only, coordinates unchanged) so that the "
-                      "input MS is never written")
             names, start = _observation_telescopes_and_start(cfg.vis)
             caveat = _relabel_caveat(names, start)
-            if caveat is not None:
+            if caveat is None:
+                copy = self.workdir / "intermediate" / "input_icrs.ms"
+                _safe_rmtree_path(copy)
+                _copy_ms(cfg.vis, copy)
+                relabel_record = relabel_J2000_to_ICRS(str(copy), verbose=cfg.verbose)
+                working = str(copy)
+                reason = ("ALMA data observed before Cycle 3 carry J2000 frame codes on ICRS "
+                          "numbers; a copy was relabelled J2000 -> ICRS (frame code only, "
+                          "coordinates unchanged) so that the input MS is never written")
+            else:
+                reason = ("J2000 frame codes kept (genuine J2000); the input MS is used as it is "
+                          "(read-only)")
                 warnings.warn(f"[AJISAI] {caveat}")
                 if cfg.verbose:
                     print(f"[AJISAI]   WARN: {caveat}")
@@ -2152,6 +2157,7 @@ Infrastructure
         }
         if relabel_record is not None:
             self.justification["derived"]["working_vis"]["relabel"] = relabel_record
+        if caveat is not None:
             self.justification["derived"]["working_vis"]["relabel_caveat"] = caveat
         if cfg.verbose:
             print(f"[AJISAI] working MS            : {working}")

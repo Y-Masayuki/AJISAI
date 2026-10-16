@@ -276,12 +276,17 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
   SOURCE.DIRECTION (previously skipped); a column that cannot be relabelled
   is warned about and recorded instead of being skipped silently;
   `relabel_J2000_to_ICRS` returns a record of what it changed
-  (`derived.working_vis.relabel`). When and by default how the input is
-  relabelled is unchanged; when the relabel is applied to data that are not
-  ALMA or were observed on or after 2015-10-01 (Cycle 3), a warning is
-  recorded (`derived.working_vis.relabel_caveat`): the label-only relabel is
-  right only for ALMA data before Cycle 3 (ICRS numbers labelled J2000) and
-  moves genuine J2000 numbers by the frame bias (up to about 23 mas).
+  (`derived.working_vis.relabel`).
+- **The input relabel is applied only where it is right.** With
+  `relabel_j2000_to_icrs=True` (the default), a J2000-labelled input is
+  relabelled (on a copy, label only) only when it is ALMA data observed
+  before Cycle 3 (2015-10-01), whose J2000 label sits on ICRS numbers (ALMA
+  knowledgebase). Any other J2000 label (not ALMA, observed on or after
+  2015-10-01, or with an unknown start) is genuine J2000 and is kept; the
+  reason is warned about and recorded (`derived.working_vis.relabel_caveat`).
+  Before, every J2000 label was relabelled, which moves genuine J2000 numbers
+  by the frame bias (up to about 23 mas). Same rule as ASEBI (SPEC 4.1 item
+  10, D37, decided by the author 2026-10-16).
 - Tests: the simulated MS (`tests/casa_sim.py`) has the FIELD layout of a
   real ALMA MS by default (PhaseDir_Ref, DelayDir_Ref, RefDir_Ref and the
   variable-reference MEASINFO keywords; `alma_field_layout`), and can store

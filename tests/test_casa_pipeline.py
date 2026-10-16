@@ -82,24 +82,57 @@ def test_input_ms_is_not_modified(run):
     assert _digest(run["ms"]) == run["before"]
 
 
-def test_relabelling_works_on_a_copy(run, tmp_path):
-    """J2000 codes in the input: the relabelled copy is used, the input is untouched."""
+def test_relabelling_works_on_a_copy(tmp_path):
+    """ALMA data observed before Cycle 3 with J2000 codes (ICRS numbers, ALMA knowledgebase): the relabelled copy
+    is used, label only, and the input is untouched (ASEBI SPEC 4.1 item 10, D37)."""
     import casatools
     from ajisai import AJISAI, AJISAIConfig
+    from tests.casa_sim import simulate_ms
 
-    ms = run["ms"]
-    aj = AJISAI(AJISAIConfig(vis=ms, results_dir=str(tmp_path), verbose=False))
-    aj.workdir = tmp_path
-    (tmp_path / "intermediate").mkdir()
+    ms = simulate_ms(str(tmp_path / "c2.ms"), freq_ghz=(230.0,), nchan=(2,), chan_mhz=(500.0,),
+                     date="2015/06/01/00:00:00")
+    before = _digest(ms)
+    work = tmp_path / "work"
+    aj = AJISAI(AJISAIConfig(vis=ms, results_dir=str(work), verbose=False))
+    aj.workdir = work
+    (work / "intermediate").mkdir(parents=True)
     aj._prepare_working_vis()
     copy = aj._derived["working_vis"]
-    assert copy == str(tmp_path / "intermediate" / "input_icrs.ms")
+    assert copy == str(work / "intermediate" / "input_icrs.ms")
+    assert "relabel_caveat" not in aj.justification["derived"]["working_vis"]
     tb = casatools.table()
     tb.open(copy + "/SOURCE")
     try:
         assert tb.getcolkeywords("DIRECTION")["MEASINFO"]["Ref"] == "ICRS"
     finally:
         tb.close()
+    tb.open(ms + "/FIELD")
+    a = tb.getcol("PHASE_DIR")
+    tb.close()
+    tb.open(copy + "/FIELD")
+    b = tb.getcol("PHASE_DIR")
+    tb.close()
+    assert (a == b).all()                                              # numbers unchanged
+    assert _digest(ms) == before
+
+
+def test_genuine_j2000_label_is_kept(run, tmp_path):
+    """J2000 codes on data observed from Cycle 3 on (the 2017 simulation): genuine J2000, kept; the input is read
+    directly and the reason is recorded and warned about (ASEBI SPEC 4.1 item 10, D37)."""
+    import warnings
+    from ajisai import AJISAI, AJISAIConfig
+
+    ms = run["ms"]
+    aj = AJISAI(AJISAIConfig(vis=ms, results_dir=str(tmp_path), verbose=False))
+    aj.workdir = tmp_path
+    (tmp_path / "intermediate").mkdir()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        aj._prepare_working_vis()
+    assert aj._derived["working_vis"] == ms
+    caveat = aj.justification["derived"]["working_vis"]["relabel_caveat"]
+    assert "kept" in caveat and "Cycle 3" in caveat
+    assert any("Cycle 3" in str(w.message) for w in caught)
     assert _digest(ms) == run["before"]
 
 

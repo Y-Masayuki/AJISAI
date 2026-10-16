@@ -304,13 +304,12 @@ def test_phase_shift_is_exact_in_every_frame(sims, tmp_path, ms_frame, target_fr
         warnings.simplefilter("always")
         aj = _run_phase_shift(ms, tmp_path / "out", TARGET_STR + (target_frame,), relabel)
     working = aj._derived["working_vis"]
-    relabelled = working != ms
-    # The genuine-J2000 MS is relabelled (copy) only with relabel=True; the
-    # 2017 date makes it data the label-only relabel is not meant for.
-    assert relabelled == (relabel and ms_frame == "J2000")
-    if relabelled:
+    # The simulated MSs are dated 2017: a J2000 label on them is genuine J2000 and is never relabelled
+    # (ASEBI SPEC 4.1 item 10, D37); with relabel=True the kept label is warned about and recorded.
+    assert working == ms
+    if relabel and ms_frame == "J2000":
         caveat = aj.justification["derived"]["working_vis"]["relabel_caveat"]
-        assert caveat and "Cycle 3" in caveat
+        assert caveat and "Cycle 3" in caveat and "kept" in caveat
         assert any("Cycle 3" in str(w.message) for w in caught)
     codes_before = _ref_codes(working)
 
@@ -354,7 +353,7 @@ def test_phase_shift_is_exact_in_every_frame(sims, tmp_path, ms_frame, target_fr
     with open(os.path.join(str(tmp_path / "out"), "justification.json")) as fh:
         saved = json.load(fh)["derived"]
     assert saved["phase_shift"]["field_source_write"]["field_ids"] == [fid]
-    assert ("relabel" in saved["working_vis"]) == relabelled
+    assert "relabel" not in saved["working_vis"]                      # never relabelled (2017 data, D37)
 
 
 def test_phase_shift_finds_the_renumbered_field(sims, tmp_path):

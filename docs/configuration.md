@@ -154,13 +154,14 @@ the lines you need.
 :   AJISAI never writes to the input MS. When this is `True` and the input
     carries J2000 frame codes, a copy (`intermediate/input_icrs.ms`) is
     relabelled J2000 -> ICRS (the frame code only; coordinates are not
-    converted) and used as the working MS, as v0.2 did in place. `False`
-    keeps the input frame (the input is then read directly). The
-    label-only relabel is right for ALMA data observed before Cycle 3
-    (ICRS numbers labelled J2000); for other data (not ALMA, or observed
-    on or after 2015-10-01) AJISAI warns and records the caveat
-    (`derived.working_vis.relabel_caveat`), because genuine J2000
-    numbers relabelled as ICRS move by the frame bias (up to about 23 mas).
+    converted) and used as the working MS, but only for ALMA data observed
+    before Cycle 3 (2015-10-01), whose J2000 label sits on ICRS numbers
+    (ALMA knowledgebase). Any other J2000 label (not ALMA, observed on or
+    after 2015-10-01, or with an unknown start) is genuine J2000: it is
+    kept, the input is read directly, and AJISAI warns and records why
+    (`derived.working_vis.relabel_caveat`); relabelling genuine J2000
+    numbers as ICRS would move them by the frame bias (up to about 23 mas).
+    `False` never relabels. Same rule as ASEBI (SPEC 4.1 item 10).
 
 `caller: str = "user"`
 :   Who drives the run: `"user"` (standalone) or `"asebi"` (the ASEBI
