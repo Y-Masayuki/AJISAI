@@ -230,6 +230,36 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **Time-averaged data broke the time geometry of `mode="data"` (convention
+  audit 2026-10-16; ASEBI SPEC 4 item 4, D38 e).** `ajisai.solint.geometry`
+  took the distinct TIME values of a scan as its integrations. After time
+  averaging of a copy that had lost rows (split with keepflags=False drops
+  fully flagged baseline-integrations), mstransform writes for each baseline
+  the mean time of the rows present, so one bin carries several TIMEs: on a
+  simulated EB with 3 % of the rows missing and 18 s bins, 11-12 "integrations"
+  per scan instead of 4, an integration time of 6 s, no adjacent pairs for the
+  noise scale, the SNR rate x1.48 and 29.5 % of the rows on the wrong side of
+  the even/odd split; one bin per scan gave an integration time of 1 s (SNR
+  rate x8). The summary now carries INTERVAL (`VisSummary.interval`): the
+  rows are placed on integration slots of the median INTERVAL from the start
+  of each scan (G2's even/odd split is the slot parity, the noise scale pairs
+  adjacent slots, the integration grid of the SNR rate and the structure
+  function is scan offset + slot), and the integration time is the median
+  spacing of adjacent slots when it agrees with the median INTERVAL to 0.1 %
+  (unaveraged data: the previous value exactly), else the median INTERVAL.
+  Recorded in `selfcal["time_geometry"]`. Unaveraged data give the previous
+  stage records bit for bit (23 simulations). The integration grid no longer
+  puts two integrations of a scan into one cell when the scan starts a
+  half-integer number of integrations after the first (it undercounted the
+  observing time, SNR rate +8 % on such a simulation).
+- **gaincal's time grid starts at the first row of a scan, fully flagged rows
+  included** (audit item 5). `read_vis_summary` drops rows without valid data,
+  so a scan whose first integration was flagged was modelled from the second
+  (17 instead of gaincal's 18 solutions at 12 s; the G1 gate matched the
+  wrong solutions). The first and last TIME of every scan over all its rows
+  are now kept (`VisSummary.scan_bounds`) and the solution intervals start
+  there (`Geometry.scan_origin`).
+
 - **A user `phase_center` with a `:`-separated declination went to CASA as
   hours.** The documented form `("16:25:45.0", "-24:12:23.0", "ICRS")` was
   passed to `phaseshift` as it was; CASA reads `-24:12:23.0` as a time

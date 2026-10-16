@@ -11,7 +11,11 @@ antenna), optionally with random phase jumps. ``production`` applies a
 numpy full-data solution the way gaincal + applycal (calonly, linearPD or
 nearest as the candidate says, G1 gate) would, so that the stage logic can
 be run end to end without CASA. ``concat`` joins execution blocks (e.g.
-with different integration times) into one run.
+with different integration times) into one run. ``interval=True`` gives
+the rows an INTERVAL as a measurement set does (``ajisai.solint.geometry``
+then finds the integrations from it, ASEBI SPEC 4 item 4, D38 e), and
+``time_average`` bins the integrations of each scan the way mstransform
+does, optionally after dropping rows (a copy split with keepflags=False).
 """
 from __future__ import annotations
 
@@ -46,12 +50,14 @@ def phase_jumps(times, n_ant, rate, rms, rng):
 
 
 def simulate(*, n_ant=16, n_scans=4, n_int=20, it=6.0, gap=60.0, n_spw=1, r=1.0, s=1.0,
-             tau0=300.0, beta=1.0, seed=1, halves=False, obs_offset=0.0, jumps=None):
+             tau0=300.0, beta=1.0, seed=1, halves=False, obs_offset=0.0, jumps=None,
+             interval=False):
     """One execution block of reduced rows; ``r`` is the per-antenna SNR rate (all spws).
 
     ``jumps=(rate_per_s, rms_rad)`` adds antenna phase steps (:func:`phase_jumps`)
     drawn from a separate random stream, so the rest of the simulation is the
-    same with and without them.
+    same with and without them. ``interval=True``: every row has INTERVAL =
+    ``it`` (the random draws are the same).
     """
     rng = np.random.default_rng(seed)
     times = []
@@ -97,7 +103,8 @@ def simulate(*, n_ant=16, n_scans=4, n_int=20, it=6.0, gap=60.0, n_spw=1, r=1.0,
     uv = np.tile(rng.uniform(10, 1000, nbl), len(rows))
     vs = so.VisSummary(time=times[ti], obs=np.zeros(n, int), scan=scans[ti], spw=sp, a1=A1, a2=A2,
                        y=y, P=P, antenna_names=[f"A{k:02d}" for k in range(n_ant)], S=y.copy(),
-                       uvdist_m=uv, y_half=yh, P_half=Ph)
+                       uvdist_m=uv, y_half=yh, P_half=Ph,
+                       interval=np.full(n, float(it)) if interval else None)
     order = np.lexsort((vs.time, vs.a2, vs.a1, vs.spw, vs.obs))
     return reorder(vs, order), phases
 
@@ -114,14 +121,65 @@ def concat(parts):
         cat[name] = np.concatenate([np.asarray(getattr(v, name)) for v, _ in parts])
     obs = np.concatenate([np.full(v.n_rows, k, int) for k, (v, _) in enumerate(parts)])
     halves = all(v.y_half is not None for v, _ in parts)
+    with_iv = all(v.interval is not None for v, _ in parts)
     vs = so.VisSummary(time=cat["time"], obs=obs, scan=cat["scan"], spw=cat["spw"], a1=cat["a1"],
                        a2=cat["a2"], y=cat["y"], P=cat["P"],
                        antenna_names=list(parts[0][0].antenna_names), S=cat["y"].copy(),
                        uvdist_m=cat["uvdist_m"],
                        y_half=np.concatenate([v.y_half for v, _ in parts], axis=1) if halves else None,
-                       P_half=np.concatenate([v.P_half for v, _ in parts], axis=1) if halves else None)
+                       P_half=np.concatenate([v.P_half for v, _ in parts], axis=1) if halves else None,
+                       interval=(np.concatenate([v.interval for v, _ in parts]) if with_iv
+                                 else None))
     order = np.lexsort((vs.time, vs.a2, vs.a1, vs.spw, vs.obs))
     return reorder(vs, order), [p for _, p in parts]
+
+
+def time_average(vs, nbin, drop=0.0, seed=0):
+    """Average ``nbin`` integrations of each scan per baseline and spw, as mstransform does.
+
+    ASEBI SPEC 4 item 4 (D38 e; time audit 2026-10-16, item 1). Rows are
+    first dropped at random with probability ``drop`` (a copy split with
+    keepflags=False loses every fully flagged baseline-integration). The
+    bins start at each scan's first integration (``k // nbin``, k = the
+    integration in the scan); an averaged row has the sums ``y``, ``P``,
+    ``S`` (and halves) of its present rows (exact for a constant model),
+    TIME = the mean time of the present rows and INTERVAL = their summed
+    INTERVAL, as mstransform writes. ``vs`` must carry INTERVAL. Returns the
+    averaged summary and the bin of each of its rows.
+    """
+    rng = np.random.default_rng(seed)
+    keep = rng.random(vs.n_rows) >= drop
+    k = np.zeros(vs.n_rows, dtype=np.int64)
+    for o in np.unique(vs.obs):
+        for sc in np.unique(vs.scan[vs.obs == o]):
+            sel = (vs.obs == o) & (vs.scan == sc)
+            st = np.unique(vs.time[sel])
+            k[sel] = np.searchsorted(st, vs.time[sel])
+    b = k // int(nbin)
+    keys = np.stack([vs.obs, vs.scan, vs.spw, vs.a1, vs.a2, b])[:, keep]
+    uk, inv = np.unique(keys, axis=1, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    m = uk.shape[1]
+
+    def tot(x):
+        x = np.asarray(x)[..., keep]
+        if x.ndim == 2:
+            return np.stack([np.bincount(inv, x[h].real, m) + 1j * np.bincount(inv, x[h].imag, m)
+                             if np.iscomplexobj(x) else np.bincount(inv, x[h], m)
+                             for h in range(x.shape[0])])
+        if np.iscomplexobj(x):
+            return np.bincount(inv, x.real, m) + 1j * np.bincount(inv, x.imag, m)
+        return np.bincount(inv, x, m)
+    cnt = np.bincount(inv, minlength=m).astype(float)
+    uv = np.bincount(inv, np.asarray(vs.uvdist_m)[keep], m) / cnt if vs.uvdist_m is not None else None
+    out = so.VisSummary(time=tot(vs.time) / cnt, obs=uk[0], scan=uk[1], spw=uk[2], a1=uk[3],
+                        a2=uk[4], y=tot(vs.y), P=tot(vs.P), antenna_names=list(vs.antenna_names),
+                        S=tot(vs.S) if vs.S is not None else None, uvdist_m=uv,
+                        y_half=tot(vs.y_half) if vs.y_half is not None else None,
+                        P_half=tot(vs.P_half) if vs.P_half is not None else None,
+                        interval=tot(vs.interval))
+    order = np.lexsort((out.time, out.a2, out.a1, out.spw, out.obs))
+    return reorder(out, order), uk[5][order]
 
 
 def reorder(vs, order):
@@ -134,7 +192,8 @@ def reorder(vs, order):
                          spw=vs.spw[order], a1=vs.a1[order], a2=vs.a2[order], y=vs.y[order],
                          P=vs.P[order], antenna_names=list(vs.antenna_names), S=pick(vs.S),
                          uvdist_m=pick(vs.uvdist_m), y_half=pick(vs.y_half),
-                         P_half=pick(vs.P_half))
+                         P_half=pick(vs.P_half), interval=pick(vs.interval),
+                         scan_bounds=vs.scan_bounds)
 
 
 def rotate(vs, rowphase, state0):
@@ -144,7 +203,7 @@ def rotate(vs, rowphase, state0):
                         y=vs.y * e, P=vs.P, antenna_names=vs.antenna_names, S=vs.S * e,
                         uvdist_m=vs.uvdist_m,
                         y_half=None if vs.y_half is None else vs.y_half * e[None, :],
-                        P_half=vs.P_half)
+                        P_half=vs.P_half, interval=vs.interval, scan_bounds=vs.scan_bounds)
     new.track_phase(state0)
     return new
 

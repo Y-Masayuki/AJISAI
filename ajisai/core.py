@@ -3149,6 +3149,9 @@ Infrastructure
             "split_note": self._sc.get("split_note"),
             "it_step": (dict(self._sc["geom"].it_step_record) if self._sc["geom"] is not None
                         else None),
+            # how the integrations were found (INTERVAL; ASEBI SPEC 4 item 4, D38 e)
+            "time_geometry": (dict(self._sc["geom"].time_record) if self._sc["geom"] is not None
+                              else None),
         })
         self._derived["selfcal_summary"] = summary
         if cfg.verbose:

@@ -686,9 +686,13 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
     Cross-correlations of the field only; per row the sums of
     :func:`ajisai.solint.reduce_visibilities` over the parallel hands
     (WEIGHT_SPECTRUM when the column holds values, else WEIGHT), the UV
-    distance (m) and, with ``band_halves=True``, the sums over the lower and
-    upper half of each spw's channels. Rows without any valid sample are
-    dropped. The table is opened read-only.
+    distance (m), the INTERVAL and, with ``band_halves=True``, the sums over
+    the lower and upper half of each spw's channels. Rows without any valid
+    sample are dropped; the first and last TIME of every (observation, scan)
+    are taken over all its rows before that, fully flagged rows included
+    (``VisSummary.scan_bounds``: gaincal's time grid starts at the first
+    row of the scan; ASEBI SPEC 4 item 4, D38 e). The table is opened
+    read-only.
     """
     _require_casa()
     from .solint import VisSummary, reduce_visibilities
@@ -704,7 +708,8 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
     finally:
         tb.close()
     parts: Dict[str, List[np.ndarray]] = {k: [] for k in (
-        "time", "obs", "scan", "spw", "a1", "a2", "y", "P", "S", "uv", "yh", "Ph")}
+        "time", "obs", "scan", "spw", "a1", "a2", "y", "P", "S", "uv", "yh", "Ph", "iv")}
+    bounds: Dict[Tuple[int, int], Tuple[float, float]] = {}
     tb.open(vis)
     try:
         cols = tb.colnames()
@@ -734,9 +739,14 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
                         halves=band_halves and nchan >= 2)
                     keep = red["n_valid"] > 0
                     uvw = sub.getcol("UVW", start, nr)
-                    parts["time"].append(sub.getcol("TIME", start, nr)[keep])
-                    parts["obs"].append(sub.getcol("OBSERVATION_ID", start, nr)[keep])
-                    parts["scan"].append(sub.getcol("SCAN_NUMBER", start, nr)[keep])
+                    t_all = sub.getcol("TIME", start, nr)
+                    o_all = sub.getcol("OBSERVATION_ID", start, nr)
+                    s_all = sub.getcol("SCAN_NUMBER", start, nr)
+                    _update_scan_bounds(bounds, o_all, s_all, t_all)
+                    parts["time"].append(t_all[keep])
+                    parts["obs"].append(o_all[keep])
+                    parts["scan"].append(s_all[keep])
+                    parts["iv"].append(sub.getcol("INTERVAL", start, nr)[keep])
                     parts["spw"].append(np.full(int(keep.sum()), int(dd_spw[dd])))
                     parts["a1"].append(sub.getcol("ANTENNA1", start, nr)[keep])
                     parts["a2"].append(sub.getcol("ANTENNA2", start, nr)[keep])
@@ -765,7 +775,31 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
         spw=cat["spw"][order], a1=cat["a1"][order], a2=cat["a2"][order], y=cat["y"][order],
         P=cat["P"][order], antenna_names=names, S=cat["S"][order], uvdist_m=cat["uv"][order],
         y_half=pick(cat["yh"]) if band_halves else None,
-        P_half=pick(cat["Ph"]) if band_halves else None, source=str(vis))
+        P_half=pick(cat["Ph"]) if band_halves else None, source=str(vis),
+        interval=cat["iv"][order], scan_bounds=bounds)
+
+
+def _update_scan_bounds(bounds: Dict[Tuple[int, int], Tuple[float, float]], obs, scan, time) -> None:
+    """Widen the (first, last) TIME of every (observation, scan) by the given rows."""
+    obs = np.asarray(obs)
+    scan = np.asarray(scan)
+    time = np.asarray(time, dtype=float)
+    if time.size == 0:
+        return
+    keys = np.stack([obs, scan])
+    uk, inv = np.unique(keys, axis=1, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    lo = np.full(uk.shape[1], np.inf)
+    hi = np.full(uk.shape[1], -np.inf)
+    np.minimum.at(lo, inv, time)
+    np.maximum.at(hi, inv, time)
+    for j in range(uk.shape[1]):
+        k = (int(uk[0, j]), int(uk[1, j]))
+        if k in bounds:
+            lo_j, hi_j = bounds[k]
+            bounds[k] = (min(lo_j, float(lo[j])), max(hi_j, float(hi[j])))
+        else:
+            bounds[k] = (float(lo[j]), float(hi[j]))
 
 
 def get_antenna_positions(vis: str) -> Dict[str, np.ndarray]:

@@ -379,6 +379,116 @@ def test_units_follow_gaincal_time_grid(solint, times):
     assert sorted(u.time.tolist()) == times
 
 
+# ---------------------------------------------------------------------------
+# Integrations from INTERVAL (ASEBI SPEC 4 item 4, D38 e; time audit 2026-10-16)
+# ---------------------------------------------------------------------------
+def _without_interval(vs):
+    """The same rows as a summary without INTERVAL (the rule before D38 e)."""
+    return so.VisSummary(time=vs.time, obs=vs.obs, scan=vs.scan, spw=vs.spw, a1=vs.a1, a2=vs.a2,
+                         y=vs.y, P=vs.P, antenna_names=vs.antenna_names, S=vs.S,
+                         uvdist_m=vs.uvdist_m)
+
+
+def _rate_and_pairs(vs):
+    geom = so.geometry(vs)
+    s_map = so.noise_scale(vs, geom)
+    return geom, so.snr_rates(vs, s_map, geom)["median"], s_map[0]["n_pairs"]
+
+
+def test_time_averaged_rows_with_missing_input_are_placed_by_interval():
+    """18 s bins of 6 s integrations after 3 % of the rows were dropped (split keepflags=False).
+
+    Each averaged row's TIME is the mean of the rows present, so a bin carries
+    several TIMEs. The distinct-time rule reproduces the audit's failure; the
+    INTERVAL slots give the bins: IT 18 s, 4 per scan, the bin parity, pairs for
+    the noise scale, and the SNR rate of the copy without missing rows.
+    """
+    vs, _ = sim.simulate(n_ant=10, n_scans=3, n_int=11, it=6.0, r=2.0, tau0=None, seed=5,
+                         interval=True)
+    clean, _ = sim.time_average(vs, 3)
+    avg, true_bin = sim.time_average(vs, 3, drop=0.03, seed=3)
+    _, r_clean, _ = _rate_and_pairs(clean)
+    # before (distinct TIME values are integrations): the failure of the audit
+    g_old, r_old, pairs_old = _rate_and_pairs(_without_interval(avg))
+    assert g_old.int_time[0] < 9.0 and min(g_old.scan_nint) > 4
+    assert pairs_old == 0 and r_old > 1.3 * r_clean
+    assert np.mean((g_old.k_in_scan % 2) != (true_bin % 2)) > 0.2
+    # with INTERVAL
+    g, r, pairs = _rate_and_pairs(avg)
+    assert g.int_time[0] == pytest.approx(18.0, abs=1e-9)
+    assert g.scan_nint.tolist() == [4, 4, 4]
+    assert np.array_equal(g.k_in_scan, true_bin)            # slot = the bin, so the parity too
+    assert pairs > 0 and r == pytest.approx(r_clean, rel=0.03)
+    rec = g.time_record["per_observation"]["0"]
+    assert rec["n_distinct_times"] > rec["n_integrations"] == 12 and "note" in rec
+    assert rec["interval_median_s"] == 18.0
+    # the slot times are the bin centres (most rows of a bin are complete)
+    np.testing.assert_allclose(np.unique(g.slot_time), np.unique(clean.time), rtol=0, atol=1e-9)
+
+
+def test_one_bin_per_scan_takes_the_integration_time_from_interval():
+    """A bin as long as the scan: no two integrations in a scan; IT was 1 s (SNR rate x 8)."""
+    vs, _ = sim.simulate(n_ant=10, n_scans=3, n_int=11, it=6.0, r=2.0, tau0=None, seed=5,
+                         interval=True)
+    one, _ = sim.time_average(vs, 11)
+    _, r_full, _ = _rate_and_pairs(vs)
+    g_old, r_old, _ = _rate_and_pairs(_without_interval(one))
+    assert g_old.int_time[0] == 1.0 and r_old > 7.0 * r_full
+    g, r, _ = _rate_and_pairs(one)
+    assert g.int_time[0] == pytest.approx(66.0) and g.scan_nint.tolist() == [1, 1, 1]
+    assert g.time_record["per_observation"]["0"]["source"] == "median INTERVAL"
+    assert r == pytest.approx(r_full, rel=0.02)
+
+
+@pytest.mark.parametrize("kw, combine", [
+    (dict(n_ant=16, n_scans=4, n_int=20, r=3.0, tau0=200.0, beta=1.0, seed=3), False),
+    (dict(n_ant=12, n_scans=3, n_int=12, n_spw=2, r=3.0, tau0=300.0, seed=4), True),
+    (dict(n_ant=16, n_scans=4, n_int=20, r=1.5, tau0=2000.0, beta=1.0, seed=2,
+          jumps=(1 / 30.0, 2.0)), False),
+])
+def test_unaveraged_data_give_the_same_records_with_interval(kw, combine):
+    """Regular data: the INTERVAL slots are the distinct times, so every record is the same bit
+    for bit (the comparison with the code before D38 e on 23 simulations is in
+    local_runs/audit/ajisai_d38/t1_bitforbit.py)."""
+    import json
+    vs, _ = sim.simulate(interval=True, **kw)
+    a, _, _ = sim.run_loop(vs, combine_spw=combine)
+    b, _, _ = sim.run_loop(_without_interval(vs), combine_spw=combine)
+
+    def conv(o):
+        return o.tolist() if isinstance(o, np.ndarray) else o.item()
+    dump = [json.dumps(so.strip_internal(r), sort_keys=True, default=conv) for r in a]
+    assert dump == [json.dumps(so.strip_internal(r), sort_keys=True, default=conv) for r in b]
+
+
+def test_gaincal_grid_starts_at_the_first_row_of_the_scan_including_flagged_rows():
+    """The scan's first integration is fully flagged (rows present, not in the summary).
+
+    gaincal starts its grid at that row (audit 2026-10-16, item 5: 18 vs 17
+    solutions at 12 s); ``scan_bounds`` gives the summary that row's time.
+    """
+    vs = _two_scan_summary()
+    keep = vs.time != 120.0                         # scan 2's first integration flagged
+    n = int(keep.sum())
+    flagged = so.VisSummary(time=vs.time[keep], obs=vs.obs[keep], scan=vs.scan[keep],
+                            spw=vs.spw[keep], a1=vs.a1[keep], a2=vs.a2[keep], y=vs.y[keep],
+                            P=vs.P[keep], antenna_names=vs.antenna_names,
+                            interval=np.full(n, 6.0),
+                            scan_bounds={(0, 1): (0.0, 54.0), (0, 2): (120.0, 174.0)})
+    geom = so.geometry(flagged)
+    assert geom.scan_origin[(0, 2)] == 120.0
+    cand = {"kind": "int", "n_int": 2, "gaincal_solint": "11.250s"}
+    u = so.solution_units(flagged, geom, cand, combine_spw=False)
+    # scan 2 on gaincal's grid from 120 s: [126], [132, 138], [144, 150], [156, 162], [168, 174]
+    assert sorted(u.time.tolist())[5:] == [126.0, 135.0, 147.0, 159.0, 171.0]
+    # without the bounds the grid started at 126 s: [126, 132], [138, 144], ...
+    g2 = so.geometry(_without_interval(flagged))
+    u2 = so.solution_units(_without_interval(flagged), g2, cand, combine_spw=False)
+    assert sorted(u2.time.tolist())[5:] == [129.0, 141.0, 153.0, 165.0, 174.0]
+    # the slots count from the flagged integration: scan 2's rows are slots 1..9
+    assert sorted(set(geom.k_in_scan[flagged.scan == 2].tolist())) == list(range(1, 10))
+
+
 def test_scan_and_eb_units():
     vs = _two_scan_summary()
     geom = so.geometry(vs)

@@ -9,9 +9,10 @@ The rules are those of the ASEBI specification v0.3 (SPEC section 10.2,
 appendices C.2 and C.3) and of the design-review records P17/P18 (decision
 block, sections 3.1-3.5, test results sections 3-5, 7, 9 and 10), P23 (the
 measurement self-cal uses the same rules), P27 (no iteration loop on the
-ASEBI side) and D34 (F3: candidate step for mixed integration times; F2:
-nearest interpolation, provisional). Every public function names its
-section in a ``Spec:`` line.
+ASEBI side), D34 (F3: candidate step for mixed integration times; F2:
+nearest interpolation, provisional) and D38 (e: the integrations are found
+from INTERVAL, not from distinct TIME values). Every public function names
+its section in a ``Spec:`` line.
 
 What is measured, from the visibilities, the model and the weights only
 (no gain solutions, no images):
@@ -58,6 +59,13 @@ measurement set (one row = one baseline, integration and spw):
 correlations and channels (:class:`VisSummary`). A phase-only gain with
 gaintype 'T' multiplies every channel and correlation of a row by the same
 factor, so applying a solution to the reduced row is exact.
+
+Time axis. The integrations are slots of width INTERVAL counted from the
+start of each scan (:func:`geometry`), not the distinct TIME values: after
+time averaging of data that lacked rows, the rows of one bin carry
+different TIMEs (each the mean of the rows present). gaincal's intervals
+are modelled from the actual row TIMEs on its grid from the first row of
+the scan, fully flagged rows included (:func:`solution_units`).
 
 CASA is never imported here; ``ajisai.ms_utils.read_vis_summary`` fills a
 :class:`VisSummary` from a measurement set.
@@ -130,6 +138,12 @@ _LCM_SEARCH_MAX = 100
 # variant whose solutions are all zero (re-solving a nested interval on top of
 # the previous stage) gives the linear candidate's coherence to ~1e-16.
 _PAIRED_NUMERICAL_TOL = 1e-9
+# The median spacing of adjacent integration slots replaces the median
+# INTERVAL as the integration time when the two agree to this fraction: they
+# then differ only by the rounding of the time stamps, and the spacing is the
+# grid the TIME values follow (D38 e; unaveraged data keep the integration
+# time of the distinct-time rule exactly).
+_IT_SPACING_RTOL = 1e-3
 
 
 # ============================================================================
@@ -255,6 +269,15 @@ class VisSummary:
     two states of the same rows. ``phi0`` is the per-row phase that maps
     this state's data back to state 0 (``DATA_0 = DATA e^{i phi0}``), set by
     :meth:`track_phase`.
+
+    Time axis (ASEBI SPEC 4 item 4, D38 e; read by
+    ``ajisai.ms_utils.read_vis_summary``): ``interval`` is the INTERVAL of
+    each row (s), from which :func:`geometry` places the rows on integration
+    slots; ``scan_bounds`` maps (observation, scan) to the first and last
+    TIME of all rows of the scan, fully flagged rows included (gaincal's
+    time grid starts at the first of them). Without them (summaries built
+    directly, e.g. in tests) the distinct TIME values are the integrations
+    and the grid starts at the first row of the summary.
     """
     time: np.ndarray
     obs: np.ndarray
@@ -271,6 +294,8 @@ class VisSummary:
     P_half: Optional[np.ndarray] = None
     phi0: Optional[np.ndarray] = None
     source: str = ""
+    interval: Optional[np.ndarray] = None
+    scan_bounds: Optional[Dict[Tuple[int, int], Tuple[float, float]]] = None
 
     def __post_init__(self):
         self.time = np.asarray(self.time, dtype=float)
@@ -282,6 +307,14 @@ class VisSummary:
         for name in ("obs", "scan", "spw", "a1", "a2", "y", "P"):
             if getattr(self, name).shape != (n,):
                 raise ValueError(f"VisSummary.{name} must have shape ({n},)")
+        for name in ("interval",):
+            if getattr(self, name) is not None:
+                setattr(self, name, np.asarray(getattr(self, name), dtype=float))
+                if getattr(self, name).shape != (n,):
+                    raise ValueError(f"VisSummary.{name} must have shape ({n},)")
+        if self.scan_bounds is not None:
+            self.scan_bounds = {(int(o), int(s)): (float(b[0]), float(b[1]))
+                                for (o, s), b in self.scan_bounds.items()}
         if self.phi0 is None:
             self.phi0 = np.zeros(n)
 
@@ -372,22 +405,31 @@ def reduce_visibilities(data, model, flag, weight, flag_row=None, corr_types=Non
 class Geometry:
     """Time structure of the rows of a run (identical for every state).
 
-    Spec: 10.2 items 3 and 6 (scan lengths in integrations, even/odd split).
+    Spec: 10.2 items 3 and 6 (scan lengths in integrations, even/odd split);
+    ASEBI SPEC 4 item 4 and D38 e (integrations from INTERVAL).
 
     ``it_step`` is the step of the candidate solints (Spec 10.2 item 3, D34
     F3): ``it_ref`` unless the EBs have different integration times with a
     least common multiple (rule "lcm", :func:`integration_step`); then the
     scan lengths in steps (``scan_nstep``) build the candidate grid.
+
+    ``k_in_scan`` is the row's integration slot counted from the start of
+    its scan and ``slot_time`` the time of that slot (the median TIME of its
+    rows); without INTERVAL (:class:`VisSummary`) the slots are the distinct
+    TIME values, as before D38. ``scan_origin``: gaincal's grid origin of
+    every (observation, scan), its first row with fully flagged rows
+    included. ``time_record``: how the integration times and slots were
+    found (recorded by the caller).
     """
     int_time: Dict[int, float]          # integration time per observation (s)
     it_ref: float                       # median integration time of all rows (s)
-    k_in_scan: np.ndarray               # index of the row's integration within its scan
-    scan_nint: np.ndarray               # integrations per scan (one entry per scan)
+    k_in_scan: np.ndarray               # the row's integration slot within its scan
+    scan_nint: np.ndarray               # integrations (slots with rows) per scan, one entry per scan
     scan_nint_median: float
     n_scans: int
     max_scans_per_obs: int
     obs_span: Dict[int, float]          # first to last integration + one IT (s)
-    utimes: Dict[int, np.ndarray]       # unique times per observation
+    utimes: Dict[int, np.ndarray]       # integration (slot) times per observation
     tgrid: np.ndarray                   # row -> index on the observation's IT grid
     cache: Dict[Any, Any] = field(default_factory=dict)   # row -> unit assignments
     it_step: float = 0.0                # step of the candidate solints (s)
@@ -395,6 +437,10 @@ class Geometry:
     scan_nstep: Optional[np.ndarray] = None   # scan lengths in steps (= scan_nint unless 'lcm')
     scan_nstep_median: float = 0.0
     scan_nstep_max: int = 0
+    slot_time: Optional[np.ndarray] = None    # row -> time of its integration slot (s)
+    scan_origin: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    time_record: Dict[str, Any] = field(default_factory=dict)
+    slots_from_interval: Dict[int, bool] = field(default_factory=dict)   # per observation
 
 
 def integration_step(int_times: Sequence[float], it_median: float, rtol: float = IT_MATCH_RTOL,
@@ -457,41 +503,159 @@ def integration_step(int_times: Sequence[float], it_median: float, rtol: float =
     return out
 
 
+def _group_median(values: np.ndarray, groups: np.ndarray, n_groups: int) -> np.ndarray:
+    """Median of ``values`` in each group ``0 .. n_groups - 1`` (as ``np.median`` of each group)."""
+    order = np.lexsort((values, groups))
+    v = values[order]
+    cnt = np.bincount(groups, minlength=n_groups)
+    start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+    lo = start + (cnt - 1) // 2
+    hi = start + cnt // 2
+    return 0.5 * (v[lo] + v[hi])
+
+
+def _median_interval(vs: VisSummary, sel: np.ndarray) -> Optional[float]:
+    """Median INTERVAL (s) of the selected rows, or None without a positive INTERVAL."""
+    if vs.interval is None:
+        return None
+    iv = vs.interval[sel]
+    iv = iv[np.isfinite(iv) & (iv > 0)]
+    return float(np.median(iv)) if iv.size else None
+
+
 def geometry(vs: VisSummary) -> Geometry:
-    """Integration time per observation, scan positions and the even/odd parity.
+    """Integration time per observation, integration slots, scan positions and the even/odd parity.
 
     Spec: 10.2 items 3 and 6; 10 item 5 (solints are integer multiples of the
     time bin); 10.2 item 3, D34 F3 (the step of the candidates for EBs of
     different integration times, :func:`integration_step`; a fallback to the
-    median is warned here).
+    median is warned here); ASEBI SPEC 4 item 4 and D38 e (AJISAI finds the
+    integrations from INTERVAL).
+
+    With INTERVAL (summaries read from an MS): the integration width of an
+    observation is the median INTERVAL of its rows, and each row's slot in
+    its scan is ``round((t - t0) / IT)`` with ``t0`` the scan's first row
+    (fully flagged rows included) moved onto the slot grid by the median
+    residual of the scan's rows. The even/odd split of G2 is the slot
+    parity and the noise scale pairs adjacent slots. Distinct TIME values
+    are not integrations: after time averaging of data that lacked rows,
+    mstransform writes for each baseline the mean time of the rows present,
+    so one bin carries several TIMEs (audit 2026-10-16: 11-12 per scan for 4
+    bins of 18 s, IT 6 s, 29.5 % of the rows on the wrong parity; one bin
+    per scan: IT 1 s). The slot's time is the median TIME of its rows, and
+    the integration time is the median spacing of adjacent slots when it
+    agrees with the median INTERVAL to :data:`_IT_SPACING_RTOL` (unaveraged
+    data: exactly the previous value), else the median INTERVAL (one bin
+    per scan; spacing distorted by partial bins). A spacing that differs from
+    INTERVAL by more than :data:`IT_MATCH_RTOL` is warned about.
+
+    Without INTERVAL (summaries built directly): the distinct TIME values of
+    a scan are its integrations and the integration time is the median of
+    their differences (1 s with no two in a scan), as before D38.
     """
+    n = vs.n_rows
     int_time: Dict[int, float] = {}
     utimes: Dict[int, np.ndarray] = {}
     obs_span: Dict[int, float] = {}
-    k_in_scan = np.zeros(vs.n_rows, dtype=np.int64)
-    tgrid = np.zeros(vs.n_rows, dtype=np.int64)
+    k_in_scan = np.zeros(n, dtype=np.int64)
+    tgrid = np.zeros(n, dtype=np.int64)
+    slot_time = np.array(vs.time, dtype=float)
+    scan_origin: Dict[Tuple[int, int], float] = {}
     scan_nint: List[int] = []
     scan_obs: List[int] = []
     max_spo = 0
+    per_obs_rec: Dict[str, Any] = {}
+    time_warnings: List[str] = []
+    by_slot: Dict[int, bool] = {}
     for o in np.unique(vs.obs):
+        oi = int(o)
         sel_o = vs.obs == o
-        ut = np.unique(vs.time[sel_o])
-        utimes[int(o)] = ut
+        it_iv = _median_interval(vs, sel_o)
+        by_slot[oi] = it_iv is not None
         diffs = []
-        max_spo = max(max_spo, int(np.unique(vs.scan[sel_o]).size))
-        for sc in np.unique(vs.scan[sel_o]):
-            sel = sel_o & (vs.scan == sc)
-            st = np.unique(vs.time[sel])
-            scan_nint.append(int(st.size))
-            scan_obs.append(int(o))
-            if st.size > 1:
-                diffs.append(np.diff(st))
-            k_in_scan[sel] = np.searchsorted(st, vs.time[sel])
+        n_distinct = 0
+        slot0: List[Tuple[np.ndarray, float]] = []      # (rows, time of slot 0) per scan
+        scans_o = np.unique(vs.scan[sel_o])
+        max_spo = max(max_spo, int(scans_o.size))
+        for sc in scans_o:
+            idx = np.flatnonzero(sel_o & (vs.scan == sc))
+            t = vs.time[idx]
+            st = np.unique(t)
+            n_distinct += int(st.size)
+            first = float(st[0])
+            if vs.scan_bounds is not None and (oi, int(sc)) in vs.scan_bounds:
+                first = min(first, vs.scan_bounds[(oi, int(sc))][0])
+            scan_origin[(oi, int(sc))] = first
+            if it_iv is None:
+                k = np.searchsorted(st, t)
+                ks = np.arange(st.size)
+                slots_t = st
+                adjacent = np.ones(max(st.size - 1, 0), bool)
+            else:
+                k0 = np.rint((t - first) / it_iv)
+                origin = first + float(np.median(t - first - k0 * it_iv))
+                k = np.rint((t - origin) / it_iv).astype(np.int64)
+                ks, kinv = np.unique(k, return_inverse=True)
+                kinv = np.asarray(kinv).ravel()
+                slots_t = _group_median(t, kinv, ks.size)
+                slot_time[idx] = slots_t[kinv]
+                adjacent = np.diff(ks) == 1
+                slot0.append((idx, origin))
+            k_in_scan[idx] = k
+            scan_nint.append(int(ks.size))
+            scan_obs.append(oi)
+            if ks.size > 1:
+                diffs.append(np.diff(slots_t)[adjacent])
         d = np.concatenate(diffs) if diffs else np.zeros(0)
-        it = float(np.median(d)) if d.size else 1.0
-        int_time[int(o)] = it
-        tgrid[sel_o] = np.rint((vs.time[sel_o] - ut[0]) / it).astype(np.int64)
-        obs_span[int(o)] = float(ut[-1] - ut[0] + it)
+        spacing = float(np.median(d)) if d.size else None
+        if it_iv is None:
+            it = spacing if spacing is not None else 1.0
+            source = ("median spacing of the distinct times (no INTERVAL)" if spacing is not None
+                      else "1 s (no INTERVAL and no two integrations in a scan)")
+        elif spacing is not None and abs(spacing / it_iv - 1.0) <= _IT_SPACING_RTOL:
+            it = spacing
+            source = "median spacing of adjacent integration slots (agrees with INTERVAL)"
+        else:
+            it = it_iv
+            source = "median INTERVAL"
+            if spacing is not None and abs(spacing / it_iv - 1.0) > IT_MATCH_RTOL:
+                time_warnings.append(
+                    f"observation {oi}: the median spacing of adjacent integrations ({spacing:.6g} s) "
+                    f"differs from the median INTERVAL ({it_iv:.6g} s) by more than "
+                    f"{IT_MATCH_RTOL:.0%}; the integrations are placed with INTERVAL")
+        int_time[oi] = it
+        ut = np.unique(slot_time[sel_o])
+        utimes[oi] = ut
+        if it_iv is None:
+            tgrid[sel_o] = np.rint((slot_time[sel_o] - ut[0]) / it).astype(np.int64)
+        else:
+            # the scan's offset on the observation's grid plus the slot: two integrations of a
+            # scan never share a cell, also when the scan starts a half-integer number of
+            # integrations after the first (rint of each row's time put two in one cell)
+            for idx, origin in slot0:
+                tgrid[idx] = int(np.rint((origin - ut[0]) / it)) + k_in_scan[idx]
+            tgrid[sel_o] -= min(int(tgrid[sel_o].min()), 0)
+        obs_span[oi] = float(ut[-1] - ut[0] + it)
+        n_slots = int(sum(scan_nint[j] for j, x in enumerate(scan_obs) if x == oi))
+        per_obs_rec[str(oi)] = {
+            "int_time_s": it, "source": source, "interval_median_s": it_iv,
+            "slot_spacing_median_s": spacing, "n_integrations": n_slots,
+            "n_distinct_times": n_distinct,
+        }
+        if it_iv is not None and n_distinct > n_slots:
+            per_obs_rec[str(oi)]["note"] = (
+                f"{n_distinct} distinct TIME values on {n_slots} integrations: rows of one integration "
+                f"carry different times (time-averaged data whose input lacked rows); gaincal bins "
+                f"the rows by their own TIME")
+    for msg in time_warnings:
+        warnings.warn(f"[AJISAI] {msg}")
+    time_record = {
+        "rule": ("integrations from INTERVAL (slots of the median INTERVAL from the first row of each "
+                 "scan, fully flagged rows included)" if vs.interval is not None
+                 else "integrations are the distinct TIME values (no INTERVAL)"),
+        "per_observation": per_obs_rec,
+        "warnings": time_warnings,
+    }
     all_it = np.array([int_time[int(o)] for o in vs.obs]) if vs.n_rows else np.ones(1)
     nint = np.asarray(scan_nint, dtype=np.int64)
     it_ref = float(np.median(all_it))
@@ -513,7 +677,9 @@ def geometry(vs: VisSummary) -> Geometry:
                     scan_nint=nint, scan_nint_median=nint_median,
                     n_scans=int(nint.size), max_scans_per_obs=max_spo, obs_span=obs_span, utimes=utimes, tgrid=tgrid,
                     it_step=float(step["step_s"]), it_step_record=step, scan_nstep=nstep,
-                    scan_nstep_median=nstep_median, scan_nstep_max=nstep_max)
+                    scan_nstep_median=nstep_median, scan_nstep_max=nstep_max,
+                    slot_time=slot_time, scan_origin=scan_origin, time_record=time_record,
+                    slots_from_interval=by_slot)
 
 
 def _sort_order(vs: VisSummary) -> np.ndarray:
@@ -539,14 +705,22 @@ def noise_scale(vs: VisSummary, geom: Geometry) -> Dict[int, Dict[str, Any]]:
     integrations. ``s`` is the mean ratio; ``s = 1`` means WEIGHT is right
     for the summed unit. Without any pair the spw gets ``s = 1``
     (``"method": "assumed"``).
+
+    Adjacent integrations are adjacent slots of :func:`geometry` (ASEBI SPEC
+    4 item 4, D38 e: time-averaged data whose rows carry different TIMEs in
+    one bin gave no pair at all before); without INTERVAL, rows less than
+    1.5 integration times apart, as before.
     """
     order = _sort_order(vs)
     t = vs.time[order]
     same = ((vs.obs[order][1:] == vs.obs[order][:-1]) & (vs.spw[order][1:] == vs.spw[order][:-1])
             & (vs.a1[order][1:] == vs.a1[order][:-1]) & (vs.a2[order][1:] == vs.a2[order][:-1])
             & (vs.scan[order][1:] == vs.scan[order][:-1]))
-    it = np.array([geom.int_time[int(o)] for o in vs.obs[order][1:]]) if vs.n_rows > 1 else np.ones(0)
-    adjacent = same & (np.diff(t) < 1.5 * it) & (np.diff(t) > 0)
+    o2 = vs.obs[order][1:]
+    it = np.array([geom.int_time[int(o)] for o in o2]) if vs.n_rows > 1 else np.ones(0)
+    by_slot = np.array([geom.slots_from_interval.get(int(o), False) for o in o2], dtype=bool)
+    adjacent = same & np.where(by_slot, np.diff(geom.k_in_scan[order]) == 1,
+                               (np.diff(t) < 1.5 * it) & (np.diff(t) > 0))
     P = vs.P[order]
     y = vs.y[order]
     ok = adjacent & (P[1:] > 0) & (P[:-1] > 0)
@@ -971,19 +1145,22 @@ def solution_units(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine
 
     Spec: 10.2 item 3 (fractional intervals at scan ends), P18 3.3 (gaincal
     re-partitions at scan boundaries), 10.2 item 14 (table and data times
-    matched by nearest).
+    matched by nearest); D38 (time audit 2026-10-16, item 5).
 
     "eb": one interval per observation (``combine='scan'``); "scan": one
     per scan; "int": gaincal's fixed time grid inside each scan,
-    ``floor((t - t_first)/solint)`` (``'int'``: every integration).
-    The solution time is the mean of the integration times of the unit
-    (that of the rows in ``rows`` when given, e.g. the training half).
+    ``floor((t - t_first)/solint)`` of each row's own TIME, with ``t_first``
+    the first row of the scan, fully flagged rows included
+    (``Geometry.scan_origin``; ``'int'``: every distinct TIME).
+    The solution time is the mean of the integration (slot) times of the
+    unit (that of the rows in ``rows`` when given, e.g. the training half).
+    ``n_times``: integrations (slots) per unit.
     """
     key = (cand["kind"], cand.get("n_int"), cand.get("gaincal_solint"), bool(combine_spw),
            vs.n_rows)
     base = geom.cache.get(key)
     if base is None:
-        base = _unit_assignment(vs, cand, combine_spw)
+        base = _unit_assignment(vs, geom, cand, combine_spw)
         geom.cache[key] = base
     of_row, ukey, pair_unit, pair_time, pair_row, n_times = base
     nu = ukey.shape[1]
@@ -998,8 +1175,8 @@ def solution_units(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine
     return Units(of_row=of_row, time=utime, obs=ukey[0], group=ukey[1], n_times=n_times)
 
 
-def _unit_assignment(vs: VisSummary, cand: Dict[str, Any], combine_spw: bool):
-    """Row -> unit of a candidate and the (unit, integration) pairs (cached per run)."""
+def _unit_assignment(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine_spw: bool):
+    """Row -> unit of a candidate and the (unit, integration slot) pairs (cached per run)."""
     group = vs.spw.copy() if not combine_spw else np.full(vs.n_rows, -1, dtype=np.int64)
     kind = cand["kind"]
     if kind == "eb":
@@ -1020,7 +1197,8 @@ def _unit_assignment(vs: VisSummary, cand: Dict[str, Any], combine_spw: bool):
                 if per_int:
                     chunk = np.arange(st.size, dtype=np.int64)
                 else:
-                    chunk = np.floor((st - st[0]) / solint).astype(np.int64)
+                    first = geom.scan_origin.get((int(o), int(sc)), float(st[0]))
+                    chunk = np.floor((st - first) / solint).astype(np.int64)
                 sub[sel] = chunk[np.searchsorted(st, vs.time[sel])]
     else:
         raise ValueError(f"unknown candidate kind {kind!r}")
@@ -1033,12 +1211,15 @@ def _unit_assignment(vs: VisSummary, cand: Dict[str, Any], combine_spw: bool):
     ucode, first_u, of_row = np.unique(codes, return_index=True, return_inverse=True)
     of_row = np.asarray(of_row).ravel()
     ukey = np.stack([c[first_u] for c in cols])
-    utime, tinv = np.unique(vs.time, return_inverse=True)
+    # (unit, integration slot) pairs, ordered by unit and slot time; unaveraged data:
+    # the slots are the distinct times
+    slot_t = geom.slot_time if geom.slot_time is not None else vs.time
+    utime, tinv = np.unique(slot_t, return_inverse=True)
     tinv = np.asarray(tinv).ravel()
     pcode = of_row.astype(np.int64) * max(utime.size, 1) + tinv
     _, first = np.unique(pcode, return_index=True)
     pair_unit = of_row[first]
-    pair_time = vs.time[first]
+    pair_time = slot_t[first]
     n_times = np.bincount(pair_unit, minlength=ucode.size).astype(np.int64)
     return of_row, ukey, pair_unit, pair_time, first, n_times
 
