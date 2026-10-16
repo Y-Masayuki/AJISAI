@@ -740,9 +740,14 @@ def noise_scale(vs: VisSummary, geom: Geometry) -> Dict[int, Dict[str, Any]]:
             & (vs.a1[order][1:] == vs.a1[order][:-1]) & (vs.a2[order][1:] == vs.a2[order][:-1])
             & (vs.scan[order][1:] == vs.scan[order][:-1]))
     o2 = vs.obs[order][1:]
-    it = np.array([geom.int_time[int(o)] for o in o2]) if vs.n_rows > 1 else np.ones(0)
-    by_slot = np.array([geom.slots_from_interval.get(int(o), False) for o in o2], dtype=bool)
-    adjacent = same & np.where(by_slot, np.diff(geom.k_in_scan[order]) == 1,
+    n_lut = int(vs.obs.max()) + 1 if vs.n_rows else 1
+    it_lut = np.ones(n_lut)
+    slot_lut = np.zeros(n_lut, dtype=bool)
+    for o, v in geom.int_time.items():
+        it_lut[int(o)] = v
+        slot_lut[int(o)] = bool(geom.slots_from_interval.get(int(o), False))
+    it = it_lut[o2]
+    adjacent = same & np.where(slot_lut[o2], np.diff(geom.k_in_scan[order]) == 1,
                                (np.diff(t) < 1.5 * it) & (np.diff(t) > 0))
     P = vs.P[order]
     y = vs.y[order]
