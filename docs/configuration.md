@@ -263,8 +263,11 @@ the lines you need.
 
 `reffreq: Optional[str] = None`
 :   Reference frequency of the Taylor expansion, e.g. `"227.0GHz"`, passed
-    to every tclean. `None` uses CASA's default (the middle of the
-    frequency range); the value used is recorded with each solve.
+    to every mtmfs tclean (`nterms > 1`); nterms = 1 images and the dirty
+    image are made without it, so that their frequency axis is the data's
+    band (tclean centres the axis on reffreq). `None` uses CASA's default
+    (the middle of the frequency range); the value used is recorded with
+    each solve.
 
 ### Image geometry
 

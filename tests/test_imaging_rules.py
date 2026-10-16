@@ -229,6 +229,42 @@ def test_consistency_detects_bad_frequency_axis():
     assert any("reference frequency" in p for p in problems)
 
 
+DATA = (215.9688e9, 233.9375e9)            # TOPO channel edges (ASEBI d38b R1 'equal' layout)
+
+
+def test_axis_without_reffreq_must_be_the_data_range():
+    """ASEBI SPEC 10.3 (D38 h), the rule of ASEBI's engines.common.axis_problems."""
+    from ajisai.core import axis_problems
+    lo, hi = DATA
+    # what tclean wrote (LSRK, -14 MHz): passes the exact test
+    assert axis_problems(224.9383e9, 17.9676e9, lo, hi, exact=True) == []
+    # a narrower axis (half the band dropped) fails both tests
+    bad = axis_problems(229.0e9, 10.0e9, lo, hi, exact=True)
+    assert any("does not cover" in p for p in bad) and any("without reffreq" in p for p in bad)
+    # Mac CASA 6.5.1 garbage: crval 0, or an axis that covers everything
+    assert "not finite/positive" in axis_problems(0.0, 9.27716e242, lo, hi, exact=True)[0]
+    wide = axis_problems(62.4537e9, 342.893e9, lo, hi, exact=True)
+    assert len(wide) == 1 and "without reffreq" in wide[0]
+    assert axis_problems(62.4537e9, 342.893e9, lo, hi) == []          # the cover test let it through
+
+
+def test_axis_with_reffreq_sees_the_far_edge_only():
+    from ajisai.core import axis_problems
+    lo, hi = 216.03e9, 233.94e9
+    ref = 218.0e9
+    w = 2.0 * max(abs(lo - ref), abs(hi - ref))
+    assert axis_problems(ref, w, lo, hi, reffreq_hz=ref, exact=True) == []
+    # only the 232-234 GHz spw imaged, reffreq near the dropped side: the same axis; sumwt sees it
+    assert axis_problems(ref, 2.0 * (233.94e9 - ref), lo, hi, reffreq_hz=ref, exact=True) == []
+    assert axis_problems(ref, 2.0 * (225.0e9 - ref), lo, hi, reffreq_hz=ref, exact=True)
+    assert axis_problems(ref, 3.1e231, lo, hi, reffreq_hz=ref, exact=True)
+    assert axis_problems(62.45e9, w, lo, hi, reffreq_hz=ref, exact=True)
+    # the audit's selection case: a third of the weight gridded
+    p = imaging_consistency_problems(218e9, 31.84e9, 10.0, lo, hi, reffreq_hz=218e9,
+                                     exact_axis=True, expected_sumwt=30.0)
+    assert len(p) == 1 and "0.333333" in p[0]
+
+
 def test_model_zero_channels():
     absmax = [0.06, 0.0, 0.05, 0.0, float("nan")]
     n_unflagged = [10, 10, 0, 0, 3]

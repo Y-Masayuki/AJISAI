@@ -230,6 +230,26 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **The post-tclean range check was fooled by an off-centre reffreq; sumwt
+  is now compared with the data's weights** (ASEBI SPEC 10.3, D38 h;
+  convention audit 2026-10-16, spectral item 2). tclean centres an image's
+  frequency axis on reffreq and makes it `2 max|edge - reffreq|` wide, and
+  AJISAI passed `reffreq` to every tclean, the dirty image and nterms = 1
+  images included: with data from 216 to 234 GHz, an image of the 233 GHz
+  spw alone covered the band with reffreq 218 GHz and passed. Now `reffreq`
+  goes to mtmfs images only; the axis check is exact (the data's band without
+  reffreq, two-sided; `reffreq +- max|edge - reffreq|` with it), which also
+  stops the meaningless axes CASA 6.5.1 on a Mac writes for spws of unequal
+  channel counts; a natural-weighted reference image of the working MS
+  without reffreq (`checks` kind `reference`) and every natural-weighted
+  Stokes I image compare `sumwt` with the data's Stokes I weight sum
+  (`ms_utils.stokes_i_weight_sum`: `w_p + w_q` over the rows without
+  FLAG_ROW and the channels with both parallel hands unflagged,
+  WEIGHT_SPECTRUM where defined; CASA 6.5.1 equal to < 1e-8 in nine layouts,
+  `tests/test_casa_imaging_checks.py`; tolerance `SUMWT_RTOL = 1e-5`). The
+  same rule as ASEBI's engine checks (`asebi.engines.common`, d38b 1e6e80b):
+  `axis_problems`, `sumwt_problems`, `imaging_consistency_problems(...,
+  reffreq_hz=, exact_axis=, expected_sumwt=)`.
 - **Final-image flux bookkeeping as ASEBI SPEC 10.4 item 9 (D18 I3)**
   (convention audit 2026-10-16, combine item 8). `aperture_flux_terms` took
   Omega_R as the PSF volume within a circle of the aperture's area, sigma as

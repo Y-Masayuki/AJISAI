@@ -284,7 +284,7 @@ def test_tclean_passes_geometry_nterms_reffreq_and_never_saves_a_model(tmp_path,
         tmp_path, monkeypatch,
         imaging=ImagingConfig(nterms=2, reffreq="227.0GHz", mask_mode="user",
                               user_mask="/data/region.crtf"))
-    aj._check_imaging_consistency = lambda base, nterms: events.append(("check", str(base), nterms))
+    aj._check_imaging_consistency = lambda base, nterms, **kw: events.append(("check", str(base), nterms))
     mask = aj._build_usemask_kwargs()
     nterms = aj._tclean("a.ms", "img", niter=100, threshold_jy=3e-5, mask_kwargs=mask)
     kw = tasks.named("tclean")[0]
@@ -300,11 +300,54 @@ def test_tclean_passes_geometry_nterms_reffreq_and_never_saves_a_model(tmp_path,
 
 def test_dirty_image_is_hogbom(tmp_path, monkeypatch):
     aj, tasks, events, vis = _pipeline(tmp_path, monkeypatch, imaging=ImagingConfig(nterms=2))
-    aj._check_imaging_consistency = lambda base, nterms: events.append(("check", nterms))
+    aj._check_imaging_consistency = lambda base, nterms, **kw: events.append(("check", nterms))
     assert aj._tclean("a.ms", "dirty", niter=0, threshold_jy=0.0, dirty=True) == 1
     kw = tasks.named("tclean")[0]
     assert kw["deconvolver"] == "hogbom" and "nterms" not in kw
     assert ("check", 1) in events
+
+
+@pytest.mark.parametrize("nterms, dirty, passed", [(2, False, True), (2, True, False),
+                                                    (1, False, False)])
+def test_reffreq_only_for_mtmfs(tmp_path, monkeypatch, nterms, dirty, passed):
+    """ASEBI SPEC 10.3 (D38 h): tclean centres the frequency axis on reffreq, so it is passed only
+    where it has an effect (mtmfs); the dirty image and nterms = 1 images keep the data's band."""
+    aj, tasks, events, vis = _pipeline(tmp_path, monkeypatch,
+                                       imaging=ImagingConfig(nterms=nterms, reffreq="218.0GHz"))
+    aj._tclean("a.ms", "img", niter=0 if dirty else 100, threshold_jy=0.0, dirty=dirty,
+               check=False)
+    kw = tasks.named("tclean")[0]
+    assert ("reffreq" in kw) is passed
+    if passed:
+        assert kw["reffreq"] == "218.0GHz" and kw["deconvolver"] == "mtmfs"
+
+
+def test_tclean_check_gets_reffreq_weighting_and_stokes(tmp_path, monkeypatch):
+    """The post-tclean check knows what tclean was given (ASEBI SPEC 10.3, D38 h)."""
+    aj, tasks, events, vis = _pipeline(tmp_path, monkeypatch,
+                                       imaging=ImagingConfig(nterms=2, reffreq="218.0GHz",
+                                                             uvtaper=("0.1arcsec",)))
+    seen = []
+    aj._check_imaging_consistency = lambda base, nterms, **kw: seen.append((nterms, kw))
+    aj._tclean("a.ms", "img", niter=100, threshold_jy=0.0)
+    aj._tclean("a.ms", "dirty", niter=0, threshold_jy=0.0, dirty=True, stokes="Q")
+    assert seen[0] == (2, {"vis": "a.ms", "reffreq_hz": 218.0e9, "weighting": "briggs+uvtaper",
+                           "stokes": "I"})
+    assert seen[1] == (1, {"vis": "a.ms", "reffreq_hz": None, "weighting": "briggs+uvtaper",
+                           "stokes": "Q"})
+
+
+def test_sumwt_problems():
+    """ASEBI SPEC 10.3 (D38 h): the same rule and tolerance as ASEBI's engines.common."""
+    from ajisai.core import SUMWT_RTOL, sumwt_problems
+    assert SUMWT_RTOL == 1e-5
+    exp = 5.958714e6
+    assert sumwt_problems(10.0) == [] and "no data were gridded" in sumwt_problems(0.0)[0]
+    assert sumwt_problems(exp * (1 + 4e-8), exp) == []
+    p = sumwt_problems(exp * (1 - 1.0 / 512), exp)       # one channel of 4 spws x 128 channels
+    assert len(p) == 1 and "weight is missing" in p[0]
+    assert "more weight" in sumwt_problems(exp * 1.001, exp)[0]
+    assert sumwt_problems(1.0, 0.0) and sumwt_problems(float("nan"), 1.0)
 
 
 def test_user_crtf_mask_for_every_tclean(tmp_path, monkeypatch):

@@ -695,6 +695,87 @@ def weight_column_queries(colnames, query: str) -> List[Tuple[str, str]]:
             (f"({query}) && !ISDEFINED(WEIGHT_SPECTRUM)", "WEIGHT")]
 
 
+def stokes_i_weight_sum(vis: str, field: Optional[str] = None,
+                        chunk_samples: int = _CHUNK_SAMPLES) -> Dict[str, Any]:
+    """The sumwt a natural-weighted Stokes I image of the field must have.
+
+    ASEBI SPEC 10.3 (D38 h: sumwt is compared with the value expected from the
+    data's Stokes I weights; the formula pinned by casa tests). tclean's
+    natural-weighting sumwt (mfs, and tt0 of mtmfs, with or without reffreq)
+    is the sum, over the cross-correlation rows without FLAG_ROW and the
+    channels where both parallel hands are unflagged, of ``w_p + w_q``
+    (with a single parallel hand, ``w_p``), WEIGHT_SPECTRUM on the rows where
+    it is defined and WEIGHT elsewhere (:func:`weight_column_queries`); a
+    zero weight is not a flag, autocorrelations do not count. The same rule
+    as ASEBI's ``engines.common.stokes_i_weight_sum`` (ASEBI d38b 1e6e80b;
+    AJISAI selects the imaged field). CASA 6.5.1: equal to < 1e-8 with
+    unequal hand weights, one-hand and channel flags, per-channel weights
+    (``tests/test_casa_imaging_checks.py``). Returns ``expected_sumwt``, the
+    sum per spw, ``n_rows``, ``n_samples`` and ``weight_column``.
+    """
+    _require_casa()
+    from .solint import PARALLEL_HANDS
+
+    fid = _field_id_for(vis, field)
+    dd_spw = _casa_column_reader(vis + "/DATA_DESCRIPTION", "SPECTRAL_WINDOW_ID")
+    dd_pol = _casa_column_reader(vis + "/DATA_DESCRIPTION", "POLARIZATION_ID")
+    tb = casatools.table()
+    tb.open(vis + "/POLARIZATION")
+    try:
+        corr = [np.asarray(tb.getcell("CORR_TYPE", i)).ravel() for i in range(tb.nrows())]
+    finally:
+        tb.close()
+    total = 0.0
+    per_spw: Dict[int, float] = {}
+    n_rows = n_samples = 0
+    used = set()
+    tb.open(vis)
+    try:
+        cols = tb.colnames()
+        for dd in range(len(dd_spw)):
+            par = [i for i, c in enumerate(corr[int(dd_pol[dd])]) if int(c) in PARALLEL_HANDS][:2]
+            if not par:                         # no parallel hand: no Stokes I sample
+                continue
+            query = f"DATA_DESC_ID=={dd} && ANTENNA1!=ANTENNA2 && !FLAG_ROW"
+            if fid is not None:
+                query += f" && FIELD_ID=={fid}"
+            spw = int(dd_spw[dd])
+            for q, wcol in weight_column_queries(cols, query):
+                sub = tb.query(q, columns=f"FLAG,{wcol}")
+                try:
+                    nrow = sub.nrows()
+                    if nrow == 0:
+                        continue
+                    used.add(wcol)
+                    npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
+                    chunk = max(1, chunk_samples // max(1, npol * nchan))
+                    for start in range(0, nrow, chunk):
+                        nr = min(chunk, nrow - start)
+                        f = np.asarray(sub.getcol("FLAG", start, nr), dtype=bool)
+                        ok = ~f[par[0]] & ~f[par[-1]]           # (nchan, nrow): both hands unflagged
+                        w = np.asarray(sub.getcol(wcol, start, nr), dtype=np.float64)
+                        ww = w[par[0]] + w[par[1]] if len(par) == 2 else w[par[0]]
+                        if ww.ndim == 1:                        # WEIGHT: the same for every channel
+                            s_chunk = float(np.sum(ww * ok.sum(axis=0)))
+                        else:
+                            s_chunk = float(np.sum(ww[ok]))
+                        total += s_chunk
+                        per_spw[spw] = per_spw.get(spw, 0.0) + s_chunk
+                        n_rows += nr
+                        n_samples += int(ok.sum())
+                finally:
+                    sub.close()
+    finally:
+        tb.close()
+    return {"expected_sumwt": total, "per_spw": {str(k): v for k, v in sorted(per_spw.items())},
+            "n_rows": n_rows, "n_samples": n_samples,
+            "weight_column": (" and ".join(sorted(used)) + (" (per row)" if len(used) > 1 else "")
+                              if used else None),
+            "rule": ("sum over the cross-correlation rows without FLAG_ROW and the channels where "
+                     "both parallel hands are unflagged of w_p + w_q (WEIGHT_SPECTRUM where "
+                     "defined, else WEIGHT) = tclean's natural-weighting Stokes I sumwt")}
+
+
 def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = False,
                      chunk_samples: int = _CHUNK_SAMPLES):
     """Read DATA, MODEL_DATA, WEIGHT and FLAG of a field once into an ``ajisai.solint.VisSummary``.

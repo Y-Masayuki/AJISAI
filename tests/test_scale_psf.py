@@ -185,7 +185,7 @@ def _scales_pipeline(tmp_path, monkeypatch, psf, imaging):
         assert str(path).endswith("intermediate/dirty.psf")
         return psf
     monkeypatch.setattr(core, "_read_image_plane", read)
-    aj._check_imaging_consistency = lambda base, nterms: None
+    aj._check_imaging_consistency = lambda base, nterms, **kw: None
     return aj, tasks, reads
 
 

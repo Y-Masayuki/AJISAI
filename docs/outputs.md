@@ -237,7 +237,10 @@ decision AJISAI made. Top-level keys:
     `solint` and `solint_s`, `combine`, `refant`, `field` (the gaincal
     field selection), `calmode`, `gaintype`,
     `minsnr`, `minblperant`, `solnorm`, `applycal` (`interp`, `applymode`,
-    `calwt`, `spwmap`), `model_image` / `model_nterms` / `model_reffreq_hz`
+    `calwt`, `spwmap`, and with combined spws `spwmap_per_observation`: the
+    map of each observation from the spw labels in the table; `spwmap` is
+    `[]` when the table was applied per observation), `model_image` /
+    `model_nterms` / `model_reffreq_hz`
     (the model the solve used), `solved_on`, `stage_ms`, `n_solutions`, and
     `flagged_solution_fraction` per observation and spw. The same list is
     `AJISAI.stages`; the keys of `solve` are `ajisai.SOLVE_INFO_KEYS`.
@@ -283,9 +286,14 @@ decision AJISAI made. Top-level keys:
       only for phase stages).
 
 `checks`
-:   The consistency check after every `tclean` (the image's frequency band
-    covers the data's frequency range; `sumwt > 0`), the model check of the
-    initial CLEAN (`clean_model`: the model has a component) and every model
+:   The consistency check after every `tclean` (`tclean`: the image's
+    frequency axis is what tclean writes for the data, the data's band without
+    reffreq and `reffreq +- max|edge - reffreq|` with it; `sumwt > 0`, and for
+    natural weighting equal to the data's Stokes I weight sum, `sumwt_ratio`),
+    the reffreq-free natural-weighted reference image of the working MS
+    (`reference`: the axis two-sided and `sumwt` = the sum of `w_p + w_q` over
+    the unflagged parallel hands, to 1e-5), the model check of the initial
+    CLEAN (`clean_model`: the model has a component) and every model
     prediction (`MODEL_DATA` non-zero on every unflagged channel). A failed
     check stops the run with `RuntimeError`.
 

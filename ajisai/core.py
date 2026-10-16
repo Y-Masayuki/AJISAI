@@ -90,6 +90,7 @@ from .ms_utils import (
     get_dish_diameter_m,
     pick_cell_imsize,
     read_vis_summary,
+    stokes_i_weight_sum,
     SKY_FRAMES,
     parse_ra_dec,
     rad_to_radec,
@@ -1042,6 +1043,57 @@ def spectral_cover_increment(ref_hz: float, inc_hz: float, lo_hz: float, hi_hz: 
     return math.copysign(need, float(inc_hz) if float(inc_hz) != 0.0 else 1.0)
 
 
+def axis_problems(ref_freq_hz: float, width_hz: float, data_fmin_hz: Optional[float],
+                  data_fmax_hz: Optional[float], tolerance: float = _DOPPLER_TOLERANCE, *,
+                  reffreq_hz: Optional[float] = None, exact: bool = False) -> List[str]:
+    """Problems of an MFS image's frequency axis against the data's channel edges ([] if consistent).
+
+    ASEBI SPEC 10.3 (D38 h); the same rule as ASEBI's ``engines.common.axis_problems``.
+    Always: the axis is finite and positive and its single channel
+    ``[ref - |width|/2, ref + |width|/2]`` covers the data's range within the
+    LSRK/TOPO tolerance (``tolerance`` x the highest frequency). ``exact`` adds
+    what tclean writes: without reffreq the axis is the data's range (its
+    centre and width; two-sided, so a drop at either edge shows), with
+    reffreq it is ``reffreq +- max|edge - reffreq|`` (only the edge far from
+    reffreq can show: the data 216-234 GHz imaged from the 233 GHz spw alone
+    with reffreq 218 GHz has the axis of the whole band, audit 2026-10-16).
+    The exact test also stops the meaningless axes CASA 6.5.1 on a Mac
+    writes for spws of unequal channel counts (crval 62 GHz, width 343 GHz,
+    which covers everything).
+    """
+    problems: List[str] = []
+    if not (np.isfinite(ref_freq_hz) and ref_freq_hz > 0):
+        problems.append(f"reference frequency is not finite/positive ({ref_freq_hz!r})")
+    if not (np.isfinite(width_hz) and width_hz != 0):
+        problems.append(f"frequency width is not finite/non-zero ({width_hz!r})")
+    if problems or data_fmin_hz is None or data_fmax_hz is None:
+        return problems
+    half = abs(width_hz) / 2.0
+    lo, hi = ref_freq_hz - half, ref_freq_hz + half
+    tol = tolerance * data_fmax_hz
+    if lo > data_fmin_hz + tol or hi < data_fmax_hz - tol:
+        problems.append(
+            f"image band {lo / 1e9:.6f}-{hi / 1e9:.6f} GHz does not cover the data "
+            f"{data_fmin_hz / 1e9:.6f}-{data_fmax_hz / 1e9:.6f} GHz (channels dropped)")
+    if not exact:
+        return problems
+    w = abs(width_hz)
+    if reffreq_hz:
+        want = 2.0 * max(abs(data_fmin_hz - reffreq_hz), abs(data_fmax_hz - reffreq_hz))
+        if abs(ref_freq_hz - reffreq_hz) > tol or abs(w - want) > 2.0 * tol:
+            problems.append(
+                f"image axis {ref_freq_hz / 1e9:.6f} GHz, width {w / 1e9:.6f} GHz is not reffreq "
+                f"{reffreq_hz / 1e9:.6f} GHz +- max|data edge - reffreq| (width {want / 1e9:.6f} GHz): "
+                f"tclean's frequency range is wrong")
+    elif (abs(ref_freq_hz - 0.5 * (data_fmin_hz + data_fmax_hz)) > tol
+          or abs(w - (data_fmax_hz - data_fmin_hz)) > 2.0 * tol):
+        problems.append(
+            f"image band {lo / 1e9:.6f}-{hi / 1e9:.6f} GHz of an image made without reffreq is not "
+            f"the data's {data_fmin_hz / 1e9:.6f}-{data_fmax_hz / 1e9:.6f} GHz: tclean's frequency "
+            f"range is wrong (channels dropped, or a meaningless axis)")
+    return problems
+
+
 def imaging_consistency_problems(
     ref_freq_hz: float,
     width_hz: float,
@@ -1049,32 +1101,55 @@ def imaging_consistency_problems(
     data_fmin_hz: Optional[float],
     data_fmax_hz: Optional[float],
     tolerance: float = _DOPPLER_TOLERANCE,
+    *,
+    reffreq_hz: Optional[float] = None,
+    exact_axis: bool = False,
+    expected_sumwt: Optional[float] = None,
 ) -> List[str]:
     """Problems with an MFS image made by tclean ([] if consistent).
 
-    1. The frequency axis is finite and positive.
-    2. The image's single channel ``[ref - width/2, ref + width/2]`` covers
-       the data's frequency range (within the LSRK/TOPO Doppler tolerance).
-       A narrower band means tclean dropped channels (seen with spws of
-       different channel counts in CASA 6.5/6.7).
-    3. ``sumwt > 0`` (some data were gridded).
+    ASEBI SPEC 10.3 (D38 h). 1. The frequency axis (:func:`axis_problems`;
+    ``exact_axis`` with the reffreq given to tclean, if any). 2. ``sumwt >
+    0`` (some data were gridded) and, for a natural-weighted Stokes I image,
+    equal to ``expected_sumwt`` (:func:`sumwt_problems`).
     """
-    problems = []
-    if not (np.isfinite(ref_freq_hz) and ref_freq_hz > 0):
-        problems.append(f"reference frequency is not finite/positive ({ref_freq_hz!r})")
-    if not (np.isfinite(width_hz) and width_hz != 0):
-        problems.append(f"frequency width is not finite/non-zero ({width_hz!r})")
-    if not problems and data_fmin_hz is not None and data_fmax_hz is not None:
-        half = abs(width_hz) / 2.0
-        lo, hi = ref_freq_hz - half, ref_freq_hz + half
-        tol = tolerance * data_fmax_hz
-        if lo > data_fmin_hz + tol or hi < data_fmax_hz - tol:
-            problems.append(
-                f"image band {lo / 1e9:.6f}-{hi / 1e9:.6f} GHz does not cover the data "
-                f"{data_fmin_hz / 1e9:.6f}-{data_fmax_hz / 1e9:.6f} GHz (channels dropped)")
+    return (axis_problems(ref_freq_hz, width_hz, data_fmin_hz, data_fmax_hz, tolerance,
+                          reffreq_hz=reffreq_hz, exact=exact_axis)
+            + sumwt_problems(sumwt, expected_sumwt))
+
+
+#: |sumwt / expected - 1| allowed for a natural-weighted Stokes I image (ASEBI SPEC 10.3,
+#: D38 h; the same tolerance as ASEBI): measured < 1e-8 (CASA 6.5.1,
+#: tests/test_casa_imaging_checks.py); one channel of four 128-channel spws is 2e-3.
+SUMWT_RTOL = 1.0e-5
+
+
+def sumwt_problems(sumwt: float, expected: Optional[float] = None,
+                   rtol: float = SUMWT_RTOL) -> List[str]:
+    """``sumwt > 0`` and, given ``expected``, equal to the data's Stokes I weight sum ([] if so).
+
+    ASEBI SPEC 10.3 (D38 h), the same rule as ASEBI's
+    ``engines.common.sumwt_problems``. ``expected`` is
+    :func:`ajisai.ms_utils.stokes_i_weight_sum` for a natural-weighted Stokes I
+    image (Briggs and uniform weighting or a uv taper have no such relation):
+    a tclean that gridded only part of the channels (CASA 6.5/6.7 with spws of
+    different channel counts) has a smaller sumwt, also when an off-centre
+    reffreq makes the image's axis cover the whole band.
+    """
     if not (np.isfinite(sumwt) and sumwt > 0):
-        problems.append(f"sumwt is not positive ({sumwt!r}): no data were gridded")
-    return problems
+        return [f"sumwt is not positive ({sumwt!r}): no data were gridded"]
+    if expected is None:
+        return []
+    if not (np.isfinite(expected) and expected > 0):
+        return [f"the data hold no unflagged Stokes I weight (expected sumwt {expected!r}) but "
+                f"tclean gridded {sumwt:.6g}"]
+    ratio = float(sumwt) / float(expected)
+    if abs(ratio - 1.0) > rtol:
+        what = ("weight is missing: channels or rows of the MS were not gridded" if ratio < 1.0
+                else "more weight than the MS holds")
+        return [f"sumwt {sumwt:.8g} is {ratio:.6f} x the data's Stokes I weight sum {expected:.8g}: "
+                f"{what} (tolerance {rtol:g})"]
+    return []
 
 
 def model_zero_channels(absmax_by_chan, n_unflagged_by_chan) -> List[int]:
@@ -1775,7 +1850,9 @@ class AJISAI:
            MS is only read (a relabelled copy is made if needed).
         4. Compute imaging parameters (cell from u_max, imsize from the
            primary beam of the smallest dish).
-        5. Make dirty image (beam and peak).
+        5. Make dirty image (beam and peak); check that tclean grids all the
+           data (a natural-weighted reference image without reffreq: the
+           frequency range and sumwt).
         6. Apply phase shift if requested (off by default).
         7. Measure the thermal noise sigma_th on a signal-free dirty image.
         8. Derive the multiscale scales from the beam and the mask region.
@@ -1800,6 +1877,7 @@ class AJISAI:
             self._inspect_ms()
             self._compute_imaging_params()
             self._make_dirty_image()
+            self._check_reference_image()
             self._apply_phase_shift_if_requested()
             self._measure_noise()
             self._compute_scales()
@@ -3870,9 +3948,10 @@ Infrastructure
     ) -> int:
         """Every tclean of a run goes through here.
 
-        Uses the run's cell, imsize, weighting, gridder, reffreq and the
+        Uses the run's cell, imsize, weighting, gridder and the
         deconvolver/nterms/scales of ``ImagingConfig`` (``mtmfs`` when
-        ``nterms > 1``); ``dirty=True`` makes a ``hogbom`` niter=0 image.
+        ``nterms > 1``), and ``reffreq`` for ``mtmfs`` only (ASEBI SPEC 10.3,
+        D38 h); ``dirty=True`` makes a ``hogbom`` niter=0 image.
         ``savemodel`` defaults to ``'none'``: tclean never writes to the MS
         (models are predicted explicitly by :meth:`_predict_model`). After
         the call the image is checked (:meth:`_check_imaging_consistency`).
@@ -3901,13 +3980,17 @@ Infrastructure
             field=self._derived["resolved_field_id"],
             interactive=False,
         )
-        if img.reffreq:
-            kw["reffreq"] = img.reffreq
         if dirty:
             kw["deconvolver"] = "hogbom"
         else:
             kw.update(_deconvolver_kwargs(img.deconvolver, img.nterms,
                                           self._derived.get("scales")))
+        # reffreq only where it means something: the Taylor expansion of mtmfs. tclean centres the
+        # image's frequency axis on it, so with an off-centre reffreq the range check of an image
+        # sees only the far edge (ASEBI SPEC 10.3, D38 h); nterms = 1 images and the dirty image
+        # keep the axis on the data's band.
+        if img.reffreq and kw.get("deconvolver") == "mtmfs":
+            kw["reffreq"] = img.reffreq
         kw.update(mask_kwargs or {})
         kw.update(extra)
         if kw.get("interactive") and cfg.caller == "asebi":
@@ -3916,7 +3999,12 @@ Infrastructure
         casatasks.tclean(**kw)
         nterms = int(kw.get("nterms", 1)) if kw.get("deconvolver") == "mtmfs" else 1
         if check:
-            self._check_imaging_consistency(imagename, nterms)
+            weighting = str(kw.get("weighting") or "natural")
+            if any(str(t) for t in (kw.get("uvtaper") or [])):
+                weighting += "+uvtaper"        # a taper scales the weights: no sumwt relation
+            self._check_imaging_consistency(
+                imagename, nterms, vis=str(vis), reffreq_hz=_freq_quantity_hz(kw.get("reffreq")),
+                weighting=weighting, stokes=str(kw.get("stokes") or "I"))
         return nterms
 
     def _check_clean_model(self, imagebase, nterms: int, threshold_jy: float, label: str) -> None:
@@ -3947,34 +4035,101 @@ Infrastructure
         if problem:
             raise RuntimeError(f"[AJISAI] {label} of {imagebase}: {problem}")
 
-    def _check_imaging_consistency(self, imagebase, nterms: int) -> None:
-        """Post-tclean check: frequency axis covers the data, sumwt > 0.
+    def _check_imaging_consistency(self, imagebase, nterms: int, vis: Optional[str] = None,
+                                   reffreq_hz: Optional[float] = None,
+                                   weighting: Optional[str] = None, stokes: str = "I") -> None:
+        """Post-tclean check (ASEBI SPEC 10.3, D38 h; ASEBI's ``check_imaging`` rule).
 
-        Raises RuntimeError on failure (an image made from a subset of the
-        channels, or from no data, must never feed a self-cal solve).
+        The frequency axis is finite and is exactly what tclean writes for the
+        data (:func:`axis_problems`: the data's range without reffreq, which
+        sees a drop at either edge; ``reffreq +- max|edge - reffreq|`` with
+        it, which sees only the far edge); sumwt > 0 and, for a natural-weighted
+        Stokes I image of ``vis``, equal to the data's Stokes I weight sum
+        (:func:`sumwt_problems`). Raises RuntimeError on failure (an image made
+        from a subset of the channels, or from no data, must never feed a
+        self-cal solve).
         """
         image = _image_name(imagebase, nterms, "image")
         sumwt_image = _image_name(imagebase, nterms, "sumwt")
         ref_hz, width_hz = _image_spectral_axis(image)
         sumwt = float(np.nansum(_read_image_plane(sumwt_image)))
+        expected = None
+        if vis is not None and str(stokes).upper() == "I" and str(weighting).lower() == "natural":
+            expected = self._expected_sumwt(vis)
         problems = imaging_consistency_problems(
             ref_hz, width_hz, sumwt,
             self._derived.get("data_fmin_hz"), self._derived.get("data_fmax_hz"),
+            reffreq_hz=reffreq_hz, exact_axis=True, expected_sumwt=expected,
         )
-        self.justification["checks"].append({
+        rec = {
             "kind": "tclean",
             "image": image,
+            "vis": vis,
             "ref_freq_hz": ref_hz,
             "width_hz": width_hz,
+            "reffreq_hz": reffreq_hz,
+            "axis_check": ("exact about reffreq (sees the far edge only)" if reffreq_hz else
+                           "exact: the data's range (no reffreq)"),
             "data_fmin_hz": self._derived.get("data_fmin_hz"),
             "data_fmax_hz": self._derived.get("data_fmax_hz"),
+            "stokes": stokes,
+            "weighting": weighting,
             "sumwt": sumwt,
+            "expected_sumwt": expected,
+            "sumwt_ratio": sumwt / expected if expected else None,
             "ok": not problems,
             "problems": problems,
-        })
+        }
+        self.justification["checks"].append(rec)
         if problems:
             raise RuntimeError(f"[AJISAI] imaging consistency check failed for {image}: "
                                + "; ".join(problems))
+
+    def _expected_sumwt(self, vis) -> float:
+        """The data's Stokes I weight sum of the run's field in ``vis`` (cached per MS)."""
+        cache = self._derived.setdefault("expected_sumwt", {})
+        key = os.path.abspath(str(vis).rstrip("/"))
+        if key not in cache:
+            cache[key] = stokes_i_weight_sum(str(vis), self._derived["resolved_field_id"])
+        return float(cache[key]["expected_sumwt"])
+
+    def _check_reference_image(self) -> None:
+        """The reffreq-free check of the working MS: range and sumwt (ASEBI SPEC 10.3, D38 h).
+
+        The same rule as ASEBI's ``check_ms_imaging``: a dirty Stokes I image of
+        the field (niter 0, natural weighting, nterms 1, no reffreq, no uv taper,
+        the run's cell and gridder, at most 128 pixels) whose axis must be the
+        data's range (two-sided) and whose sumwt must equal the data's Stokes I
+        weight sum. An image made with an off-centre reffreq tests only the far
+        edge of the band and a Briggs image's sumwt has no relation to the data's
+        weights; this image tests both. Every stage MS and the final MS are
+        splits of the working MS with its channels, weights and flags, so the
+        check is made once; with natural weighting every image of the run is
+        also compared (:meth:`_check_imaging_consistency`). Recorded as checks
+        kind ``"reference"``; raises RuntimeError on failure.
+        """
+        assert self.workdir is not None
+        img = self.cfg.imaging
+        vis = str(self._derived["working_vis"])
+        base = self.workdir / "intermediate" / "imaging_check"
+        _safe_rmtree_glob(self.workdir / "intermediate", "imaging_check.*")
+        n = int(min(int(self._derived["imsize"][0]), 128))
+        kw: Dict[str, Any] = dict(
+            vis=vis, imagename=str(base), datacolumn="data", specmode="mfs", niter=0,
+            deconvolver="hogbom", gridder=img.gridder, imsize=[n, n], cell=self._derived["cell"],
+            weighting="natural", stokes="I", field=self._derived["resolved_field_id"],
+            pbcor=False, savemodel="none", interactive=False)
+        if img.gridder == "mosaic":
+            kw["mosweight"] = True
+        casatasks.tclean(**kw)
+        self._check_imaging_consistency(base, 1, vis=vis, reffreq_hz=None, weighting="natural")
+        rec = self.justification["checks"][-1]
+        cached = self._derived["expected_sumwt"][os.path.abspath(vis.rstrip("/"))]
+        rec.update(kind="reference", weights={k: cached[k] for k in (
+            "n_rows", "n_samples", "weight_column", "per_spw")},
+                   rule=("natural-weighted dirty image without reffreq: axis = the data's range, "
+                         "sumwt = sum of w_p + w_q over the unflagged parallel hands (ASEBI SPEC "
+                         "10.3, D38 h)"))
 
     def _predict_model(self, vis, imagebase, nterms: int) -> Dict[str, Any]:
         """Write the model of ``imagebase`` into MODEL_DATA of an AJISAI-owned MS.
@@ -4695,6 +4850,19 @@ def _image_spectral_axis(path) -> Tuple[float, float]:
     finally:
         ia.close()
     return ref * scale, inc * scale
+
+
+def _freq_quantity_hz(value) -> Optional[float]:
+    """A CASA frequency quantity ('225.1GHz', '2.251e11Hz', 2.251e11; None or '' -> None) in Hz."""
+    if value is None or value == "" or value == []:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.match(r"^\s*([+-]?[0-9.]+(?:[eE][+-]?\d+)?)\s*([kMGT]?Hz)?\s*$", str(value))
+    if not m:
+        return None
+    scale = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9, "THz": 1e12, None: 1.0}[m.group(2)]
+    return float(m.group(1)) * scale
 
 
 def _data_frequency_edges(vis) -> Tuple[float, float]:
