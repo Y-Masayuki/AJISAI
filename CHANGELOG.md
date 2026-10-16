@@ -230,6 +230,15 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **`read_vis_summary` aborted on WEIGHT_SPECTRUM defined on some rows only**
+  (convention audit 2026-10-16, weights item 2). A concat of an MS with
+  WEIGHT_SPECTRUM and one without keeps the column when the earliest input
+  has it, defined on that input's rows only; the reader chose the weight
+  column per data description from its first row, and reading an undefined
+  cell aborts CASA 6.5.1 (the process exited with SIGABRT). Each row is now
+  read with its own column: WEIGHT_SPECTRUM where its cell is defined, WEIGHT
+  elsewhere (`ms_utils.weight_column_queries`, TaQL `ISDEFINED`), as tclean
+  does.
 - **Time-averaged data broke the time geometry of `mode="data"` (convention
   audit 2026-10-16; ASEBI SPEC 4 item 4, D38 e).** `ajisai.solint.geometry`
   took the distinct TIME values of a scan as its integrations. After time

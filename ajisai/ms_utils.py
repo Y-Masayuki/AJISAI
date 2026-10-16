@@ -676,6 +676,25 @@ def get_uv_max(vis: str, field: Optional[str] = None) -> Dict[str, Any]:
     return best
 
 
+def weight_column_queries(colnames, query: str) -> List[Tuple[str, str]]:
+    """(TaQL query, weight column) pairs that together select the rows of ``query``.
+
+    WEIGHT_SPECTRUM is read on the rows where its cell is defined and WEIGHT
+    on the others. A concat of MSs with and without WEIGHT_SPECTRUM defines it
+    on the rows of some inputs only (the earliest input decides whether the
+    column exists), and reading an undefined cell aborts CASA 6.5.1
+    ("TiledStMan: calcCacheSize: invalid arguments"): a presence check on the
+    first row of a data description is not enough (convention audit
+    2026-10-16, weights item 2; ASEBI SPEC 9 item 3, D38 d). TaQL ``ISDEFINED``
+    splits the rows; tclean likewise uses WEIGHT_SPECTRUM where it is
+    defined.
+    """
+    if "WEIGHT_SPECTRUM" not in list(colnames):
+        return [(query, "WEIGHT")]
+    return [(f"({query}) && ISDEFINED(WEIGHT_SPECTRUM)", "WEIGHT_SPECTRUM"),
+            (f"({query}) && !ISDEFINED(WEIGHT_SPECTRUM)", "WEIGHT")]
+
+
 def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = False,
                      chunk_samples: int = _CHUNK_SAMPLES):
     """Read DATA, MODEL_DATA, WEIGHT and FLAG of a field once into an ``ajisai.solint.VisSummary``.
@@ -685,7 +704,8 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
 
     Cross-correlations of the field only; per row the sums of
     :func:`ajisai.solint.reduce_visibilities` over the parallel hands
-    (WEIGHT_SPECTRUM when the column holds values, else WEIGHT), the UV
+    (WEIGHT_SPECTRUM on the rows where it is defined, else WEIGHT:
+    :func:`weight_column_queries`), the UV
     distance (m), the INTERVAL, the row's weight in gaincal's solution time
     (``W`` of the reduction) and, with ``band_halves=True``, the sums over
     the lower and upper half of each spw's channels. Rows without any valid
@@ -716,17 +736,18 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
         cols = tb.colnames()
         if "MODEL_DATA" not in cols:
             raise RuntimeError(f"{vis} has no MODEL_DATA column; predict the model first")
-        has_ws = "WEIGHT_SPECTRUM" in cols
+        queries = []
         for dd in range(len(dd_spw)):
             query = f"DATA_DESC_ID=={dd} && ANTENNA1!=ANTENNA2"
             if fid is not None:
                 query += f" && FIELD_ID=={fid}"
+            queries += [(dd, q, wcol) for q, wcol in weight_column_queries(cols, query)]
+        for dd, query, wcol in queries:
             sub = tb.query(query)
             try:
                 nrow = sub.nrows()
                 if nrow == 0:
                     continue
-                use_ws = has_ws and sub.iscelldefined("WEIGHT_SPECTRUM", 0)
                 npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
                 chunk = max(1, chunk_samples // max(1, npol * nchan))
                 ctypes = corr[int(dd_pol[dd])]
@@ -734,8 +755,7 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
                     nr = min(chunk, nrow - start)
                     red = reduce_visibilities(
                         sub.getcol("DATA", start, nr), sub.getcol("MODEL_DATA", start, nr),
-                        sub.getcol("FLAG", start, nr),
-                        sub.getcol("WEIGHT_SPECTRUM" if use_ws else "WEIGHT", start, nr),
+                        sub.getcol("FLAG", start, nr), sub.getcol(wcol, start, nr),
                         sub.getcol("FLAG_ROW", start, nr), ctypes,
                         halves=band_halves and nchan >= 2)
                     keep = red["n_valid"] > 0
