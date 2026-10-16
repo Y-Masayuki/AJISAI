@@ -8,8 +8,10 @@ Data-driven solution intervals for phase self-calibration (pure numpy).
 The rules are those of the ASEBI specification v0.3 (SPEC section 10.2,
 appendices C.2 and C.3) and of the design-review records P17/P18 (decision
 block, sections 3.1-3.5, test results sections 3-5, 7, 9 and 10), P23 (the
-measurement self-cal uses the same rules) and P27 (no iteration loop on the
-ASEBI side). Every public function names its section in a ``Spec:`` line.
+measurement self-cal uses the same rules), P27 (no iteration loop on the
+ASEBI side) and D34 (F3: candidate step for mixed integration times; F2:
+nearest interpolation, provisional). Every public function names its
+section in a ``Spec:`` line.
 
 What is measured, from the visibilities, the model and the weights only
 (no gain solutions, no images):
@@ -26,7 +28,9 @@ What is measured, from the visibilities, the model and the weights only
 How a stage is decided (:func:`evaluate_stage`):
 
 1. candidate solints: divisors of the median scan length in integrations,
-   the scan and the execution block (:func:`candidate_solints`);
+   the scan and the execution block (:func:`candidate_solints`); for EBs of
+   different integration times the step is their least common multiple
+   (D34 F3, :func:`integration_step`);
 2. G1: predicted true SNR >= 5 per candidate and per antenna and solution
    (:func:`g1_gate`);
 3. prediction of the residual phase variance ``V(T)`` on the candidate grid
@@ -35,6 +39,9 @@ How a stage is decided (:func:`evaluate_stage`):
 4. G2: held-out coherence with an even/odd split of the integrations in
    each scan (band halves when scans have fewer than 4 integrations),
    antenna delete-one paired jackknife (:func:`holdout_coherence`);
+   nearest-interpolation variants join when ``2 D_eff(T_hat)`` from
+   adjacent solutions exceeds 1 rad^2 (D34 F2, provisional,
+   :func:`adjacent_solution_structure`);
    rule A (loss-table corrected argmin) and rule B (one candidate shorter
    than the held-out argmin), the longer when they disagree
    (:func:`choose_solint`);
@@ -94,11 +101,25 @@ CANDIDATE_MAX_RATIO = 2.0
 BETA_RANGE = (0.1, 2.0)
 #: A fitted structure function counts only when its amplitude exceeds this many sigma.
 FIT_MIN_SIGNIFICANCE = 2.0
+#: Integration times of the EBs of a run: two count as one value when they agree within
+#: this fraction, and a common multiple must be an integer multiple of each within it
+#: (Spec 10.2 item 3, D34 F3).
+IT_MATCH_RTOL = 0.01
+#: The least common multiple of the integration times is the candidate step only up to
+#: this many times the longest integration time (Spec 10.2 item 3, D34 F3).
+IT_LCM_MAX_FACTOR = 4.0
+#: Nearest-interpolation variants join G2 when 2 D_eff(T_hat) from adjacent solutions,
+#: noise removed, exceeds this (rad^2). Provisional: the 1 rad boundary is untested
+#: (Spec 10.2 item 6, D34 F2).
+NEAREST_TRIGGER_2D = 1.0
 
 # Sample limits for the discrete prediction (accuracy is set by the smoothness
 # of D, not by the number of integrations).
 _MAX_EVAL_TIMES = 600
 _MAX_MEMBERS_PER_UNIT = 300
+# The least common multiple is searched up to this many times the longest
+# integration time (beyond IT_LCM_MAX_FACTOR only for the record).
+_LCM_SEARCH_MAX = 100
 
 
 # ============================================================================
@@ -342,6 +363,11 @@ class Geometry:
     """Time structure of the rows of a run (identical for every state).
 
     Spec: 10.2 items 3 and 6 (scan lengths in integrations, even/odd split).
+
+    ``it_step`` is the step of the candidate solints (Spec 10.2 item 3, D34
+    F3): ``it_ref`` unless the EBs have different integration times with a
+    least common multiple (rule "lcm", :func:`integration_step`); then the
+    scan lengths in steps (``scan_nstep``) build the candidate grid.
     """
     int_time: Dict[int, float]          # integration time per observation (s)
     it_ref: float                       # median integration time of all rows (s)
@@ -354,12 +380,80 @@ class Geometry:
     utimes: Dict[int, np.ndarray]       # unique times per observation
     tgrid: np.ndarray                   # row -> index on the observation's IT grid
     cache: Dict[Any, Any] = field(default_factory=dict)   # row -> unit assignments
+    it_step: float = 0.0                # step of the candidate solints (s)
+    it_step_record: Dict[str, Any] = field(default_factory=dict)   # integration_step()
+    scan_nstep: Optional[np.ndarray] = None   # scan lengths in steps (= scan_nint unless 'lcm')
+    scan_nstep_median: float = 0.0
+    scan_nstep_max: int = 0
+
+
+def integration_step(int_times: Sequence[float], it_median: float, rtol: float = IT_MATCH_RTOL,
+                     max_factor: float = IT_LCM_MAX_FACTOR) -> Dict[str, Any]:
+    """Step of the candidate solints: the least common multiple of the integration times.
+
+    Spec: 10.2 item 3 (D34 F3: for EBs of different integration times the step
+    is their least common multiple within 1 %, so that on every EB the
+    solution intervals line up with the integration boundaries, DG Tau B
+    2.016 s and 6.048 s -> 6.048 s; above 4x the longest integration time
+    the median integration time of all rows, recorded with a warning), 10
+    item 5 (solints in seconds, integer multiples of the time bin).
+
+    ``int_times``: the integration time of each observation (s);
+    ``it_median``: the median integration time of all rows (``it_ref``).
+    Sorted times within ``rtol`` of the smallest of a group are one value
+    (the group median). With one value the step is ``it_median`` (rule
+    "single": nothing changes). Otherwise the least common multiple is the
+    smallest ``L = m t_max`` (``m = 1, 2, ...``) with ``|L/(n t) - 1| <=
+    rtol`` for an integer ``n`` and every value ``t``; it is the step when
+    ``m <= max_factor`` (rule "lcm"); else the step is ``it_median`` (rule
+    "median_fallback", with ``warning``). ``multiples``: ``n`` of each
+    distinct value.
+    """
+    vals = sorted(float(t) for t in int_times if np.isfinite(t) and t > 0)
+    groups: List[List[float]] = []
+    for t in vals:
+        if groups and t <= groups[-1][0] * (1.0 + rtol):
+            groups[-1].append(t)
+        else:
+            groups.append([t])
+    distinct = [float(np.median(g)) for g in groups]
+    out: Dict[str, Any] = {"rule": "single", "step_s": float(it_median), "distinct_s": distinct,
+                           "lcm_s": None, "multiples": None, "rtol": float(rtol),
+                           "max_factor": float(max_factor), "warning": None}
+    if len(distinct) <= 1:
+        return out
+    t_max = distinct[-1]
+    found = None
+    for m in range(1, _LCM_SEARCH_MAX + 1):
+        L = m * t_max
+        n = [max(int(round(L / t)), 1) for t in distinct]
+        if all(abs(L / (k * t) - 1.0) <= rtol for k, t in zip(n, distinct)):
+            found = (m, L, n)
+            break
+    if found is not None:
+        out["lcm_s"] = float(found[1])
+        out["multiples"] = [int(k) for k in found[2]]
+    if found is not None and found[0] <= max_factor + 1e-9:
+        out.update(rule="lcm", step_s=float(found[1]))
+        return out
+    lcm_txt = (f"their least common multiple is {found[1]:.6g} s" if found is not None else
+               f"they have no common multiple up to {_LCM_SEARCH_MAX} x the longest")
+    out["rule"] = "median_fallback"
+    out["warning"] = (f"integration times {', '.join(f'{t:.6g}' for t in distinct)} s: {lcm_txt}, "
+                      f"more than {max_factor:g} x the longest ({max_factor * t_max:.6g} s); the "
+                      f"candidate solints step by the median integration time of all rows "
+                      f"({it_median:.6g} s), so their intervals need not line up with the "
+                      f"integrations of every EB")
+    return out
 
 
 def geometry(vs: VisSummary) -> Geometry:
     """Integration time per observation, scan positions and the even/odd parity.
 
-    Spec: 10.2 items 3 and 6; 10 item 5 (solints are integer multiples of the time bin).
+    Spec: 10.2 items 3 and 6; 10 item 5 (solints are integer multiples of the
+    time bin); 10.2 item 3, D34 F3 (the step of the candidates for EBs of
+    different integration times, :func:`integration_step`; a fallback to the
+    median is warned here).
     """
     int_time: Dict[int, float] = {}
     utimes: Dict[int, np.ndarray] = {}
@@ -367,6 +461,7 @@ def geometry(vs: VisSummary) -> Geometry:
     k_in_scan = np.zeros(vs.n_rows, dtype=np.int64)
     tgrid = np.zeros(vs.n_rows, dtype=np.int64)
     scan_nint: List[int] = []
+    scan_obs: List[int] = []
     max_spo = 0
     for o in np.unique(vs.obs):
         sel_o = vs.obs == o
@@ -378,6 +473,7 @@ def geometry(vs: VisSummary) -> Geometry:
             sel = sel_o & (vs.scan == sc)
             st = np.unique(vs.time[sel])
             scan_nint.append(int(st.size))
+            scan_obs.append(int(o))
             if st.size > 1:
                 diffs.append(np.diff(st))
             k_in_scan[sel] = np.searchsorted(st, vs.time[sel])
@@ -388,9 +484,26 @@ def geometry(vs: VisSummary) -> Geometry:
         obs_span[int(o)] = float(ut[-1] - ut[0] + it)
     all_it = np.array([int_time[int(o)] for o in vs.obs]) if vs.n_rows else np.ones(1)
     nint = np.asarray(scan_nint, dtype=np.int64)
-    return Geometry(int_time=int_time, it_ref=float(np.median(all_it)), k_in_scan=k_in_scan,
-                    scan_nint=nint, scan_nint_median=float(np.median(nint)) if nint.size else 0.0,
-                    n_scans=int(nint.size), max_scans_per_obs=max_spo, obs_span=obs_span, utimes=utimes, tgrid=tgrid)
+    it_ref = float(np.median(all_it))
+    nint_median = float(np.median(nint)) if nint.size else 0.0
+    step = integration_step([int_time[o] for o in sorted(int_time)], it_ref)
+    if step["rule"] == "lcm":
+        # scan lengths in steps of the least common multiple (fractional for a
+        # scan that does not hold a whole number of steps)
+        nstep = nint * np.array([int_time[o] for o in scan_obs]) / step["step_s"]
+        nstep_median = float(np.median(nstep))
+        nstep_max = int(math.ceil(float(nstep.max()) - 1e-6))
+    else:
+        nstep = nint.astype(float)
+        nstep_median = nint_median
+        nstep_max = int(nint.max()) if nint.size else 0
+    if step["warning"]:
+        warnings.warn(f"[AJISAI] {step['warning']}")
+    return Geometry(int_time=int_time, it_ref=it_ref, k_in_scan=k_in_scan,
+                    scan_nint=nint, scan_nint_median=nint_median,
+                    n_scans=int(nint.size), max_scans_per_obs=max_spo, obs_span=obs_span, utimes=utimes, tgrid=tgrid,
+                    it_step=float(step["step_s"]), it_step_record=step, scan_nstep=nstep,
+                    scan_nstep_median=nstep_median, scan_nstep_max=nstep_max)
 
 
 def _sort_order(vs: VisSummary) -> np.ndarray:
@@ -508,7 +621,14 @@ def snr_rates(vs: VisSummary, s_map: Dict[int, Dict[str, Any]], geom: Geometry,
 
 
 def _lag_bins(it_ref: float, max_lag_s: float) -> np.ndarray:
-    """Lag-bin edges (s): single lags 1..8 IT, then x1.25 (geometric)."""
+    """Lag-bin edges (s): single lags 1..8 IT, then x1.25 (geometric).
+
+    The bins use the median integration time ``it_ref``, not the candidate
+    step ``it_step`` of D34 F3: M3 measures D at the lags of each EB's own
+    integration grid, and edges at multiples of a least common multiple would
+    drop more of the short lags of the EBs with the shorter integration time
+    (lags below ``it_ref/2`` are not binned).
+    """
     edges = [(m + 0.5) * it_ref for m in range(0, 9)]
     while edges[-1] < max_lag_s + it_ref:
         edges.append(edges[-1] * 1.25)
@@ -698,23 +818,65 @@ def gaincal_solint_string(n_int: int, it: float, scan_nint_max: int) -> str:
     return f"{n * it - it / (4.0 * m):.4f}s"
 
 
+def gaincal_solint_string_mixed(n_step: int, step: float, int_times: Sequence[float],
+                                scan_nstep_max: int) -> str:
+    """gaincal ``solint`` of ``n_step`` steps when the EBs have different integration times.
+
+    Spec: 10.2 item 3 (D34 F3: on every EB the intervals line up with the
+    integration boundaries), 10 item 5. One solint (s) serves every EB of the
+    concatenated MS: EB ``i`` (integration time ``t_i``) must get chunks of
+    exactly ``n_i = n_step step / t_i`` integrations, which holds for any
+    solint in ``(n_i t_i - t_i/M, n_i t_i]`` (``M`` chunks in the longest
+    scan). The value is a quarter of the common window below its top, which
+    is :func:`gaincal_solint_string` (``n IT - IT/(4M)``) for a single
+    integration time; it is never ``'int'``. If times that match the step
+    only within the 1 % tolerance leave no common window, the window of the
+    shortest ``n_i t_i`` is used and :func:`solution_units` models the
+    chunks gaincal actually makes.
+    """
+    ts = sorted(set(float(t) for t in int_times))
+    n = max(int(n_step), 1)
+    m = max(1, int(math.ceil(max(int(scan_nstep_max), n) / n)))
+    per = [(max(int(round(n * step / t)), 1), t) for t in ts]
+    hi = min(k * t for k, t in per)
+    lo = max(k * t - t / m for k, t in per)
+    width = hi - lo if hi > lo else ts[0] / m
+    return f"{hi - width / 4.0:.4f}s"
+
+
+def _n_int_by_it(n_step: int, step: float, int_times: Sequence[float]) -> Dict[str, int]:
+    """Integrations per solution of ``n_step`` steps for each integration time (keys: s, 4 digits)."""
+    return {f"{t:.4g}": max(int(round(n_step * step / t)), 1)
+            for t in sorted(set(float(x) for x in int_times))}
+
+
 def candidate_solints(scan_nint_median: float, it_ref: float, scans_per_obs: int = 2,
                       eb_span_s: Optional[float] = None,
-                      scan_nint_max: Optional[int] = None) -> List[Dict[str, Any]]:
+                      scan_nint_max: Optional[int] = None,
+                      int_times: Optional[Sequence[float]] = None) -> List[Dict[str, Any]]:
     """Candidate solution intervals, shortest first.
 
     Spec: 10.2 item 3 (divisors of the median scan length in integrations as
     integer multiples of the integration time, the scan and the EB;
     non-divisor multiples where neighbouring divisors are more than a factor
-    2 apart; no "N x IT" schedule), 10 item 5 (seconds, integer multiples of
-    the time bin).
+    2 apart; no "N x IT" schedule; D34 F3: for EBs of different integration
+    times the step is their least common multiple), 10 item 5 (seconds,
+    integer multiples of the time bin).
 
     Each candidate: ``label``, ``kind`` ("int" | "scan" | "eb"), ``n_int``
     (integrations per solution for "int"), ``T_s`` (nominal length) and the
     gaincal arguments ``gaincal_solint`` / ``time_combine``. For "int",
     ``gaincal_solint`` (:func:`gaincal_solint_string`) makes gaincal's chunks
     hold exactly ``n`` integrations, whatever the timestamp jitter.
+
+    ``int_times`` (the integration times of the observations, given only when
+    they differ; rule "lcm" of :func:`integration_step`): ``it_ref`` is then
+    the step (the least common multiple), the scan lengths are in steps,
+    ``n_int`` counts steps, ``n_int_by_it_s`` gives the integrations per
+    solution of each integration time and ``gaincal_solint`` comes from
+    :func:`gaincal_solint_string_mixed`.
     """
+    mixed = int_times is not None and len(set(float(t) for t in int_times)) > 1
     n_scan = int(round(scan_nint_median))
     n_max = int(scan_nint_max) if scan_nint_max else n_scan
     out: List[Dict[str, Any]] = []
@@ -734,18 +896,53 @@ def candidate_solints(scan_nint_median: float, it_ref: float, scans_per_obs: int
         for d in grid:
             if d >= n_scan:
                 continue
+            gs = (gaincal_solint_string_mixed(d, it_ref, int_times, n_max) if mixed
+                  else gaincal_solint_string(d, it_ref, n_max))
             out.append({"label": f"{d * it_ref:.4g}s", "kind": "int", "n_int": int(d),
                         "divisor": bool(n_scan % d == 0), "T_s": float(d * it_ref),
-                        "gaincal_solint": gaincal_solint_string(d, it_ref, n_max),
-                        "time_combine": ""})
+                        "gaincal_solint": gs, "time_combine": ""})
+            if mixed:
+                out[-1]["n_int_by_it_s"] = _n_int_by_it(d, it_ref, int_times)
     if scans_per_obs > 1:
         out.append({"label": "scan", "kind": "scan", "n_int": n_scan, "divisor": True,
                     "T_s": float(max(n_scan, 1) * it_ref), "gaincal_solint": "inf",
                     "time_combine": ""})
+        if mixed:
+            out[-1]["n_int_by_it_s"] = _n_int_by_it(max(n_scan, 1), it_ref, int_times)
     eb_T = float(eb_span_s) if eb_span_s else float(max(n_scan, 1) * it_ref * max(scans_per_obs, 1))
     out.append({"label": "EB", "kind": "eb", "n_int": None, "divisor": True, "T_s": eb_T,
                 "gaincal_solint": "inf", "time_combine": "scan"})
     return out
+
+
+def geometry_candidates(geom: Geometry) -> List[Dict[str, Any]]:
+    """The candidate solints of a run from its geometry.
+
+    Spec: 10.2 item 3 (D34 F3: the step is the least common multiple of the
+    integration times when :func:`integration_step` gives rule "lcm"; else
+    the median integration time and the scan lengths in integrations, as
+    before D34).
+    """
+    eb_span = sum(geom.obs_span.values())
+    if geom.it_step_record.get("rule") == "lcm":
+        return candidate_solints(geom.scan_nstep_median, geom.it_step, geom.max_scans_per_obs,
+                                 eb_span, geom.scan_nstep_max,
+                                 int_times=sorted(set(geom.int_time.values())))
+    return candidate_solints(geom.scan_nint_median, geom.it_ref, geom.max_scans_per_obs, eb_span,
+                             int(geom.scan_nint.max()) if geom.scan_nint.size else None)
+
+
+def _single_integration(cand: Dict[str, Any]) -> bool:
+    """An "int" candidate that solves single integrations of some EB (the even/odd split cannot score it).
+
+    Spec: 10.2 item 6 (with the even/odd split, T = IT trains on intervals
+    that each hold one integration: it is scored as 2 IT); D34 F3 (with
+    mixed integration times, per EB).
+    """
+    if cand.get("kind") != "int":
+        return False
+    per = cand.get("n_int_by_it_s")
+    return (min(per.values()) if per else cand.get("n_int")) == 1
 
 
 @dataclass
@@ -937,15 +1134,80 @@ def interpolation_weights(eval_times, sol_times) -> Tuple[np.ndarray, np.ndarray
     return lo, hi, f
 
 
-def kappa_geometry(eval_times, sol_times) -> float:
+def nearest_weights(eval_times, sol_times) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(lo, hi, f)`` of nearest interpolation: ``lo = hi`` = the nearest solution, ``f = 0``.
+
+    Spec: 10.2 item 6 (D34 F2: nearest interpolation), C.2 (nearest =
+    piecewise constant, ``a = 1/((beta+1)(beta+2))``). Ties go to the earlier
+    solution, as CASA 6.5.1 applycal 'nearest' does
+    (``tests/test_casa_solint.py``).
+    """
+    st = np.asarray(sol_times, dtype=float)
+    t = np.asarray(eval_times, dtype=float)
+    k = np.searchsorted(st, t, side="right") - 1
+    lo = np.clip(k, 0, st.size - 1)
+    hi = np.clip(k + 1, 0, st.size - 1)
+    pick = np.where((k >= 0) & (np.abs(st[hi] - t) < np.abs(t - st[lo])), hi, lo)
+    return pick, pick.copy(), np.zeros(t.size)
+
+
+def _weights_function(interp: str) -> Callable:
+    if interp == "linear":
+        return interpolation_weights
+    if interp == "nearest":
+        return nearest_weights
+    raise ValueError(f"interp must be 'linear' or 'nearest'; got {interp!r}")
+
+
+def kappa_geometry(eval_times, sol_times, interp: str = "linear") -> float:
     """M4: ``kappa`` = mean over the evaluated integrations of ``sum_k c_k(t)^2``.
 
     Spec: 10.2 item 1, C.2 (2/3 for a uniform interior grid with linear
     interpolation; 1 for T = IT or one solution per EB; 0.95 for one per
-    scan with long gaps; 0.54-0.60 for the even/odd halves of G2).
+    scan with long gaps; 0.54-0.60 for the even/odd halves of G2; 1 for
+    nearest interpolation, D34 F2).
     """
-    lo, hi, f = interpolation_weights(eval_times, sol_times)
+    lo, hi, f = _weights_function(interp)(eval_times, sol_times)
     return float(np.mean((1 - f) ** 2 + f ** 2)) if f.size else float("nan")
+
+
+def _row_nearest(units: Units, row_time: np.ndarray, row_obs: np.ndarray,
+                 row_group: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(lo, hi, f)`` of nearest interpolation for every row: its own solution interval.
+
+    Spec: 10.2 item 6 (D34 F2), 10 item 3 ('perobs'). The rows are all rows
+    of the run (``units.of_row`` order). A row takes the solution of the
+    interval it falls in; that is CASA's nearest solution time for gaincal's
+    intervals (only the last interval of a scan can be shorter, and a tie
+    goes to the earlier solution, the row's own). When that interval has no
+    solution time (no training row of a G2 split in it), the nearest
+    solution time of the same observation and group. A flagged nearest
+    solution leaves the row uncorrected: CASA 6.5.1 'nearest' does not skip
+    it (``tests/test_casa_solint.py``).
+    """
+    own = units.of_row
+    n = own.size
+    has = np.zeros(n, bool)
+    if units.time.size:
+        has = (own >= 0) & np.isfinite(units.time[np.maximum(own, 0)])
+    lo = np.where(has, own, -1).astype(np.int64)
+    rest = np.flatnonzero(~has)
+    if rest.size:
+        l2, h2, f2 = _row_brackets(units, row_time[rest], row_obs[rest], row_group[rest])
+        lo[rest] = np.where(f2 > 0.5, h2, l2)
+    return lo, lo.copy(), np.zeros(n)
+
+
+def _row_weights(vs: VisSummary, units: Units, interp: str = "linear"
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Interpolation ``(lo, hi, f)`` of every row of ``vs`` for ``interp`` (linear or nearest)."""
+    group = (units.group[np.maximum(units.of_row, 0)] if units.of_row.size
+             else np.zeros(0, np.int64))
+    if interp == "nearest":
+        return _row_nearest(units, vs.time, vs.obs, group)
+    if interp != "linear":
+        raise ValueError(f"interp must be 'linear' or 'nearest'; got {interp!r}")
+    return _row_brackets(units, vs.time, vs.obs, group)
 
 
 def _row_values(values: np.ndarray, good: np.ndarray, lo: np.ndarray, hi: np.ndarray,
@@ -984,16 +1246,19 @@ def _stride_sample(x: np.ndarray, nmax: int) -> np.ndarray:
 
 
 def _interval_variance(eval_t: np.ndarray, members: List[np.ndarray], sol_t: np.ndarray,
-                       dfun: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
-    """Atmospheric residual variance at ``eval_t`` after linear interpolation of interval means.
+                       dfun: Callable[[np.ndarray], np.ndarray],
+                       interp: str = "linear") -> np.ndarray:
+    """Atmospheric residual variance at ``eval_t`` after interpolation of interval means.
 
     Spec: C.2 (variogram identity ``Var(sum a phi) = -1/2 sum a_m a_n D(t_m - t_n)``
-    for weights summing to zero; ``a = 1/((beta+1)(beta+2))`` for nearest).
+    for weights summing to zero; ``a = 1/((beta+1)(beta+2))`` for nearest,
+    :func:`box_coefficient`, which ``interp="nearest"`` gives on a uniform
+    interior grid; D34 F2).
     """
     order = np.argsort(sol_t)
     sol_t = sol_t[order]
     members = [members[k] for k in order]
-    lo, hi, f = interpolation_weights(eval_t, sol_t)
+    lo, hi, f = _weights_function(interp)(eval_t, sol_t)
     mem = [_stride_sample(m, _MAX_MEMBERS_PER_UNIT) for m in members]
     nu = len(mem)
     m_k = np.zeros((eval_t.size, nu))
@@ -1027,8 +1292,11 @@ def predict_residual_variance(vs: VisSummary, geom: Geometry, cand: Dict[str, An
     For the typical antenna (rate ``r_unit``): the atmospheric term uses the
     fitted ``D_eff`` with the variogram identity for linear interpolation of
     interval means; the thermal term is ``mean_t sum_k c_k(t)^2 L(r sqrt(T_k))``.
-    Observations are weighted by their number of integrations.
+    Observations are weighted by their number of integrations. A nearest
+    variant (``cand["interp"] == "nearest"``, D34 F2) uses the nearest
+    solution: the box term of C.2 and ``c = 1``.
     """
+    interp = cand.get("interp", "linear")
     units = solution_units(vs, geom, cand, combine_spw=True)
     _, _, pair_unit, pair_time, _, _ = geom.cache[(cand["kind"], cand.get("n_int"),
                                                    cand.get("gaincal_solint"), True, vs.n_rows)]
@@ -1041,9 +1309,9 @@ def predict_residual_variance(vs: VisSummary, geom: Geometry, cand: Dict[str, An
         members = [pair_time[cut[u]:cut[u + 1]] for u in uidx]
         sol_t = units.time[uidx]
         ev = _stride_sample(times, _MAX_EVAL_TIMES)
-        atm = _interval_variance(ev, members, sol_t, dfun)
+        atm = _interval_variance(ev, members, sol_t, dfun, interp)
         order = np.argsort(sol_t)
-        lo, hi, f = interpolation_weights(ev, sol_t[order])
+        lo, hi, f = _weights_function(interp)(ev, sol_t[order])
         snr = r_unit * np.sqrt(np.array([m.size * it for m in members]))[order]
         L = casa_loss(snr)
         th = (1 - f) ** 2 * L[lo] + f ** 2 * L[hi]
@@ -1132,16 +1400,15 @@ def _solve_units(vs: VisSummary, units: Units, y: np.ndarray, P: np.ndarray, row
     return ph, valid
 
 
-def apply_units(vs: VisSummary, units: Units, phases: np.ndarray, good: np.ndarray
-                ) -> Tuple[np.ndarray, np.ndarray]:
+def apply_units(vs: VisSummary, units: Units, phases: np.ndarray, good: np.ndarray,
+                interp: str = "linear") -> Tuple[np.ndarray, np.ndarray]:
     """Per-row baseline phase ``psi_1 - psi_2`` of interpolated solutions and its mask.
 
     Spec: 10.2 items 4 and 14 (calonly: a row whose antennas lack a good
-    solution passes uncorrected; table and data times by nearest).
+    solution passes uncorrected; table and data times by nearest); item 6
+    (D34 F2: ``interp="nearest"``, :func:`_row_nearest`).
     """
-    lo, hi, f = _row_brackets(units, vs.time, vs.obs,
-                              units.group[np.maximum(units.of_row, 0)]
-                              if units.of_row.size else np.zeros(0, np.int64))
+    lo, hi, f = _row_weights(vs, units, interp)
     p1, ok1 = _row_values(phases, good, lo, hi, f, vs.a1, phase=True)
     p2, ok2 = _row_values(phases, good, lo, hi, f, vs.a2, phase=True)
     ok = ok1 & ok2
@@ -1149,16 +1416,16 @@ def apply_units(vs: VisSummary, units: Units, phases: np.ndarray, good: np.ndarr
 
 
 def thermal_rows(vs: VisSummary, units: Units, snr: np.ndarray, good: np.ndarray,
-                 rows: np.ndarray) -> float:
+                 rows: np.ndarray, interp: str = "linear") -> float:
     """P-weighted mean over ``rows`` of the solution-noise loss ``(v_1 + v_2)/2``.
 
     Spec: C.3 (rule A: ``kappa L(SNR)``), C.2 (loss table), 10.2 item 7.
-    ``v_a(t) = sum_k c_k(t)^2 L(SNR_ak)`` of the interpolated solutions.
+    ``v_a(t) = sum_k c_k(t)^2 L(SNR_ak)`` of the interpolated solutions
+    (``c = 1`` for the nearest solution with ``interp="nearest"``, D34 F2).
     """
     L = casa_loss(np.where(snr > 0, snr, np.nan))
     L = np.where(np.isfinite(L), L, 0.0)
-    lo, hi, f = _row_brackets(units, vs.time, vs.obs,
-                              units.group[np.maximum(units.of_row, 0)])
+    lo, hi, f = _row_weights(vs, units, interp)
     v1, ok1 = _row_values(L, good, lo, hi, f, vs.a1, phase=False)
     v2, ok2 = _row_values(L, good, lo, hi, f, vs.a2, phase=False)
     ok = ok1 & ok2 & rows
@@ -1231,6 +1498,8 @@ def _train_solution(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combin
 
     Returns the per-row phase ``psi_1 - psi_2`` (all rows) and its mask.
     The gate is G1 on the full-data predicted SNR (the same as production).
+    The solutions are applied with the candidate's interpolation
+    (``cand["interp"]``, linear unless a nearest variant of D34 F2).
     """
     units_tr = solution_units(vs, geom, cand, combine_spw, rows=split.train)
     y0, P = _data(vs, split.half_train)
@@ -1240,7 +1509,7 @@ def _train_solution(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combin
     if gate:
         snr_full = unit_snr(vs, units_tr, s_rows)
         good = good & (snr_full >= G1_SNR_MIN)
-    return apply_units(vs, units_tr, ph, good)
+    return apply_units(vs, units_tr, ph, good, cand.get("interp", "linear"))
 
 
 def _reference_phase(chain: List[StageSolve], geom: Geometry, combine_spw: bool, split: Split,
@@ -1351,12 +1620,14 @@ def loss_correction(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], splits
     actual interpolation geometry: the full-data solutions on all rows, and
     the training-half solutions (SNR of the training rows) on the held rows,
     averaged over the splits. Solutions failing G1 (full-data predicted SNR)
-    carry no correction in either.
+    carry no correction in either. A nearest variant (D34 F2) uses the
+    nearest solution in both (``kappa = 1``).
     """
+    interp = cand.get("interp", "linear")
     units = solution_units(vs, geom, cand, combine_spw)
     snr_full = unit_snr(vs, units, s_rows)
     good_full = snr_full >= G1_SNR_MIN
-    full = thermal_rows(vs, units, snr_full, good_full, np.ones(vs.n_rows, bool))
+    full = thermal_rows(vs, units, snr_full, good_full, np.ones(vs.n_rows, bool), interp)
     held_vals = []
     held_w = []
     kap_h = []
@@ -1365,7 +1636,7 @@ def loss_correction(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], splits
         P_tr = vs.P if sp.half_train is None else vs.P_half[sp.half_train]
         snr_half = unit_snr(vs, units_tr, s_rows, rows=sp.train, P=P_tr)
         good = unit_snr(vs, units_tr, s_rows) >= G1_SNR_MIN
-        held_vals.append(thermal_rows(vs, units_tr, snr_half, good, sp.held))
+        held_vals.append(thermal_rows(vs, units_tr, snr_half, good, sp.held, interp))
         held_w.append(float(np.sum(np.where(sp.held, vs.P, 0.0))))
         for o in np.unique(vs.obs):
             uo = (units_tr.obs == o) & np.isfinite(units_tr.time)
@@ -1373,10 +1644,144 @@ def loss_correction(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], splits
                 continue
             st = np.unique(units_tr.time[uo])
             ev = np.unique(vs.time[(vs.obs == o) & sp.held])
-            kap_h.append(kappa_geometry(ev, st))
+            kap_h.append(kappa_geometry(ev, st, interp))
     held = float(np.average(held_vals, weights=held_w)) if sum(held_w) > 0 else 0.0
     return {"thermal_full": full, "thermal_held": held, "corr": held - full,
             "kappa_held": float(np.mean(kap_h)) if kap_h else float("nan")}
+
+
+# ============================================================================
+# Breakdown of linear interpolation (Spec 10.2 item 6, D34 F2, provisional)
+# ============================================================================
+
+def _next_unit(vs: VisSummary, units: Units, within_scan: bool) -> np.ndarray:
+    """Index of the next solution in time of the same observation and group (and scan), or -1."""
+    nu = units.time.size
+    nxt = np.full(nu, -1, dtype=np.int64)
+    if nu == 0:
+        return nxt
+    scan_u = np.full(nu, -1, dtype=np.int64)
+    rows = np.flatnonzero(units.of_row >= 0)
+    uu, first = np.unique(units.of_row[rows], return_index=True)
+    scan_u[uu] = vs.scan[rows[first]]
+    if not within_scan:
+        scan_u[:] = 0
+    ok = np.isfinite(units.time)
+    idx = np.flatnonzero(ok)
+    order = idx[np.lexsort((units.time[idx], scan_u[idx], units.group[idx], units.obs[idx]))]
+    same = ((units.obs[order][1:] == units.obs[order][:-1])
+            & (units.group[order][1:] == units.group[order][:-1])
+            & (scan_u[order][1:] == scan_u[order][:-1]))
+    nxt[order[:-1][same]] = order[1:][same]
+    return nxt
+
+
+def adjacent_solution_structure(vs: VisSummary, geom: Geometry, cand: Dict[str, Any],
+                                s_rows: np.ndarray, combine_spw: bool,
+                                refant: Optional[int] = None, minblperant: int = 4,
+                                dfun: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                                threshold: float = NEAREST_TRIGGER_2D) -> Dict[str, Any]:
+    """``2 D_eff(T_hat)`` from the differences of adjacent solutions at the predicted best interval.
+
+    Spec: 10.2 item 6 (D34 F2, provisional: when ``2 D_eff(T_hat)`` from the
+    differences of adjacent solutions exceeds 1 rad^2, linear interpolation
+    (linearPD) can break down, and nearest-interpolation candidates join G2;
+    the rms of the adjacent differences and ``2 D_eff(T_hat)`` are
+    recorded; the 1 rad boundary is untested), C.2 (D per antenna, 2D per
+    baseline; the SNR convention ``eps^2 = (N_ant - 1)/N_ant / SNR^2``).
+
+    The candidate ``cand`` is solved on all rows of the current state with
+    the numpy solver of G2, gated by G1 as in production. For every row whose
+    two antennas have good solutions in its interval and in the next one
+    (same observation and group; same scan for "int" intervals, consecutive
+    scans for "scan"), ``delta`` is the change of the baseline solution
+    phase ``psi_1 - psi_2`` between them, wrapped to (-pi, pi]: independent
+    of the reference antenna, it is the sum of the two antennas' changes.
+    ``two_D_eff_raw`` is its P-weighted mean square (the weights of C_held
+    in G2), i.e. 2 x the antenna mean square difference; the solution noise
+    is ``eps^2`` of each antenna in both intervals (2 eps^2 per antenna
+    difference) with ``eps`` from the predicted solution SNR
+    (:func:`unit_snr`); ``two_D_eff`` is the difference. ``rms_adjacent_rad``
+    = ``sqrt(two_D_eff_raw)`` (the rms of the adjacent differences of a
+    gain table, whose phases are baseline phases to the reference antenna).
+    ``two_D_model`` is the M3 fit at ``tau = T_hat`` for comparison
+    (interval means differ by less than the point values: 2/3 of 2D(T) for
+    beta = 1, 1 for beta = 2). ``trigger``: ``two_D_eff > threshold``.
+    """
+    rec: Dict[str, Any] = {"computed": False, "candidate": cand["label"],
+                           "T_s": float(cand["T_s"]), "threshold_two_D": float(threshold),
+                           "trigger": False}
+    if dfun is not None:
+        rec["two_D_model"] = float(2.0 * dfun(np.array([float(cand["T_s"])]))[0])
+    if cand["kind"] not in ("int", "scan"):
+        rec["reason"] = "one solution per EB: no adjacent solutions; linear interpolation kept"
+        return rec
+    units = solution_units(vs, geom, cand, combine_spw)
+    ph, valid = _solve_units(vs, units, vs.y, vs.P, np.ones(vs.n_rows, bool), refant, minblperant)
+    snr = unit_snr(vs, units, s_rows)
+    good = valid & (snr >= G1_SNR_MIN)
+    n_val = valid.sum(axis=1).astype(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        eps2 = np.where(good, ((n_val - 1.0) / np.maximum(n_val, 1.0))[:, None]
+                        / np.where(snr > 0, snr, 1.0) ** 2, 0.0)
+    nxt = _next_unit(vs, units, within_scan=cand["kind"] == "int")
+    u = units.of_row
+    v = np.where(u >= 0, nxt[np.maximum(u, 0)], -1)
+    ok = (u >= 0) & (v >= 0) & (vs.P > 0)
+    uu = np.where(ok, u, 0)
+    vv = np.where(ok, v, 0)
+    ok &= good[uu, vs.a1] & good[uu, vs.a2] & good[vv, vs.a1] & good[vv, vs.a2]
+    w = np.where(ok, vs.P, 0.0)
+    wsum = float(w.sum())
+    if wsum <= 0:
+        rec["reason"] = "no pair of adjacent good solutions; linear interpolation kept"
+        return rec
+    delta = np.angle(np.exp(1j * ((ph[vv, vs.a1] - ph[vv, vs.a2]) - (ph[uu, vs.a1] - ph[uu, vs.a2]))))
+    noise = eps2[uu, vs.a1] + eps2[uu, vs.a2] + eps2[vv, vs.a1] + eps2[vv, vs.a2]
+    raw = float(np.sum(w * delta ** 2) / wsum)
+    nz = float(np.sum(w * noise) / wsum)
+    two_d = raw - nz
+    trig = bool(two_d > threshold)
+    rec.update({
+        "computed": True,
+        "n_pairs": int(np.unique(uu[ok] * max(units.time.size, 1) + vv[ok]).size),
+        "lag_s": float(np.sum(w * (units.time[vv] - units.time[uu])) / wsum),
+        "rms_adjacent_rad": math.sqrt(raw),
+        "rms_adjacent_corr_rad": math.sqrt(max(two_d, 0.0)),
+        "two_D_eff_raw": raw,
+        "two_D_noise": nz,
+        "two_D_eff": two_d,
+        "trigger": trig,
+        "estimator": ("P-weighted mean square of the wrapped change of the baseline solution "
+                      "phase between adjacent solutions (2 x the antenna mean square); noise = "
+                      "eps^2 of both antennas in both solutions, eps^2 = (N-1)/N / SNR^2 from "
+                      "the predicted solution SNR"),
+        "reason": (f"2 D_eff(T_hat = {cand['label']}) = {two_d:.3f} rad^2 (noise removed) "
+                   f"{'>' if trig else '<='} {threshold:g} rad^2: "
+                   + ("linear interpolation can break down; nearest-interpolation variants "
+                      "join G2" if trig else "linear interpolation kept")),
+    })
+    return rec
+
+
+def applycal_interp_string(default: str, interp: str = "linear") -> str:
+    """CASA applycal ``interp`` of a stage: the configured string, or its nearest form.
+
+    Spec: 10.2 item 6 (D34 F2: a stage that chose a nearest-interpolation
+    candidate is applied with nearest interpolation), 10 item 3 ('perobs'
+    kept). Only the time part (before a comma) changes:
+    'linearPDperobs' -> 'nearestPDperobs' (accepted by CASA 6.5.1 applycal,
+    ``tests/test_casa_solint.py``). ``interp="linear"`` returns ``default``.
+    """
+    if interp == "linear":
+        return default
+    if interp != "nearest":
+        raise ValueError(f"interp must be 'linear' or 'nearest'; got {interp!r}")
+    parts = str(default).split(",", 1)
+    time_part = parts[0].strip()
+    if not time_part.lower().startswith("linear"):
+        raise ValueError(f"the configured applycal interp must start with 'linear'; got {default!r}")
+    return ",".join(["nearest" + time_part[len("linear"):]] + parts[1:])
 
 
 # ============================================================================
@@ -1435,7 +1840,8 @@ def choose_solint(a: Optional[int], b: Optional[int], T_of: Callable[[int], floa
     """The longer of the rule-A and rule-B answers when they disagree.
 
     Spec: 10.2 item 6 ("一致しなければ長い方を選ぶ"), C.3 (the safe side
-    against fitting noise).
+    against fitting noise). A linear candidate and its nearest variant (D34
+    F2) have the same length: then rule A's answer is taken.
     """
     if a is None and b is None:
         return None, "no candidate was evaluated"
@@ -1444,6 +1850,10 @@ def choose_solint(a: Optional[int], b: Optional[int], T_of: Callable[[int], floa
         return k, "only one rule gave an answer"
     if a == b:
         return a, "rules A and B agree"
+    if T_of(a) == T_of(b):
+        # only a linear candidate and its nearest variant share T (D34 F2)
+        return a, ("rules A and B give the same interval with different interpolation; "
+                   "rule A (loss-table corrected) is taken")
     k = a if T_of(a) >= T_of(b) else b
     return k, "rules A and B disagree; the longer interval is taken"
 
@@ -1569,15 +1979,19 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
 
     Spec: 10.2 items 1-8 and 14 (and the record listed after item 14), C.2,
     C.3; P18 decision; P23 (measurement and production self-cal use the same
-    rules).
+    rules); D34 F3 (candidate step for mixed integration times,
+    :func:`geometry_candidates`) and F2 (nearest-interpolation variants when
+    ``2 D_eff(T_hat) > 1 rad^2``, :func:`adjacent_solution_structure`).
 
     ``state``: the current data (DATA of the last accepted stage, MODEL of
     its image) with ``phi0`` tracked to state 0. ``chain``: the accepted
     stages (for the reference state re-solved on the training half). Stage 1
     evaluates one solution per EB only. Returns a JSON-able record with the
     measured quantities, every candidate (G1, prediction, G2), rules A/B,
-    the chosen candidate and the decision with its reason; the internal
-    objects needed by the caller are under ``"_"``.
+    the chosen candidate, its interpolation (``chosen_interp``: "linear" or
+    "nearest"; :func:`applycal_interp_string` gives the CASA string) and the
+    decision with its reason; the internal objects needed by the caller are
+    under ``"_"``.
     """
     rec: Dict[str, Any] = {"stage": int(stage)}
     s_map = noise_scale(state, geom)
@@ -1600,6 +2014,8 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
         "n_scans": geom.n_scans,
         "g2_split": mode,
         "combine_spw": bool(combine_spw),
+        "it_step_s": geom.it_step,
+        "it_step": dict(geom.it_step_record),
     }
     if fit.get("significant") and np.isfinite(r_med) and r_med > 0:
         a_lin = atmospheric_coefficient(fit["beta"], "linear")
@@ -1608,9 +2024,7 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
     else:
         rec["measured"]["T_star_closed_s"] = None
 
-    eb_span = sum(geom.obs_span.values())
-    cands = candidate_solints(geom.scan_nint_median, geom.it_ref, geom.max_scans_per_obs, eb_span,
-                              int(geom.scan_nint.max()) if geom.scan_nint.size else None)
+    cands = geometry_candidates(geom)
     if stage == 1:
         cands = [c for c in cands if c["kind"] == "eb"]
     for i, c in enumerate(cands):
@@ -1647,8 +2061,7 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
         to_eval = passing
         k_pred = passing[0]
     else:
-        scored = [k for k in passing
-                  if not (mode == "time" and cands[k]["kind"] == "int" and cands[k]["n_int"] == 1)]
+        scored = [k for k in passing if not (mode == "time" and _single_integration(cands[k]))]
         with_pred = [k for k in passing if "V_pred" in cands[k]]
         k_pred = (min(with_pred, key=lambda k: cands[k]["V_pred"]) if with_pred else passing[-1])
         eb_k = [c["index"] for c in cands if c["kind"] == "eb" and c["index"] in passing]
@@ -1672,11 +2085,47 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
 
     for k in to_eval:
         run_g2(k)
+
+    # D34 F2 (provisional): when 2 D_eff(T_hat) from adjacent solutions exceeds
+    # 1 rad^2, every G1-passing interval gets a nearest-interpolation variant
+    # (same solutions, applied piecewise constant); G2 evaluates the variants
+    # of the intervals it evaluates, and the same rules choose among all.
+    nearest_of: Dict[int, int] = {}
+    if stage == 1:
+        rec["interpolation"] = {"computed": False, "trigger": False,
+                                "reason": "stage 1 (one solution per EB): no adjacent solutions"}
+    else:
+        rec["interpolation"] = adjacent_solution_structure(state, geom, cands[k_pred], s_rows,
+                                                           combine_spw, refant, minblperant, dfun)
+    if rec["interpolation"]["trigger"]:
+        for k in passing:
+            c = cands[k]
+            if c["kind"] not in ("int", "scan"):
+                continue
+            nc = {kk: vv for kk, vv in c.items()
+                  if kk not in ("index", "g2", "evaluated", "V_atm", "V_th", "V_pred", "kappa_full")}
+            nc.update({"label": f"{c['label']}_nearest", "interp": "nearest", "linear_index": k,
+                       "index": len(cands), "g1": dict(c["g1"])})
+            if np.isfinite(r_med) and r_med > 0:
+                nc.update(predict_residual_variance(state, geom, nc, dfun, r_med, combine_spw))
+            nc["evaluated"] = False
+            cands.append(nc)
+            nearest_of[k] = nc["index"]
+        for k in to_eval:
+            if k in nearest_of:
+                run_g2(nearest_of[k])
+
     evald = [dict(results[k], V_held=results[k]["V_held"]) for k in sorted(results)]
     ka = rule_a(evald)
-    kb = rule_b(evald, passing)
+    passing_b = passing
+    if nearest_of:
+        # rule B steps one interval shorter within the interpolation of the held-out argmin
+        arg = int(min(evald, key=lambda e: e["V_held"])["index"])
+        if cands[arg].get("interp") == "nearest":
+            passing_b = [nearest_of.get(k, k) for k in passing]
+    kb = rule_b(evald, passing_b)
     if kb is not None and kb not in results:
-        if not (mode == "time" and cands[kb]["kind"] == "int" and cands[kb]["n_int"] == 1):
+        if not (mode == "time" and _single_integration(cands[kb])):
             run_g2(kb)
     kc, why = choose_solint(ka, kb, lambda k: cands[k]["T_s"])
     if kc is not None and kc not in results:
@@ -1685,6 +2134,7 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
     rec["rule_B"] = cands[kb]["label"] if kb is not None else None
     rec["chosen"] = cands[kc]["label"] if kc is not None else None
     rec["chosen_reason"] = why
+    rec["chosen_interp"] = cands[kc].get("interp", "linear")
     res = results[kc]
     dec = acceptance(stage, res["improvement_corr"], res["sigma"])
     rec["decision"] = "apply" if dec["accept"] else ("skip" if stage == 1 else "stop")

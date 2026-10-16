@@ -1874,10 +1874,14 @@ Infrastructure
             raise ValueError("schedule.mode='data' needs gaincal.applymode='calonly': the solutions "
                              "below the G1 gate are flagged so that those antennas keep the "
                              f"previous stage (got {cfg.gaincal.applymode!r}, which would flag data)")
+        # The configured interpolation is linear; a stage switches itself to the
+        # nearest form of it only when G2 chose a nearest-interpolation candidate
+        # (ASEBI SPEC 10.2 item 6, D34 F2; solint.applycal_interp_string).
         interp = cfg.gaincal.applycal_interp.split(",")[0].strip().lower()
         if not interp.startswith("linear"):
             raise ValueError("schedule.mode='data' predicts and evaluates the stages with linear time "
-                             "interpolation of the solutions; gaincal.applycal_interp must be "
+                             "interpolation of the solutions (a stage switches to nearest only when "
+                             "G2 chooses it); gaincal.applycal_interp must be "
                              f"'linear...' (e.g. 'linearPDperobs'); got {cfg.gaincal.applycal_interp!r}")
         parts = [x.strip() for x in cfg.gaincal.combine.split(",") if x.strip()]
         bad = [x for x in parts if x not in ("scan", "spw")]
@@ -2934,7 +2938,8 @@ Infrastructure
         }
         summary: Dict[str, Any] = {
             "mode": "data",
-            "spec": "ASEBI SPEC v0.3 section 10.2, appendices C.2-C.3; DESIGN_REVIEW P17, P18, P23",
+            "spec": ("ASEBI SPEC v0.3 section 10.2, appendices C.2-C.3; DESIGN_REVIEW P17, P18, P23, "
+                     "D34 (F2, F3)"),
             "rules": {
                 "g1_snr_min": _solint.G1_SNR_MIN,
                 "gaincal_minsnr": float(cfg.gaincal.minsnr),
@@ -2945,6 +2950,12 @@ Infrastructure
                 "loss_table": {"snr": list(_solint.LOSS_TABLE_SNR),
                                "neg_ln_C": list(_solint.LOSS_TABLE_NEG_LN_C)},
                 "amplitude": cfg.schedule.amplitude,
+                "candidate_step": (f"least common multiple of the integration times (within "
+                                   f"{_solint.IT_MATCH_RTOL:.0%}) up to "
+                                   f"{_solint.IT_LCM_MAX_FACTOR:g} x the longest, else the "
+                                   f"median integration time"),
+                "nearest_trigger_two_D_rad2": _solint.NEAREST_TRIGGER_2D,
+                "applycal_interp": cfg.gaincal.applycal_interp,
             },
             "combine_spw": combine_spw,
             "stages": [],
@@ -2976,6 +2987,8 @@ Infrastructure
                                                                  self._sc["halves"])),
             "spwmap": self._sc["spwmap"],
             "split_note": self._sc.get("split_note"),
+            "it_step": (dict(self._sc["geom"].it_step_record) if self._sc["geom"] is not None
+                        else None),
         })
         self._derived["selfcal_summary"] = summary
         if cfg.verbose:
@@ -3073,6 +3086,10 @@ Infrastructure
                                            "spw" if sc["combine_spw"] else "") if x)
             spwmap = self._data_spwmap(state)
             sc["spwmap"] = spwmap
+            # the stage's time interpolation: the configured (linear) one, or its nearest
+            # form when G2 chose a nearest variant (ASEBI SPEC 10.2 item 6, D34 F2)
+            stage_interp = _solint.applycal_interp_string(cfg.gaincal.applycal_interp,
+                                                          cand.get("interp", "linear"))
             label = f"phase_{cand['label']}"
             step = SelfcalStep("p", cand["gaincal_solint"], label=label)
             if not copied:
@@ -3091,7 +3108,7 @@ Infrastructure
                 self._record_unapplied_stage(k, selection)
                 return "stop", selection["reason"]
             self._plot_gain_table(str(caltable), k, step)
-            self._applycal(tmp_vis, caltable, spwmap=spwmap)
+            self._applycal(tmp_vis, caltable, spwmap=spwmap, interp=stage_interp)
             casatasks.split(vis=str(tmp_vis), outputvis=str(out_vis), datacolumn="corrected")
         finally:
             if copied:
@@ -3112,7 +3129,7 @@ Infrastructure
             table=str(caltable), solint=cand["gaincal_solint"],
             solint_s=None if cand["kind"] == "eb" else float(cand["T_s"]),
             combine=combine, refant=refant, field=str(field_id), calmode="p", gaintype=g.gaintype, minsnr=g.minsnr,
-            minblperant=g.minblperant, solnorm=False, interp=g.applycal_interp,
+            minblperant=g.minblperant, solnorm=False, interp=stage_interp,
             applymode=g.applymode, calwt=g.calwt, spwmap=spwmap or g.spwmap,
             model_image=model_info["model_image"], model_nterms=model_info["nterms"],
             model_reffreq_hz=model_info.get("reffreq_hz"), solved_on=str(prev_vis),
@@ -3279,6 +3296,11 @@ Infrastructure
                 line += (f", dV_held {g2['dV_raw']:+.4f} +- {g2['sigma']:.4f}, "
                          f"corrected improvement {g2['improvement_corr']:+.4f}")
             print(line)
+        ip = sel.get("interpolation") or {}
+        if ip.get("computed"):
+            print(f"[AJISAI]   adjacent solutions at {ip['candidate']}: 2 D_eff = "
+                  f"{ip['two_D_eff']:.3f} rad^2 (raw {ip['two_D_eff_raw']:.3f}) -> "
+                  + ("nearest variants evaluated" if ip.get("trigger") else "linear only"))
         print(f"[AJISAI]   rule A {sel.get('rule_A')}, rule B {sel.get('rule_B')} -> "
               f"{sel.get('chosen')}: {sel.get('decision')} ({sel.get('reason')})")
 
@@ -3323,11 +3345,13 @@ Infrastructure
                 return st
         return None
 
-    def _applycal(self, vis, caltable, spwmap=None) -> None:
+    def _applycal(self, vis, caltable, spwmap=None, interp: Optional[str] = None) -> None:
         """applycal of one self-cal table on an AJISAI-owned temporary MS.
 
         ``spwmap`` overrides ``GainCalConfig.spwmap`` (mode="data" derives it
-        when spws are combined and none was given).
+        when spws are combined and none was given); ``interp`` overrides
+        ``GainCalConfig.applycal_interp`` (mode="data": the stage's own
+        interpolation, nearest when G2 chose it; ASEBI SPEC 10.2 item 6, D34 F2).
         """
         g = self.cfg.gaincal
         spwmap = [int(x) for x in (g.spwmap if spwmap is None else spwmap)]
@@ -3336,7 +3360,7 @@ Infrastructure
             gaintable=[str(caltable)],
             spwmap=[spwmap] if spwmap else [],
             calwt=g.calwt,
-            interp=g.applycal_interp,
+            interp=g.applycal_interp if interp is None else interp,
             applymode=g.applymode,
         )
 

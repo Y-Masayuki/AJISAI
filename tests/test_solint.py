@@ -173,6 +173,178 @@ def test_one_scan_per_observation_has_no_scan_candidate():
 
 
 # ---------------------------------------------------------------------------
+# Candidate step for EBs of different integration times (Spec 10.2 item 3, D34 F3)
+# ---------------------------------------------------------------------------
+def test_integration_step_rule_constants():
+    assert so.IT_MATCH_RTOL == 0.01
+    assert so.IT_LCM_MAX_FACTOR == 4.0
+
+
+def test_integration_step_of_dg_tau_b_is_6_048_s():
+    st = so.integration_step([2.016, 6.048, 2.016], it_median=2.016)
+    assert st["rule"] == "lcm" and st["warning"] is None
+    assert st["step_s"] == pytest.approx(6.048, abs=1e-12)
+    np.testing.assert_allclose(st["distinct_s"], [2.016, 6.048])
+    assert st["multiples"] == [3, 1]
+
+
+def test_integration_step_single_time_changes_nothing():
+    for its, med in (([6.048], 6.048), ([6.048, 6.048, 6.048], 6.048), ([], 2.0)):
+        st = so.integration_step(its, it_median=med)
+        assert st["rule"] == "single" and st["step_s"] == med and st["warning"] is None
+
+
+@pytest.mark.parametrize("its, rule, n_distinct, step", [
+    ([2.016, 2.0159], "single", 1, None),          # within 1 %: one value, step = the median
+    ([2.016, 2.0159, 6.048], "lcm", 2, 6.048),     # 6.048 / 2.01595 = 3.00007
+    ([2.0, 6.05], "lcm", 2, 6.05),                 # 3.025: an integer multiple within 1 %
+    ([2.0, 2.03], "median_fallback", 2, None),     # 1.5 % apart: two values, no multiple <= 4x
+    ([2.0, 6.15], "median_fallback", 2, None),     # 3.075: 2.5 % off any integer multiple
+])
+def test_integration_step_one_percent_tolerance(its, rule, n_distinct, step):
+    st = so.integration_step(its, it_median=its[0])
+    assert st["rule"] == rule and len(st["distinct_s"]) == n_distinct
+    assert st["step_s"] == pytest.approx(step if step is not None else its[0])
+
+
+@pytest.mark.parametrize("its, lcm, rule", [
+    ([2.0, 7.0], 14.0, "lcm"),              # 14 <= 4 x 7
+    ([3.0, 7.0], 21.0, "lcm"),
+    ([4.0, 7.0], 28.0, "lcm"),              # exactly 4 x the longest: accepted
+    ([5.0, 7.0], 35.0, "median_fallback"),  # 35 > 28
+])
+def test_integration_step_lcm_up_to_four_times_the_longest(its, lcm, rule):
+    st = so.integration_step(its, it_median=6.0)
+    assert st["lcm_s"] == pytest.approx(lcm) and st["rule"] == rule
+    if rule == "lcm":
+        assert st["step_s"] == pytest.approx(lcm) and st["warning"] is None
+    else:
+        assert st["step_s"] == 6.0
+        assert "35" in st["warning"] and "median" in st["warning"]
+
+
+def _mixed_summary(n_ant=5, jitter=2e-4, seed=0):
+    """Two EBs: 2.016 s (scans of 30 and 31 integrations) and 6.048 s (two scans of 10)."""
+    rng = np.random.default_rng(seed)
+    a1, a2 = np.triu_indices(n_ant, 1)
+    nb = a1.size
+    cols = {k: [] for k in ("time", "obs", "scan")}
+    for o, it, nints in ((0, 2.016, (30, 31)), (1, 6.048, (10, 10))):
+        t0 = 1e5 * o
+        for sc, n in enumerate(nints, 1):
+            t = t0 + np.arange(n) * it + rng.uniform(-jitter, jitter, n)
+            t0 = t[-1] + 120.0
+            cols["time"].append(np.repeat(t, nb))
+            cols["obs"].append(np.full(n * nb, o))
+            cols["scan"].append(np.full(n * nb, sc))
+    time = np.concatenate(cols["time"])
+    n = time.size
+    return so.VisSummary(time=time, obs=np.concatenate(cols["obs"]),
+                         scan=np.concatenate(cols["scan"]), spw=np.zeros(n, int),
+                         a1=np.tile(a1, n // nb), a2=np.tile(a2, n // nb), y=np.ones(n, complex),
+                         P=np.ones(n), antenna_names=[f"A{k}" for k in range(n_ant)])
+
+
+def test_mixed_integration_times_step_by_the_least_common_multiple():
+    vs = _mixed_summary()
+    geom = so.geometry(vs)
+    assert geom.int_time[0] == pytest.approx(2.016, abs=1e-3)
+    assert geom.int_time[1] == pytest.approx(6.048, abs=1e-3)
+    assert geom.it_step_record["rule"] == "lcm"
+    assert geom.it_step == pytest.approx(6.048, abs=1e-3)
+    # scan lengths in steps: 10, 10.33 (31 x 2.016 s), 10, 10
+    np.testing.assert_allclose(sorted(geom.scan_nstep), [10, 10, 10, 31 / 3], atol=1e-3)
+    assert geom.scan_nstep_median == pytest.approx(10.0, abs=1e-3) and geom.scan_nstep_max == 11
+    cands = so.geometry_candidates(geom)
+    ints = [c for c in cands if c["kind"] == "int"]
+    assert [c["n_int"] for c in ints] == [1, 2, 3, 5]
+    assert [c["kind"] for c in cands[len(ints):]] == ["scan", "eb"]
+    for c in ints:
+        d = c["n_int"]
+        assert c["T_s"] == pytest.approx(d * geom.it_step)
+        assert c["n_int_by_it_s"] == {"2.016": 3 * d, "6.048": d}
+        assert c["gaincal_solint"] != "int"
+        # one solint for both EBs: below n IT_i by a quarter of the common window
+        m = math.ceil(11 / d)
+        assert float(c["gaincal_solint"].rstrip("s")) == pytest.approx(
+            d * geom.it_step - geom.int_time[0] / (4 * m), abs=2e-3)
+    assert cands[len(ints)]["n_int_by_it_s"] == {"2.016": 30, "6.048": 10}
+    # T = 1 step solves single integrations of the 6.048 s EB: not scorable by even/odd
+    assert so._single_integration(ints[0]) and not so._single_integration(ints[1])
+
+
+def test_mixed_integration_times_line_up_with_every_eb():
+    """gaincal's chunks hold exactly n_i = T / IT_i integrations of every EB (last one fractional)."""
+    vs = _mixed_summary()
+    geom = so.geometry(vs)
+    for c in [x for x in so.geometry_candidates(geom) if x["kind"] == "int"]:
+        units = so.solution_units(vs, geom, c, combine_spw=False)
+        for o, key in ((0, "2.016"), (1, "6.048")):
+            n_i = c["n_int_by_it_s"][key]
+            sel = vs.obs == o
+            for sc in np.unique(vs.scan[sel]):
+                rows = sel & (vs.scan == sc)
+                k = geom.k_in_scan[rows]
+                u = units.of_row[rows]
+                # rows of the same unit are exactly the integrations k // n_i of the scan
+                _, chunk = np.unique(u, return_inverse=True)
+                assert np.array_equal(np.asarray(chunk).ravel(), k // n_i)
+                nt = units.n_times[np.unique(u)]
+                assert np.all(nt[:-1] == n_i) and 1 <= nt[-1] <= n_i
+
+
+def test_single_integration_time_gives_the_previous_candidates():
+    vs, _ = sim.simulate(n_ant=8, n_scans=3, n_int=12, it=6.048, seed=1)
+    geom = so.geometry(vs)
+    assert geom.it_step_record["rule"] == "single" and geom.it_step == geom.it_ref
+    before = so.candidate_solints(geom.scan_nint_median, geom.it_ref, geom.max_scans_per_obs,
+                                  sum(geom.obs_span.values()), int(geom.scan_nint.max()))
+    assert so.geometry_candidates(geom) == before
+    assert [c["gaincal_solint"] for c in before][:3] == ["int", "11.8440s", "17.7660s"]
+    # two EBs whose integration times agree within 1 %: one value, candidates as before
+    a, pa = sim.simulate(n_ant=8, n_scans=3, n_int=12, it=6.048, seed=1)
+    b, pb = sim.simulate(n_ant=8, n_scans=3, n_int=12, it=6.0479, seed=2, obs_offset=1e5)
+    vs2, _ = sim.concat([(a, pa), (b, pb)])
+    g2 = so.geometry(vs2)
+    assert g2.it_step_record["rule"] == "single" and g2.it_step == g2.it_ref
+    assert so.geometry_candidates(g2) == so.candidate_solints(
+        g2.scan_nint_median, g2.it_ref, g2.max_scans_per_obs, sum(g2.obs_span.values()),
+        int(g2.scan_nint.max()))
+
+
+def test_no_common_multiple_falls_back_to_the_median_with_a_warning():
+    a, pa = sim.simulate(n_ant=6, n_scans=2, n_int=12, it=5.0, seed=1)
+    b, pb = sim.simulate(n_ant=6, n_scans=2, n_int=12, it=7.0, seed=2, obs_offset=1e5)
+    vs, _ = sim.concat([(a, pa), (b, pb)])
+    with pytest.warns(UserWarning, match="least common multiple is 35"):
+        geom = so.geometry(vs)
+    assert geom.it_step_record["rule"] == "median_fallback"
+    assert geom.it_step == geom.it_ref
+    assert so.geometry_candidates(geom) == so.candidate_solints(
+        geom.scan_nint_median, geom.it_ref, geom.max_scans_per_obs, sum(geom.obs_span.values()),
+        int(geom.scan_nint.max()))
+
+
+def test_mixed_integration_times_end_to_end():
+    """DG Tau B-like concatenation (2.016 s and 6.048 s EBs): the stages run on the 6.048 s step."""
+    a, pa = sim.simulate(n_ant=12, n_scans=3, n_int=30, it=2.016, gap=60.0, r=3.0, tau0=300.0,
+                         seed=31)
+    b, pb = sim.simulate(n_ant=12, n_scans=3, n_int=10, it=6.048, gap=60.0, r=3.0, tau0=300.0,
+                         seed=32, obs_offset=1e5)
+    vs, _ = sim.concat([(a, pa), (b, pb)])
+    recs, chain, final = sim.run_loop(vs)
+    assert recs[0]["decision"] == "apply"
+    for r in recs:
+        meas = r["measured"]
+        assert meas["it_step"]["rule"] == "lcm" and meas["it_step_s"] == pytest.approx(6.048, abs=1e-3)
+        for c in r["candidates"]:
+            if c["kind"] == "int":
+                assert c["T_s"] / 6.048 == pytest.approx(round(c["T_s"] / 6.048), abs=1e-6)
+                assert c["n_int_by_it_s"]["2.016"] == 3 * c["n_int_by_it_s"]["6.048"]
+    assert len(chain) >= 2 and chain[1].cand["kind"] in ("int", "scan")
+
+
+# ---------------------------------------------------------------------------
 # Solution units reproduce gaincal's chunking (CASA 6.5.1, combine='')
 # ---------------------------------------------------------------------------
 def _two_scan_summary(n_ant=5):
@@ -251,6 +423,61 @@ def test_phase_interpolation_takes_the_short_way_round():
     values = np.array([[3.0], [-3.0]])           # 6 rad apart the long way, 0.28 rad short way
     val, ok = so._row_values(values, np.ones((2, 1), bool), lo, hi, f, np.zeros(1, int), True)
     assert abs(np.angle(np.exp(1j * (val[0] - 3.0)))) < 0.2
+
+
+def test_nearest_weights_ties_go_to_the_earlier_solution():
+    """CASA 6.5.1 applycal 'nearest': the nearest solution time, ties to the earlier one."""
+    st = np.array([0.0, 18.0, 36.0, 48.0])
+    t = np.array([-6.0, 0.0, 6.0, 9.0, 12.0, 18.0, 24.0, 27.0, 30.0, 42.0, 48.0, 54.0])
+    lo, hi, f = so.nearest_weights(t, st)
+    assert lo.tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3]
+    assert hi.tolist() == lo.tolist() and f.tolist() == [0.0] * t.size
+
+
+def test_nearest_rows_take_their_own_interval_and_a_flagged_one_is_not_skipped():
+    # four intervals; interval 2 has no solution time (no training row in it)
+    units = so.Units(of_row=np.array([0, 0, 1, 1, 1, 2, 2, 3]),
+                     time=np.array([3.0, 15.0, np.nan, 39.0]), obs=np.zeros(4, int),
+                     group=np.zeros(4, int), n_times=np.array([2, 3, 2, 1]))
+    t = np.arange(0, 48, 6.0)       # 0, 6, ..., 42
+    zero = np.zeros(t.size, int)
+    lo, hi, f = so._row_nearest(units, t, zero, zero)
+    # own interval; rows of interval 2 (30, 36 s) take the nearest solution time (39 s)
+    assert lo.tolist() == [0, 0, 1, 1, 1, 3, 3, 3] and np.all(f == 0)
+    values = np.array([[0.1], [0.2], [0.3], [0.4]])
+    good = np.array([[True], [False], [True], [True]])
+    val, ok = so._row_values(values, good, lo, hi, f, zero, phase=True)
+    # the flagged solution of interval 1 leaves its own rows uncorrected (calonly)
+    assert ok.tolist() == [True, True, False, False, False, True, True, True]
+    np.testing.assert_allclose(val[ok], [0.1, 0.1, 0.4, 0.4, 0.4])
+
+
+def test_kappa_and_the_box_coefficient_of_nearest_interpolation():
+    sol = np.arange(20) * 10.0 + 5.0
+    t = np.linspace(sol[0], sol[-1], 2001)[:-1]
+    assert so.kappa_geometry(t, sol, "nearest") == 1.0
+    # the discrete prediction with nearest weights is a = 1/((beta+1)(beta+2)) (Spec C.2)
+    beta = 1.3
+    members = [k + (np.arange(400) + 0.5) / 400 for k in range(5)]
+    centres = np.array([m.mean() for m in members])
+    ev = np.linspace(0.5, 4.5, 801)[:-1]
+    var = so._interval_variance(ev, members, centres, lambda lag: np.abs(lag) ** beta, "nearest")
+    assert var.mean() == pytest.approx(so.box_coefficient(beta), rel=3e-3)
+    lin = so._interval_variance(ev, members, centres, lambda lag: np.abs(lag) ** beta)
+    assert lin.mean() < var.mean()
+    with pytest.raises(ValueError):
+        so.kappa_geometry(t, sol, "cubic")
+
+
+def test_applycal_interp_string():
+    assert so.applycal_interp_string("linearPDperobs", "nearest") == "nearestPDperobs"
+    assert so.applycal_interp_string("linearperobs", "nearest") == "nearestperobs"
+    assert so.applycal_interp_string("linear,linear", "nearest") == "nearest,linear"
+    assert so.applycal_interp_string("linearPDperobs") == "linearPDperobs"
+    with pytest.raises(ValueError):
+        so.applycal_interp_string("nearestperobs", "nearest")
+    with pytest.raises(ValueError):
+        so.applycal_interp_string("linearPDperobs", "cubic")
 
 
 def test_interpolation_never_crosses_observations():
@@ -378,6 +605,14 @@ def test_rule_a_b_and_the_longer_when_they_disagree():
     k, why = so.choose_solint(1, 2, T.get)
     assert k == 2 and "longer" in why
     assert so.choose_solint(3, 3, T.get) == (3, "rules A and B agree")
+
+
+def test_choose_between_a_linear_candidate_and_its_nearest_variant():
+    """Same interval, different interpolation (D34 F2): rule A's answer."""
+    T = {3: 24.0, 7: 24.0, 8: 30.0}
+    k, why = so.choose_solint(7, 3, T.get)
+    assert k == 7 and "different interpolation" in why
+    assert so.choose_solint(3, 8, T.get)[0] == 8          # otherwise the longer, as before
 
 
 def test_rule_b_at_the_shortest_passing_candidate_returns_it():
@@ -564,3 +799,93 @@ def test_records_are_json_serialisable():
         raise TypeError(type(o))
     for r in recs:
         json.dumps(so.strip_internal(r), default=conv)
+
+
+# ---------------------------------------------------------------------------
+# Breakdown of linear interpolation: nearest variants in G2 (Spec 10.2 item 6, D34 F2)
+# ---------------------------------------------------------------------------
+def test_nearest_trigger_constant():
+    assert so.NEAREST_TRIGGER_2D == 1.0
+
+
+@pytest.mark.parametrize("n_int, two_d", [
+    (1, 2 * 6.0 / 60.0),            # point solutions: 2 D(6 s) = 0.2
+    (2, 2 * (12.0 - 3.0) / 60.0),   # means of 2 integrations: 2 (S12 - S11) = 0.3
+])
+def test_adjacent_solution_structure_recovers_the_screen(n_int, two_d):
+    """tau0 = 60 s, beta = 1, IT = 6 s: 2 D_eff from adjacent solutions after the noise is removed."""
+    vs, _ = sim.simulate(n_ant=12, n_scans=3, n_int=24, r=4.0, tau0=60.0, beta=1.0, seed=22)
+    geom = so.geometry(vs)
+    s_rows = so._s_rows(vs, so.noise_scale(vs, geom))
+    cand = [c for c in so.geometry_candidates(geom) if c.get("n_int") == n_int][0]
+    rec = so.adjacent_solution_structure(vs, geom, cand, s_rows, False, 0, 4,
+                                         dfun=lambda lag: np.abs(lag) / 60.0)
+    assert rec["computed"] and not rec["trigger"]
+    assert rec["lag_s"] == pytest.approx(6.0 * n_int)
+    assert rec["n_pairs"] == 3 * (24 // n_int - 1)
+    # noise: eps^2 = (N-1)/N / SNR^2 of both antennas in both solutions, SNR^2 = r^2 n IT
+    assert rec["two_D_noise"] == pytest.approx(4 * (11 / 12) / (16 * 6.0 * n_int), rel=0.1)
+    assert rec["two_D_eff"] == pytest.approx(two_d, rel=0.2)
+    assert rec["two_D_eff_raw"] == pytest.approx(rec["two_D_eff"] + rec["two_D_noise"])
+    assert rec["rms_adjacent_rad"] == pytest.approx(math.sqrt(rec["two_D_eff_raw"]))
+    assert rec["two_D_model"] == pytest.approx(2 * 6.0 * n_int / 60.0)
+
+
+def test_one_solution_per_eb_has_no_adjacent_solutions():
+    vs, _ = sim.simulate(n_ant=8, n_scans=2, n_int=8, r=3.0, tau0=200.0, seed=9)
+    geom = so.geometry(vs)
+    eb = so.geometry_candidates(geom)[-1]
+    rec = so.adjacent_solution_structure(vs, geom, eb, np.ones(vs.n_rows), False)
+    assert rec["computed"] is False and rec["trigger"] is False and "EB" in rec["reason"]
+
+
+def test_small_phase_steps_add_no_nearest_candidates():
+    """2 D_eff(T_hat) well below 1 rad^2: linear only, the decisions of the v0.3 rules."""
+    vs, _ = sim.simulate(n_ant=16, n_scans=4, n_int=20, r=3.0, tau0=200.0, beta=1.0, seed=3)
+    recs, chain, final = sim.run_loop(vs)
+    assert [r["decision"] for r in recs] == ["apply", "apply", "stop"]
+    assert [r["chosen"] for r in recs] == ["EB", "12s", "scan"]
+    assert recs[0]["interpolation"]["computed"] is False
+    ip = recs[1]["interpolation"]
+    assert ip["computed"] and not ip["trigger"] and ip["two_D_eff"] < 0.3
+    assert {"rms_adjacent_rad", "rms_adjacent_corr_rad", "two_D_eff_raw", "two_D_noise",
+            "two_D_eff", "two_D_model", "lag_s", "threshold_two_D"} <= set(ip)
+    assert all("interp" not in c for r in recs for c in r["candidates"])
+    assert all(r["chosen_interp"] == "linear" for r in recs)
+
+
+def test_large_phase_jumps_add_nearest_candidates_to_g2():
+    """Antenna phase jumps (2 D_eff(T_hat) = 2.3 rad^2): nearest variants evaluated like the others.
+
+    The held-out coherence decides; the test does not force a winner (here the
+    nearest variant of 24 s is chosen by both rules).
+    """
+    vs, _ = sim.simulate(n_ant=16, n_scans=4, n_int=20, r=1.5, tau0=2000.0, beta=1.0, seed=2,
+                         jumps=(1 / 30.0, 2.0))
+    recs, chain, final = sim.run_loop(vs)
+    second = recs[1]
+    ip = second["interpolation"]
+    assert ip["trigger"] and 1.5 < ip["two_D_eff"] < 3.5
+    assert ip["rms_adjacent_rad"] > 1.0 and ip["candidate"] == second["T_pred"]
+    cands = second["candidates"]
+    near = [c for c in cands if c.get("interp") == "nearest"]
+    assert near and all(c["label"].endswith("_nearest") for c in near)
+    for c in near:
+        lin = cands[c["linear_index"]]
+        assert lin["kind"] in ("int", "scan") and lin["g1"]["pass"]
+        assert (c["T_s"], c["gaincal_solint"], c["g1"]) == (lin["T_s"], lin["gaincal_solint"],
+                                                             lin["g1"])
+        assert "V_pred" in c
+    # every interval G2 evaluated with linear interpolation was evaluated with nearest too
+    lin_eval = {c["label"] for c in cands if c["evaluated"] and "interp" not in c
+                and c["kind"] in ("int", "scan")}
+    near_eval = {c["label"][:-len("_nearest")] for c in near if c["evaluated"]}
+    assert lin_eval and lin_eval <= near_eval
+    for c in near:
+        if c["evaluated"]:
+            assert c["g2"]["kappa_held"] == 1.0
+            assert {"C_held", "sigma", "improvement_corr"} <= set(c["g2"])
+    assert (second["chosen_interp"] == "nearest") == second["chosen"].endswith("_nearest")
+    # the chosen interpolation is carried by the stage into production and the next G2 reference
+    if second["decision"] == "apply":
+        assert chain[1].cand.get("interp", "linear") == second["chosen_interp"]

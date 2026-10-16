@@ -118,6 +118,29 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
   image, and it is recorded in the `rms_info` of `justification.json`.
 
 - `solve.field`: the gaincal field selection is recorded with each stage (`SOLVE_INFO_KEYS`), so a caller can re-solve the stage exactly; the per-stage model images are documented as kept after the run.
+- **Mixed integration times (ASEBI SPEC 10.2 item 3, D34 F3).** When the
+  execution blocks of a run have different integration times, the candidate
+  solution intervals step by their least common multiple (times within 1 %
+  count as one; e.g. 2.016 s and 6.048 s -> 6.048 s), so that on every EB the
+  intervals line up with its integrations; one gaincal `solint` serves all
+  EBs. A least common multiple above 4x the longest integration time falls
+  back to the median integration time with a warning. Recorded in
+  `selection["measured"]["it_step"]` and `selfcal["it_step"]`
+  (`solint.integration_step`, `solint.geometry_candidates`). A single
+  integration time gives exactly the previous candidates.
+- **Nearest interpolation when linear interpolation can break down (ASEBI
+  SPEC 10.2 item 6, D34 F2, provisional).** From stage 2 on, the solutions of
+  the predicted best interval are solved once on all data; when
+  `2 D_eff(T_hat)` from the changes of adjacent solutions, solution noise
+  removed, exceeds 1 rad^2, every G1-passing interval gets a nearest-
+  interpolation variant (`"<label>_nearest"`), G2 evaluates the variants of
+  the intervals it evaluates, and the same rules choose. A stage that picks a
+  nearest variant is applied with the nearest form of
+  `GainCalConfig.applycal_interp` (`linearPDperobs` -> `nearestPDperobs`) and
+  records it in `solve["applycal"]["interp"]`. The adjacent-solution
+  quantities are recorded in `selection["interpolation"]`, the choice in
+  `selection["chosen_interp"]`. When the trigger does not fire, the stage
+  decisions are unchanged.
 
 ### Changed
 

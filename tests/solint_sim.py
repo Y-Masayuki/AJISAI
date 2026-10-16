@@ -7,9 +7,11 @@ row (baseline, integration, spw) has the model power ``P`` and
 reduction ``y = sum w V M*``, ``P = sum w |M|^2`` of a measurement set whose
 weights are wrong by the factor ``s``. Antenna phases follow a Gaussian
 process with the structure function ``D(tau) = (tau/tau0)^beta`` (per
-antenna). ``production`` applies a numpy full-data solution the way
-gaincal + applycal (calonly, linearPD, G1 gate) would, so that the stage
-logic can be run end to end without CASA.
+antenna), optionally with random phase jumps. ``production`` applies a
+numpy full-data solution the way gaincal + applycal (calonly, linearPD or
+nearest as the candidate says, G1 gate) would, so that the stage logic can
+be run end to end without CASA. ``concat`` joins execution blocks (e.g.
+with different integration times) into one run.
 """
 from __future__ import annotations
 
@@ -30,9 +32,27 @@ def phase_screen(times, n_ant, tau0, beta, rng):
     return ph
 
 
+def phase_jumps(times, n_ant, rate, rms, rng):
+    """Antenna phase steps: Poisson times (``rate`` per s and antenna), Gaussian sizes (``rms`` rad)."""
+    t = np.asarray(times, dtype=float)
+    out = np.zeros((t.size, n_ant))
+    span = float(t[-1] - t[0]) if t.size else 0.0
+    for a in range(n_ant):
+        n = rng.poisson(rate * span)
+        at = np.sort(rng.uniform(t[0], t[-1], n))
+        size = rng.normal(0.0, rms, n)
+        out[:, a] = np.array([size[at <= x].sum() for x in t])
+    return out
+
+
 def simulate(*, n_ant=16, n_scans=4, n_int=20, it=6.0, gap=60.0, n_spw=1, r=1.0, s=1.0,
-             tau0=300.0, beta=1.0, seed=1, halves=False, obs_offset=0.0):
-    """One execution block of reduced rows; ``r`` is the per-antenna SNR rate (all spws)."""
+             tau0=300.0, beta=1.0, seed=1, halves=False, obs_offset=0.0, jumps=None):
+    """One execution block of reduced rows; ``r`` is the per-antenna SNR rate (all spws).
+
+    ``jumps=(rate_per_s, rms_rad)`` adds antenna phase steps (:func:`phase_jumps`)
+    drawn from a separate random stream, so the rest of the simulation is the
+    same with and without them.
+    """
     rng = np.random.default_rng(seed)
     times = []
     scans = []
@@ -46,6 +66,9 @@ def simulate(*, n_ant=16, n_scans=4, n_int=20, it=6.0, gap=60.0, n_spw=1, r=1.0,
     times = np.asarray(times)
     scans = np.asarray(scans)
     phases = phase_screen(times, n_ant, tau0, beta, rng)
+    if jumps is not None:
+        phases = phases + phase_jumps(times, n_ant, jumps[0], jumps[1],
+                                      np.random.default_rng(seed + 1000))
     a1, a2 = np.triu_indices(n_ant, 1)
     nbl = a1.size
     # per-antenna information per integration: r^2 IT = (n_ant - 1) P / s (summed over spws)
@@ -79,6 +102,28 @@ def simulate(*, n_ant=16, n_scans=4, n_int=20, it=6.0, gap=60.0, n_spw=1, r=1.0,
     return reorder(vs, order), phases
 
 
+def concat(parts):
+    """Concatenate simulated execution blocks: observation k is ``parts[k]`` (rows re-sorted).
+
+    ``parts``: (VisSummary, phases) pairs as returned by :func:`simulate`
+    (each with its own ``obs_offset``). Returns the joint VisSummary and the
+    phases of each part (a list).
+    """
+    cat = {}
+    for name in ("time", "scan", "spw", "a1", "a2", "y", "P", "uvdist_m"):
+        cat[name] = np.concatenate([np.asarray(getattr(v, name)) for v, _ in parts])
+    obs = np.concatenate([np.full(v.n_rows, k, int) for k, (v, _) in enumerate(parts)])
+    halves = all(v.y_half is not None for v, _ in parts)
+    vs = so.VisSummary(time=cat["time"], obs=obs, scan=cat["scan"], spw=cat["spw"], a1=cat["a1"],
+                       a2=cat["a2"], y=cat["y"], P=cat["P"],
+                       antenna_names=list(parts[0][0].antenna_names), S=cat["y"].copy(),
+                       uvdist_m=cat["uvdist_m"],
+                       y_half=np.concatenate([v.y_half for v, _ in parts], axis=1) if halves else None,
+                       P_half=np.concatenate([v.P_half for v, _ in parts], axis=1) if halves else None)
+    order = np.lexsort((vs.time, vs.a2, vs.a1, vs.spw, vs.obs))
+    return reorder(vs, order), [p for _, p in parts]
+
+
 def reorder(vs, order):
     def pick(x):
         if x is None:
@@ -110,7 +155,7 @@ def production(vs, geom, cand, state0, combine_spw=False, refant=0):
     s_rows = so._s_rows(vs, so.noise_scale(vs, geom))
     ph, valid = so._solve_units(vs, units, vs.y, vs.P, np.ones(vs.n_rows, bool), refant, 4)
     good = valid & (so.unit_snr(vs, units, s_rows) >= so.G1_SNR_MIN)
-    rowphase, ok = so.apply_units(vs, units, ph, good)
+    rowphase, ok = so.apply_units(vs, units, ph, good, cand.get("interp", "linear"))
     return rotate(vs, rowphase, state0)
 
 

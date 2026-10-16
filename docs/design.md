@@ -121,7 +121,11 @@ coarse grid of candidates suffices.
    data are re-imaged so that the model improves.
 2. *Candidates*: integer multiples of the integration time that divide the
    median scan length (with non-divisors added where neighbours differ by
-   more than a factor 2), the scan, and the EB.
+   more than a factor 2), the scan, and the EB. When the EBs have different
+   integration times, the step is their least common multiple (within 1 %;
+   2.016 s and 6.048 s give 6.048 s), so the intervals line up with the
+   integrations of every EB; above 4x the longest integration time the
+   median integration time is used, with a warning.
 3. *G1 (gate)*: a candidate needs a predicted true solution SNR of at least
    5 for the typical solution; antennas and solutions below 5 are flagged in
    the table and keep the previous stage's correction (`applymode='calonly'`;
@@ -136,7 +140,12 @@ coarse grid of candidates suffices.
    one read of DATA, MODEL_DATA, WEIGHT and FLAG; gaincal runs only for the
    chosen interval. Rule A takes the candidate with the best loss-corrected
    value, rule B the candidate one step shorter than the raw held-out
-   optimum; when they disagree the longer interval is taken.
+   optimum; when they disagree the longer interval is taken. When the
+   changes of adjacent solutions at the predicted best interval give
+   `2 D_eff > 1 rad^2` (solution noise removed), linear interpolation can
+   break down: nearest-interpolation variants of the intervals join G2 and
+   are chosen by the same rules (provisional); a stage that picks one is
+   applied with nearest interpolation.
 6. *Acceptance*: the stage is applied only when the loss-corrected held-out
    improvement exceeds `max(1 sigma, 0.001)`. From stage 2 on, the
    reference is the state re-solved on the training half with each stage's
