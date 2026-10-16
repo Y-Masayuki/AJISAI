@@ -70,6 +70,7 @@ def simulate_ms(
     dec: str = "-30d00m00.0s",
     alma_field_layout: bool = True,
     frame: str = "J2000",
+    shared_scans: bool = False,
 ) -> str:
     """Simulate one execution block into ``msname`` (DATA only).
 
@@ -86,6 +87,11 @@ def simulate_ms(
     ``frame`` is the frame of the stored FIELD and SOURCE directions: "J2000"
     (genuine J2000 numbers, as simulated) or "ICRS" (converted with
     casatools.measures, so the directions are physically the same).
+
+    ``shared_scans=True``: every spw observed in the same time block has one
+    scan number, as in real data (the simulator numbers each ``observe``
+    call, i.e. each spw, separately); gaincal combines spws only within a
+    scan.
     """
     import casatasks
     import casatools
@@ -175,6 +181,10 @@ def simulate_ms(
             sub.putcol("WEIGHT", w)
             sub.putcol("SIGMA", np.full(w.shape, sig))
             sub.close()
+        if shared_scans:
+            gap = np.diff(utimes) > 1.5 * float(int_s)
+            blk = np.concatenate([[0], np.cumsum(gap)]) + 1
+            tb.putcol("SCAN_NUMBER", blk[tindex].astype(np.int32))
     finally:
         tb.close()
     casatasks.split(vis=raw, outputvis=msname, datacolumn="data")

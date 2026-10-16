@@ -48,7 +48,7 @@ import warnings
 from dataclasses import asdict, dataclass, field as _dc_field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -966,12 +966,17 @@ def build_solve_info(
     n_solutions: int,
     flagged_solution_fraction: List[Dict[str, Any]],
     field: str = "",
+    spwmap_per_observation: Optional[Dict[int, Sequence[int]]] = None,
 ) -> Dict[str, Any]:
     """Per-stage record of how the gain table was solved and applied.
 
     Enough to re-solve the same stage later (same solint, combine, refant,
     field, model) and to re-apply the table elsewhere (interp, applymode,
     spwmap). ``field`` is the gaincal field selection ("" = all fields).
+    ``spwmap_per_observation`` (combined spws, ASEBI SPEC 9 item 3, D38 d):
+    the map of each observation from the table's spw labels; ``spwmap`` is
+    then the one map for all observations, or [] when the table needs one
+    applycal per observation.
     """
     info = {
         "table": str(table),
@@ -1000,6 +1005,9 @@ def build_solve_info(
         "n_solutions": int(n_solutions),
         "flagged_solution_fraction": flagged_solution_fraction,
     }
+    if spwmap_per_observation is not None:
+        info["applycal"]["spwmap_per_observation"] = {
+            str(int(o)): [int(x) for x in m] for o, m in sorted(spwmap_per_observation.items())}
     return info
 
 
@@ -3146,6 +3154,7 @@ Infrastructure
             "g2_split": (self._sc["geom"] and _solint.split_mode(self._sc["geom"],
                                                                  self._sc["halves"])),
             "spwmap": self._sc["spwmap"],
+            "spwmap_record": self._sc.get("spwmap_record"),
             "split_note": self._sc.get("split_note"),
             "it_step": (dict(self._sc["geom"].it_step_record) if self._sc["geom"] is not None
                         else None),
@@ -3181,18 +3190,115 @@ Infrastructure
             st.track_phase(sc["state0"])
         return st
 
-    def _data_spwmap(self, state) -> Optional[List[int]]:
-        """applycal spwmap for combined-spw tables: the configured one, else derived."""
+    def _data_spwmap(self, state, caltable: str) -> Optional[Dict[str, Any]]:
+        """applycal spwmap of a combined-spw table, from the spw labels gaincal wrote in it.
+
+        ASEBI SPEC 9 item 3 (D38 d; convention audit 2026-10-16, combine item
+        3 and time item 3): per observation, every spw with data is mapped to
+        the label gaincal wrote for that observation, read from all rows of the
+        table (flagged solutions included). The lowest spw of an observation is
+        not always the label (EBs of one setup merged by concat: labels 0, 1, 1;
+        a lowest spw without rows in some intervals), and a map built from the
+        spws with valid data missed a fully flagged lowest spw that still
+        labels the solutions ([0, 1] instead of [0, 0]: no spw-1 row
+        corrected). An observation with several labels has its other labels'
+        rows relabelled to its lowest label (a direct edit of the table AJISAI
+        just wrote, recorded); when no single map serves every observation,
+        applycal runs per observation. A configured ``GainCalConfig.spwmap``
+        that differs from the table's is warned about and not used. Returns
+        None without spw combination.
+        """
         g = self.cfg.gaincal
         if not self._sc["combine_spw"]:
             return None
-        if g.spwmap:
-            return [int(x) for x in g.spwmap]
-        per_obs: Dict[int, List[int]] = {}
+        labels = self._caltable_spw_labels(caltable)
+        spws: Dict[int, List[int]] = {}
         for o in np.unique(state.obs):
-            per_obs[int(o)] = sorted(int(x) for x in np.unique(state.spw[state.obs == o]))
+            spws[int(o)] = sorted(int(x) for x in np.unique(state.spw[state.obs == o]))
         nspw = int(self._derived.get("nspw") or (int(state.spw.max()) + 1))
-        return _solint.spwmap_for_combined_spw(per_obs, nspw)
+        nspw = max([nspw] + [max(v) + 1 for v in labels.values() if v])
+        rec = _solint.spwmap_from_labels(labels, spws, nspw)
+        rec["labels_by_observation"] = {str(o): list(v) for o, v in sorted(labels.items())}
+        if rec["relabel"]:
+            rec["relabelled_rows"] = self._relabel_caltable_spws(caltable, rec["relabel"])
+        if g.spwmap:
+            conf = [int(x) for x in g.spwmap]
+            agrees = rec["global"] is not None and conf == rec["global"]
+            rec["configured"] = conf
+            if not agrees:
+                msg = (f"GainCalConfig.spwmap {conf} does not match the spw labels in {caltable} "
+                       f"(per observation {rec['label']}); the table's map is used "
+                       f"({rec['global'] if rec['global'] is not None else rec['per_observation']})")
+                rec["configured_warning"] = msg
+                warnings.warn(f"[AJISAI] {msg}")
+        return rec
+
+    @staticmethod
+    def _caltable_spw_labels(caltable: str) -> Dict[int, List[int]]:
+        """Observation -> the SPECTRAL_WINDOW_ID values of all rows of a gain table."""
+        tb = casatools.table()
+        tb.open(str(caltable))
+        try:
+            if tb.nrows() == 0:
+                return {}
+            obs = tb.getcol("OBSERVATION_ID")
+            spw = tb.getcol("SPECTRAL_WINDOW_ID")
+        finally:
+            tb.close()
+        return {int(o): sorted(set(int(x) for x in spw[obs == o])) for o in np.unique(obs)}
+
+    @staticmethod
+    def _relabel_caltable_spws(caltable: str, relabel: Dict[int, Any]) -> Dict[str, int]:
+        """Give every row of an observation its lowest spw label (one label per observation).
+
+        A combined-spw solution is one solution for all spws of its interval; its
+        label only names the spw whose frequency linearPD scales the phase from
+        (a ratio of the spw frequencies, < 1 % across a band). Rows that would
+        duplicate an existing (time, antenna) solution of the target label are
+        left alone. The table is then rewritten in gaincal's row order
+        (spw, time, antenna): applycal reads each spw's solutions in row order,
+        and relabelled rows left at the end of the table were mis-interpolated
+        (CASA 6.5.1, ``tests/test_casa_spwmap.py``). Returns the number of
+        relabelled rows per observation.
+        """
+        out: Dict[str, int] = {}
+        caltable = str(caltable)
+        tb = casatools.table()
+        tb.open(caltable, nomodify=False)
+        try:
+            obs = tb.getcol("OBSERVATION_ID")
+            spw = tb.getcol("SPECTRAL_WINDOW_ID")
+            t = tb.getcol("TIME")
+            ant = tb.getcol("ANTENNA1")
+            new = spw.copy()
+            for o, (labs, target) in relabel.items():
+                sel = (obs == int(o)) & (spw != int(target))
+                have = set(zip(np.round(t[(obs == int(o)) & (spw == int(target))], 6).tolist(),
+                               ant[(obs == int(o)) & (spw == int(target))].tolist()))
+                idx = [i for i in np.flatnonzero(sel)
+                       if (round(float(t[i]), 6), int(ant[i])) not in have]
+                new[idx] = int(target)
+                out[str(o)] = len(idx)
+            changed = bool(np.any(new != spw))
+            if changed:
+                tb.putcol("SPECTRAL_WINDOW_ID", new)
+        finally:
+            tb.close()
+        if changed:
+            tmp = caltable.rstrip("/") + ".sorted.tmp"
+            _safe_rmtree_path(tmp)
+            tb.open(caltable)
+            try:
+                srt = tb.query("", sortlist="SPECTRAL_WINDOW_ID,TIME,ANTENNA1")
+                try:
+                    srt.copy(newtablename=tmp, deep=True, valuecopy=True)
+                finally:
+                    srt.close()
+            finally:
+                tb.close()
+            _safe_rmtree_path(caltable)
+            os.rename(tmp, caltable)
+        return out
 
     def _data_stage(self, k: int) -> Tuple[str, str]:
         """One stage of mode="data"; returns (decision, reason) with decision apply|skip|stop."""
@@ -3247,8 +3353,6 @@ Infrastructure
             cand = rec["_"]["chosen"]
             combine = ",".join(x for x in (cand["time_combine"],
                                            "spw" if sc["combine_spw"] else "") if x)
-            spwmap = self._data_spwmap(state)
-            sc["spwmap"] = spwmap
             # the stage's time interpolation: the configured (linear) one, or its nearest
             # form when G2 chose a nearest variant (ASEBI SPEC 10.2 item 6, D34 F2)
             stage_interp = _solint.applycal_interp_string(cfg.gaincal.applycal_interp,
@@ -3271,7 +3375,16 @@ Infrastructure
                 self._record_unapplied_stage(k, selection)
                 return "stop", selection["reason"]
             self._plot_gain_table(str(caltable), k, step)
-            self._applycal(tmp_vis, caltable, spwmap=spwmap, interp=stage_interp)
+            # the spwmap from the spw labels gaincal wrote (ASEBI SPEC 9 item 3, D38 d)
+            maps = self._data_spwmap(state, str(caltable))
+            spwmap = maps["global"] if maps else None
+            per_obs = (maps["per_observation"] if maps and maps["global"] is None else None)
+            sc["spwmap"] = spwmap
+            sc["spwmap_record"] = maps
+            if maps is not None:
+                selection["spwmap"] = maps
+            self._applycal(tmp_vis, caltable, spwmap=spwmap, interp=stage_interp,
+                           per_observation=per_obs)
             casatasks.split(vis=str(tmp_vis), outputvis=str(out_vis), datacolumn="corrected")
         finally:
             if copied:
@@ -3293,7 +3406,9 @@ Infrastructure
             solint_s=None if cand["kind"] == "eb" else float(cand["T_s"]),
             combine=combine, refant=refant, field=str(field_id), calmode="p", gaintype=g.gaintype, minsnr=g.minsnr,
             minblperant=g.minblperant, solnorm=False, interp=stage_interp,
-            applymode=g.applymode, calwt=g.calwt, spwmap=spwmap or g.spwmap,
+            applymode=g.applymode, calwt=g.calwt,
+            spwmap=spwmap if maps is not None else g.spwmap,
+            spwmap_per_observation=maps["per_observation"] if maps is not None else None,
             model_image=model_info["model_image"], model_nterms=model_info["nterms"],
             model_reffreq_hz=model_info.get("reffreq_hz"), solved_on=str(prev_vis),
             stage_ms=str(out_vis), n_solutions=n_solutions,
@@ -3508,24 +3623,29 @@ Infrastructure
                 return st
         return None
 
-    def _applycal(self, vis, caltable, spwmap=None, interp: Optional[str] = None) -> None:
+    def _applycal(self, vis, caltable, spwmap=None, interp: Optional[str] = None,
+                  per_observation: Optional[Dict[int, List[int]]] = None) -> None:
         """applycal of one self-cal table on an AJISAI-owned temporary MS.
 
         ``spwmap`` overrides ``GainCalConfig.spwmap`` (mode="data" derives it
-        when spws are combined and none was given); ``interp`` overrides
-        ``GainCalConfig.applycal_interp`` (mode="data": the stage's own
-        interpolation, nearest when G2 chose it; ASEBI SPEC 10.2 item 6, D34 F2).
+        from the table's spw labels when spws are combined); ``interp``
+        overrides ``GainCalConfig.applycal_interp`` (mode="data": the stage's
+        own interpolation, nearest when G2 chose it; ASEBI SPEC 10.2 item 6,
+        D34 F2). ``per_observation`` (observation -> spwmap): one applycal per
+        observation, selected with ``observation=``, when no single spwmap
+        serves every observation (ASEBI SPEC 9 item 3, D38 d); the rows of an
+        observation without solutions are left uncorrected (calonly).
         """
         g = self.cfg.gaincal
+        kw = dict(vis=str(vis), gaintable=[str(caltable)], calwt=g.calwt,
+                  interp=g.applycal_interp if interp is None else interp, applymode=g.applymode)
+        if per_observation:
+            for o in sorted(per_observation):
+                casatasks.applycal(observation=str(int(o)),
+                                   spwmap=[[int(x) for x in per_observation[o]]], **kw)
+            return
         spwmap = [int(x) for x in (g.spwmap if spwmap is None else spwmap)]
-        casatasks.applycal(
-            vis=str(vis),
-            gaintable=[str(caltable)],
-            spwmap=[spwmap] if spwmap else [],
-            calwt=g.calwt,
-            interp=g.applycal_interp if interp is None else interp,
-            applymode=g.applymode,
-        )
+        casatasks.applycal(spwmap=[spwmap] if spwmap else [], **kw)
 
     @staticmethod
     def _caltable_solution_stats(caltable: str) -> List[Dict[str, Any]]:

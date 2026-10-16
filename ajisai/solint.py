@@ -11,8 +11,9 @@ block, sections 3.1-3.5, test results sections 3-5, 7, 9 and 10), P23 (the
 measurement self-cal uses the same rules), P27 (no iteration loop on the
 ASEBI side), D34 (F3: candidate step for mixed integration times; F2:
 nearest interpolation, provisional) and D38 (e: the integrations are found
-from INTERVAL, not from distinct TIME values). Every public function names
-its section in a ``Spec:`` line.
+from INTERVAL, not from distinct TIME values; d: the spwmap of a
+combined-spw table comes from the labels gaincal wrote). Every public
+function names its section in a ``Spec:`` line.
 
 What is measured, from the visibilities, the model and the weights only
 (no gain solutions, no images):
@@ -2165,11 +2166,13 @@ def combine_spw_decision(snr_per_spw: float, snr_combined: float,
 
 
 def spwmap_for_combined_spw(spws_per_obs: Dict[int, Sequence[int]], nspw: int) -> List[int]:
-    """applycal spwmap for a ``combine='spw'`` table: each spw -> lowest spw of its observation.
+    """Each spw -> the lowest spw of its observation (the rule before D38; not used by AJISAI).
 
-    Spec: 10.2 item 11 (spw combination), ASEBI Spec 9 item 3. gaincal labels
-    a combined solution with the lowest spw of its interval, and an interval
-    never spans observations. A spw that would need two targets raises.
+    Spec: 10.2 item 11, ASEBI Spec 9 item 3 before D38 d. gaincal does not
+    always label a combined solution with the observation's lowest spw (EBs
+    of one setup merged by concat, a lowest spw without rows or fully
+    flagged); :func:`spwmap_from_labels` reads the labels from the table. A
+    spw that would need two targets raises.
     """
     m = list(range(int(nspw)))
     owner: Dict[int, int] = {}
@@ -2184,6 +2187,62 @@ def spwmap_for_combined_spw(spws_per_obs: Dict[int, Sequence[int]], nspw: int) -
             owner[sp] = lo
             m[sp] = lo
     return m
+
+
+def spwmap_from_labels(labels_by_obs: Dict[int, Sequence[int]],
+                       spws_by_obs: Dict[int, Sequence[int]], nspw: int) -> Dict[str, Any]:
+    """applycal spwmap of a ``combine='spw'`` table from the spw labels gaincal wrote in it.
+
+    Spec: ASEBI SPEC 9 item 3 (D38 d: the spwmap is made per observation from
+    the spw labels actually written in the solved table; when one spwmap
+    cannot express it, applycal runs per observation), 10.2 item 11.
+
+    ``labels_by_obs``: observation -> the SPECTRAL_WINDOW_ID values of the
+    table's rows of that observation, flagged solutions included (a fully
+    flagged lowest spw still labels the solutions: CASA 6.5.1 and 6.7.0).
+    ``spws_by_obs``: observation -> the spws with data in it. Each
+    observation's solutions are applied from its lowest label to all its
+    spws; an observation with several labels (the lowest spw without rows in
+    some intervals) needs its other labels' rows relabelled to that one
+    (``relabel``: observation -> (labels, target)); concat-merged setups can
+    label observations differently (3 EBs x 2 spws: 0, 1, 1). ``global`` is
+    one map for all observations, or None when a spw would need two targets;
+    ``per_observation`` always holds each observation's map.
+    """
+    nspw = int(nspw)
+    per_obs: Dict[int, List[int]] = {}
+    label: Dict[int, int] = {}
+    relabel: Dict[int, Tuple[List[int], int]] = {}
+    for o in sorted(labels_by_obs):
+        labs = sorted(set(int(x) for x in labels_by_obs[o]))
+        if not labs:
+            continue
+        lab = labs[0]
+        label[int(o)] = lab
+        if len(labs) > 1:
+            relabel[int(o)] = (labs, lab)
+        m = list(range(nspw))
+        for sp in set(int(x) for x in spws_by_obs.get(o, ())) | set(labs):
+            if 0 <= sp < nspw:
+                m[sp] = lab
+        per_obs[int(o)] = m
+    glob: Optional[List[int]] = list(range(nspw))
+    owner: Dict[int, int] = {}
+    for o, m in per_obs.items():
+        for sp in set(int(x) for x in spws_by_obs.get(o, ())) | set(int(x) for x in labels_by_obs[o]):
+            if not 0 <= sp < nspw:
+                continue
+            if sp in owner and owner[sp] != m[sp]:
+                glob = None
+                break
+            owner[sp] = m[sp]
+            glob[sp] = m[sp]
+        if glob is None:
+            break
+    return {"global": glob, "per_observation": per_obs, "label": label, "relabel": relabel,
+            "rule": ("each observation's spws -> the lowest spw label gaincal wrote for it (all "
+                     "table rows, flagged ones included); one map when no spw needs two targets, "
+                     "else applycal per observation")}
 
 
 def g3_short_baseline_ratio(vs: VisSummary, fraction: float = 0.2) -> Dict[int, Dict[str, float]]:

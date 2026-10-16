@@ -176,6 +176,8 @@ def _fake_imaging(aj, events, n_solutions=12):
     aj._plot_gain_table = lambda *a, **k: None
     aj._caltable_solution_stats = lambda table: [
         {"observation": 0, "spw": 0, "n_solutions": 12, "n_flagged": 0, "fraction": 0.0}]
+    # gaincal labels every solution of observation 0 with spw 0 (combined spws)
+    aj._caltable_spw_labels = lambda table: {0: [0]}
 
 
 # ---------------------------------------------------------------------------

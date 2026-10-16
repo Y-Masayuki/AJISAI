@@ -177,8 +177,52 @@ def test_combined_spws_get_a_derived_spwmap(tmp_path, monkeypatch):
         tmp_path, monkeypatch, state0, gaincal=GainCalConfig(combine="scan,spw"))
     assert calls[0]["combine"] == "scan,spw"
     assert tasks.named("applycal")[0]["spwmap"] == [[0, 0]]
+    assert "observation" not in tasks.named("applycal")[0]
     assert aj._stage(1)["solve"]["applycal"]["spwmap"] == [0, 0]
+    assert aj._stage(1)["solve"]["applycal"]["spwmap_per_observation"] == {"0": [0, 0]}
     assert aj.justification["selfcal"]["spwmap"] == [0, 0]
+
+
+def test_spwmap_comes_from_the_labels_gaincal_wrote(tmp_path, monkeypatch):
+    """ASEBI SPEC 9 item 3 (D38 d): two EBs of one setup merged by concat, gaincal labels them
+    spw 0 and spw 1 (CASA 6.5.1, tests/test_casa_spwmap.py): no single spwmap serves both, so
+    applycal runs per observation; a configured spwmap that disagrees is warned about."""
+    a, pa = sim.simulate(n_ant=12, n_scans=3, n_int=12, n_spw=2, r=3.0, tau0=300.0, seed=4)
+    b, pb = sim.simulate(n_ant=12, n_scans=3, n_int=12, n_spw=2, r=3.0, tau0=300.0, seed=5,
+                         obs_offset=1e5)
+    state0, _ = sim.concat([(a, pa), (b, pb)])
+    labels = {0: [0], 1: [1]}
+    aj, tasks, events, vis = _pipeline(tmp_path, monkeypatch,
+                                       gaincal=GainCalConfig(combine="scan,spw", spwmap=(0, 0)))
+    _fake_imaging(aj, events)
+    aj._caltable_spw_labels = lambda table: labels
+    geom = so.geometry(state0)
+
+    def read(path, fid, band_halves=False):
+        if str(path).endswith("_applycal.tmp.ms") or str(path) == vis:
+            return state0
+        last = aj._sc["chain"][-1]
+        st = sim.production(last.state, geom, last.cand, state0, aj._sc["combine_spw"])
+        return so.VisSummary(time=st.time, obs=st.obs, scan=st.scan, spw=st.spw, a1=st.a1,
+                             a2=st.a2, y=st.y, P=st.P, antenna_names=st.antenna_names, S=st.S,
+                             uvdist_m=st.uvdist_m)
+    monkeypatch.setattr(core, "read_vis_summary", read)
+    aj._gate_caltable = lambda caltable, state, cand, s_rows: {"n_rows": 40, "n_flagged": 0}
+    aj.metrics.append({"iteration": 0, "status": "ok", "dynamic_range": 50.0,
+                       "image_path": "clean_iter0.image", "fits_path": "clean_iter0.fits"})
+    aj._add_stage({"stage": 0, "label": "no_selfcal", "status": "ok", "data_ms": vis,
+                   "stage_ms": None, "solve": None})
+    with pytest.warns(UserWarning, match="does not match the spw labels"):
+        aj._run_data_driven()
+    first = [kw for kw in tasks.named("applycal")][:2]
+    assert [(kw["observation"], kw["spwmap"]) for kw in first] == [("0", [[0, 0]]), ("1", [[1, 1]])]
+    applied = aj._stage(1)["solve"]["applycal"]
+    assert applied["spwmap"] == [] and applied["spwmap_per_observation"] == {"0": [0, 0],
+                                                                             "1": [1, 1]}
+    rec = aj._stage(1)["selection"]["spwmap"]
+    assert rec["global"] is None and rec["label"] == {0: 0, 1: 1}
+    assert rec["configured"] == [0, 0] and "configured_warning" in rec
+    assert aj.justification["selfcal"]["spwmap"] is None
 
 
 def test_all_solutions_gated_stops_the_loop(tmp_path, monkeypatch):

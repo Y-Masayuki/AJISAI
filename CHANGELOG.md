@@ -230,6 +230,30 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **The spwmap of a combined-spw table comes from the labels gaincal wrote**
+  (ASEBI SPEC 9 item 3, D38 d; convention audit 2026-10-16, combine item 3
+  and time item 3). `mode="data"` with `combine` containing `"spw"` mapped
+  every spw to the lowest spw with valid data in its observation. gaincal
+  does not always label a combined solution that way: a fully flagged lowest
+  spw still labels the solutions (the map [0, 1] left every spw-1 row
+  uncorrected), EBs of one setup merged by concat are labelled 0, 1, 1 per
+  observation (the map [0, 0] left observations 1 and 2 uncorrected), and a
+  lowest spw without rows in some intervals labels those solutions with the
+  next spw. The map is now built after gaincal from all rows of the table
+  (flagged solutions included), per observation; an observation with several
+  labels has the other labels' rows relabelled to its lowest one (the table is
+  rewritten in gaincal's row order, spw-time-antenna: relabelled rows left at
+  the end were mis-interpolated by applycal); when no single map serves every
+  observation, applycal runs per observation (`observation=`). Recorded in
+  `selection["spwmap"]` (labels, maps, relabelled rows) and in
+  `solve["applycal"]["spwmap_per_observation"]` (`spwmap` is then `[]`); a
+  configured `GainCalConfig.spwmap` that disagrees with the table is warned
+  about and not used (`solint.spwmap_from_labels`). Tests:
+  `tests/test_casa_spwmap.py` (the three cases with gaincal/applycal, and an
+  end-to-end run on two merged EBs: both observations corrected, rms phase
+  1.25/1.45 -> 0.28/0.28 rad). `tests/casa_sim.simulate_ms(shared_scans=True)`
+  gives every spw of a time block one scan number, as real data have
+  (gaincal combines spws only within a scan).
 - **`read_vis_summary` aborted on WEIGHT_SPECTRUM defined on some rows only**
   (convention audit 2026-10-16, weights item 2). A concat of an MS with
   WEIGHT_SPECTRUM and one without keeps the column when the earliest input
