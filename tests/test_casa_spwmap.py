@@ -162,7 +162,8 @@ def test_several_labels_in_one_observation_are_relabelled(tmp_path):
     s2 = np.unique(t[sc == 2])
     ms = str(tmp_path / "c.ms")
     casatasks.mstransform(vis=ms0, outputvis=ms, datacolumn="all",
-                          taql=f"!(DATA_DESC_ID==0 && TIME>{s2[0] - 0.5!r} && TIME<{s2[3] + 0.5!r})")
+                          taql=(f"!(DATA_DESC_ID==0 && TIME>{float(s2[0]) - 0.5!r} "
+                                f"&& TIME<{float(s2[3]) + 0.5!r})"))
     casatasks.clearcal(vis=ms, addmodel=True)
     ct = _gaincal(ms, str(tmp_path / "c.G"), solint="11.7500s", combine="spw")
     labels, spws, rec = _derive(ms, ct)
