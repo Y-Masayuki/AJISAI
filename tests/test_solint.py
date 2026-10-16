@@ -607,14 +607,6 @@ def test_rule_a_b_and_the_longer_when_they_disagree():
     assert so.choose_solint(3, 3, T.get) == (3, "rules A and B agree")
 
 
-def test_choose_between_a_linear_candidate_and_its_nearest_variant():
-    """Same interval, different interpolation (D34 F2): rule A's answer."""
-    T = {3: 24.0, 7: 24.0, 8: 30.0}
-    k, why = so.choose_solint(7, 3, T.get)
-    assert k == 7 and "different interpolation" in why
-    assert so.choose_solint(3, 8, T.get)[0] == 8          # otherwise the longer, as before
-
-
 def test_rule_b_at_the_shortest_passing_candidate_returns_it():
     ev = [{"index": 2, "V_held": 0.01}, {"index": 3, "V_held": 0.02}]
     assert so.rule_b(ev, [2, 3]) == 2
@@ -804,8 +796,24 @@ def test_records_are_json_serialisable():
 # ---------------------------------------------------------------------------
 # Breakdown of linear interpolation: nearest variants in G2 (Spec 10.2 item 6, D34 F2)
 # ---------------------------------------------------------------------------
-def test_nearest_trigger_constant():
+def test_nearest_trigger_constants():
     assert so.NEAREST_TRIGGER_2D == 1.0
+    assert so.NEAREST_PAIRED_SIGMA == 2.0
+
+
+def test_paired_coherence_difference_and_its_jackknife():
+    """C_held(a) - C_held(b) on the same rows; delete-one antenna jackknife of the difference."""
+    def sums(N, D, Na, Da):
+        return [{"N": complex(N), "D": float(D), "Na": np.asarray(Na, complex),
+                 "Da": np.asarray(Da, float)}]
+    a = sums(9.0, 10.0, [4.0, 3.0, 2.0], [4.0, 4.0, 4.0])
+    b = sums(8.0, 10.0, [3.0, 3.0, 2.0], [4.0, 4.0, 4.0])
+    pd = so.paired_coherence_difference(a, b, [0, 1, 2])
+    assert pd["delta"] == pytest.approx(0.1) and pd["n_jackknife"] == 3
+    d = np.array([(9 - 4) / 6 - (8 - 3) / 6, (9 - 3) / 6 - (8 - 3) / 6, (9 - 2) / 6 - (8 - 2) / 6])
+    assert pd["sigma"] == pytest.approx(math.sqrt(2 / 3 * np.sum((d - d.mean()) ** 2)))
+    same = so.paired_coherence_difference(a, a, [0, 1, 2])
+    assert same["delta"] == 0.0 and same["sigma"] == 0.0
 
 
 @pytest.mark.parametrize("n_int, two_d", [
@@ -854,11 +862,11 @@ def test_small_phase_steps_add_no_nearest_candidates():
     assert all(r["chosen_interp"] == "linear" for r in recs)
 
 
-def test_large_phase_jumps_add_nearest_candidates_to_g2():
-    """Antenna phase jumps (2 D_eff(T_hat) = 2.3 rad^2): nearest variants evaluated like the others.
+def test_large_phase_jumps_compare_nearest_with_linear_at_the_same_interval():
+    """Antenna phase jumps (2 D_eff(T_hat) = 2.3 rad^2): nearest variants paired with linear.
 
-    The held-out coherence decides; the test does not force a winner (here the
-    nearest variant of 24 s is chosen by both rules).
+    The test does not force a winner: whether the nearest variant replaces the
+    chosen interval's linear candidate follows the recorded paired difference.
     """
     vs, _ = sim.simulate(n_ant=16, n_scans=4, n_int=20, r=1.5, tau0=2000.0, beta=1.0, seed=2,
                          jumps=(1 / 30.0, 2.0))
@@ -869,23 +877,38 @@ def test_large_phase_jumps_add_nearest_candidates_to_g2():
     assert ip["rms_adjacent_rad"] > 1.0 and ip["candidate"] == second["T_pred"]
     cands = second["candidates"]
     near = [c for c in cands if c.get("interp") == "nearest"]
-    assert near and all(c["label"].endswith("_nearest") for c in near)
-    for c in near:
-        lin = cands[c["linear_index"]]
-        assert lin["kind"] in ("int", "scan") and lin["g1"]["pass"]
-        assert (c["T_s"], c["gaincal_solint"], c["g1"]) == (lin["T_s"], lin["gaincal_solint"],
-                                                             lin["g1"])
-        assert "V_pred" in c
-    # every interval G2 evaluated with linear interpolation was evaluated with nearest too
-    lin_eval = {c["label"] for c in cands if c["evaluated"] and "interp" not in c
-                and c["kind"] in ("int", "scan")}
-    near_eval = {c["label"][:-len("_nearest")] for c in near if c["evaluated"]}
-    assert lin_eval and lin_eval <= near_eval
-    for c in near:
-        if c["evaluated"]:
-            assert c["g2"]["kappa_held"] == 1.0
-            assert {"C_held", "sigma", "improvement_corr"} <= set(c["g2"])
-    assert (second["chosen_interp"] == "nearest") == second["chosen"].endswith("_nearest")
-    # the chosen interpolation is carried by the stage into production and the next G2 reference
+    # every interval G2 evaluated with linear interpolation is paired with its nearest variant
+    lin_eval = sorted(c["label"] for c in cands if c["evaluated"] and "interp" not in c
+                      and c["kind"] in ("int", "scan"))
+    assert lin_eval and sorted(e["linear"] for e in ip["paired"]) == lin_eval
+    assert all(c["evaluated"] and c["g2"]["kappa_held"] == 1.0 for c in near)
+    for e in ip["paired"]:
+        lin = [c for c in cands if c["label"] == e["linear"]][0]
+        nc = [c for c in near if c["label"] == e["nearest"]][0]
+        assert (nc["T_s"], nc["gaincal_solint"], nc["g1"]) == (lin["T_s"], lin["gaincal_solint"],
+                                                               lin["g1"])
+        assert e["delta"] == pytest.approx(nc["g2"]["C_held"] - lin["g2"]["C_held"])
+        assert e["sigma_delta"] > 0 and e["threshold"] == pytest.approx(2 * e["sigma_delta"])
+        assert e["nearest_wins"] == (e["delta"] > max(e["threshold"], 1e-9))
+    # the interval is the linear rules' choice; nearest replaces it only on a paired win
+    chosen_T = [c for c in cands if c["label"] == second["chosen"]][0]["T_s"]
+    rule_T = [c for c in cands if c["label"] in (second["rule_A"], second["rule_B"])]
+    assert all("interp" not in c for c in rule_T) and chosen_T in [c["T_s"] for c in rule_T]
+    win = [e for e in ip["paired"] if e["T_s"] == chosen_T][0]["nearest_wins"]
+    assert second["chosen_interp"] == ("nearest" if win else "linear")
     if second["decision"] == "apply":
         assert chain[1].cand.get("interp", "linear") == second["chosen_interp"]
+
+
+def test_nearest_variants_never_move_the_interval(monkeypatch):
+    """Rules A/B and T are the same with the trigger disabled (linear only)."""
+    kw = dict(n_ant=16, n_scans=4, n_int=20, r=1.5, tau0=2000.0, beta=1.0, seed=2,
+              jumps=(1 / 30.0, 2.0))
+    vs, _ = sim.simulate(**kw)
+    on, _, _ = sim.run_loop(vs)
+    monkeypatch.setattr(so, "NEAREST_TRIGGER_2D", float("inf"))
+    off, _, _ = sim.run_loop(vs)
+    assert on[1]["interpolation"]["trigger"] and not off[1]["interpolation"]["trigger"]
+    for a, b in zip(on[:2], off[:2]):
+        assert (a["rule_A"], a["rule_B"]) == (b["rule_A"], b["rule_B"])
+        assert a["chosen"].replace("_nearest", "") == b["chosen"]

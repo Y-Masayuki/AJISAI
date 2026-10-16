@@ -39,12 +39,14 @@ How a stage is decided (:func:`evaluate_stage`):
 4. G2: held-out coherence with an even/odd split of the integrations in
    each scan (band halves when scans have fewer than 4 integrations),
    antenna delete-one paired jackknife (:func:`holdout_coherence`);
-   nearest-interpolation variants join when ``2 D_eff(T_hat)`` from
-   adjacent solutions exceeds 1 rad^2 (D34 F2, provisional,
-   :func:`adjacent_solution_structure`);
    rule A (loss-table corrected argmin) and rule B (one candidate shorter
    than the held-out argmin), the longer when they disagree
-   (:func:`choose_solint`);
+   (:func:`choose_solint`); when ``2 D_eff(T_hat)`` from adjacent solutions
+   exceeds 1 rad^2, nearest-interpolation variants of the evaluated
+   intervals are compared with their linear twins on the same held-out rows,
+   and the nearest one replaces the chosen interval's linear candidate only
+   when it is better by more than 2 paired sigma (D34 F2, provisional,
+   :func:`adjacent_solution_structure`, :func:`paired_coherence_difference`);
 5. acceptance: corrected held-out improvement > max(1 sigma, 0.001) with the
    conditional two-sided correction (:func:`acceptance`); stage 1 (one
    solution per EB) is skipped only when its corrected change is below
@@ -108,10 +110,14 @@ IT_MATCH_RTOL = 0.01
 #: The least common multiple of the integration times is the candidate step only up to
 #: this many times the longest integration time (Spec 10.2 item 3, D34 F3).
 IT_LCM_MAX_FACTOR = 4.0
-#: Nearest-interpolation variants join G2 when 2 D_eff(T_hat) from adjacent solutions,
+#: Nearest-interpolation variants are evaluated in G2 when 2 D_eff(T_hat) from adjacent solutions,
 #: noise removed, exceeds this (rad^2). Provisional: the 1 rad boundary is untested
 #: (Spec 10.2 item 6, D34 F2).
 NEAREST_TRIGGER_2D = 1.0
+#: A nearest variant replaces the linear candidate of the same interval only when its
+#: held-out coherence is higher by more than this many paired-jackknife sigma (one-sided;
+#: D34 F2 as implemented, the interval itself is chosen from the linear candidates).
+NEAREST_PAIRED_SIGMA = 2.0
 
 # Sample limits for the discrete prediction (accuracy is set by the smoothness
 # of D, not by the number of integrations).
@@ -120,6 +126,10 @@ _MAX_MEMBERS_PER_UNIT = 300
 # The least common multiple is searched up to this many times the longest
 # integration time (beyond IT_LCM_MAX_FACTOR only for the record).
 _LCM_SEARCH_MAX = 100
+# A paired held-out difference below this is rounding, not a win: a nearest
+# variant whose solutions are all zero (re-solving a nested interval on top of
+# the previous stage) gives the linear candidate's coherence to ~1e-16.
+_PAIRED_NUMERICAL_TOL = 1e-9
 
 
 # ============================================================================
@@ -1570,7 +1580,7 @@ def reference_bases(chain: List[StageSolve], geom: Geometry, splits: List[Split]
 def holdout_coherence(vs: VisSummary, geom: Geometry, cand: Optional[Dict[str, Any]],
                       bases: List[np.ndarray], splits: List[Split], s_rows: np.ndarray,
                       combine_spw: bool, refant: Optional[int] = None, minblperant: int = 4,
-                      gate: bool = True) -> Dict[str, Any]:
+                      gate: bool = True, keep_sums: bool = False) -> Dict[str, Any]:
     """G2: held-out coherence of a candidate against the re-solved reference state.
 
     Spec: 10.2 item 6 (``C_held = |sum w V_corr M*| / sum w |M|^2`` with an
@@ -1584,6 +1594,9 @@ def holdout_coherence(vs: VisSummary, geom: Geometry, cand: Optional[Dict[str, A
     ``V_held`` of the candidate and ``V_ref`` of the reference, the raw
     difference ``dV_raw = V_held - V_ref`` (negative = better) and its paired
     jackknife ``sigma``. ``gate=False`` switches G1 off (tests of G2 alone).
+    ``keep_sums=True`` adds the candidate's held-out sums and the jackknifed
+    antennas under ``"_sums"`` / ``"_present"`` (for
+    :func:`paired_coherence_difference`).
     """
     present = np.flatnonzero((np.bincount(vs.a1, minlength=vs.n_ant)
                               + np.bincount(vs.a2, minlength=vs.n_ant)) > 0)
@@ -1606,7 +1619,26 @@ def holdout_coherence(vs: VisSummary, geom: Geometry, cand: Optional[Dict[str, A
     sigma = float(math.sqrt((n - 1) / n * np.sum((dv - dv.mean()) ** 2))) if n > 1 else float("nan")
     out.update({"V_held": v_c, "C_held": math.exp(-v_c), "dV_raw": v_c - v_ref, "sigma": sigma,
                 "n_jackknife": int(n)})
+    if keep_sums:
+        out["_sums"] = csums
+        out["_present"] = present
     return out
+
+
+def paired_coherence_difference(sums_a: List[Dict[str, Any]], sums_b: List[Dict[str, Any]],
+                                present: Sequence[int]) -> Dict[str, Any]:
+    """``C_held(a) - C_held(b)`` of two candidates on the same held-out rows, with its jackknife.
+
+    Spec: 10.2 item 6 (D34 F2: a nearest-interpolation variant against the
+    linear candidate of the same interval; the antenna delete-one jackknife
+    paired as in G2), 2.4. ``sums_*``: the held-out sums of
+    :func:`holdout_coherence` (``keep_sums=True``) of the same splits.
+    """
+    delta = _coherence(sums_a) - _coherence(sums_b)
+    d = np.array([_coherence(sums_a, a) - _coherence(sums_b, a) for a in present])
+    n = d.size
+    sigma = float(math.sqrt((n - 1) / n * np.sum((d - d.mean()) ** 2))) if n > 1 else float("nan")
+    return {"delta": float(delta), "sigma": sigma, "n_jackknife": int(n)}
 
 
 def loss_correction(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], splits: List[Split],
@@ -1680,7 +1712,7 @@ def adjacent_solution_structure(vs: VisSummary, geom: Geometry, cand: Dict[str, 
                                 s_rows: np.ndarray, combine_spw: bool,
                                 refant: Optional[int] = None, minblperant: int = 4,
                                 dfun: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-                                threshold: float = NEAREST_TRIGGER_2D) -> Dict[str, Any]:
+                                threshold: Optional[float] = None) -> Dict[str, Any]:
     """``2 D_eff(T_hat)`` from the differences of adjacent solutions at the predicted best interval.
 
     Spec: 10.2 item 6 (D34 F2, provisional: when ``2 D_eff(T_hat)`` from the
@@ -1706,8 +1738,12 @@ def adjacent_solution_structure(vs: VisSummary, geom: Geometry, cand: Dict[str, 
     gain table, whose phases are baseline phases to the reference antenna).
     ``two_D_model`` is the M3 fit at ``tau = T_hat`` for comparison
     (interval means differ by less than the point values: 2/3 of 2D(T) for
-    beta = 1, 1 for beta = 2). ``trigger``: ``two_D_eff > threshold``.
+    beta = 1, 1 for beta = 2). ``trigger``: ``two_D_eff > threshold``
+    (default :data:`NEAREST_TRIGGER_2D`); then
+    :func:`evaluate_stage` compares nearest variants with their linear twins.
     """
+    if threshold is None:
+        threshold = NEAREST_TRIGGER_2D
     rec: Dict[str, Any] = {"computed": False, "candidate": cand["label"],
                            "T_s": float(cand["T_s"]), "threshold_two_D": float(threshold),
                            "trigger": False}
@@ -1759,7 +1795,8 @@ def adjacent_solution_structure(vs: VisSummary, geom: Geometry, cand: Dict[str, 
         "reason": (f"2 D_eff(T_hat = {cand['label']}) = {two_d:.3f} rad^2 (noise removed) "
                    f"{'>' if trig else '<='} {threshold:g} rad^2: "
                    + ("linear interpolation can break down; nearest-interpolation variants "
-                      "join G2" if trig else "linear interpolation kept")),
+                      "are compared with linear at the same intervals" if trig
+                      else "linear interpolation kept")),
     })
     return rec
 
@@ -1840,8 +1877,7 @@ def choose_solint(a: Optional[int], b: Optional[int], T_of: Callable[[int], floa
     """The longer of the rule-A and rule-B answers when they disagree.
 
     Spec: 10.2 item 6 ("一致しなければ長い方を選ぶ"), C.3 (the safe side
-    against fitting noise). A linear candidate and its nearest variant (D34
-    F2) have the same length: then rule A's answer is taken.
+    against fitting noise).
     """
     if a is None and b is None:
         return None, "no candidate was evaluated"
@@ -1850,10 +1886,6 @@ def choose_solint(a: Optional[int], b: Optional[int], T_of: Callable[[int], floa
         return k, "only one rule gave an answer"
     if a == b:
         return a, "rules A and B agree"
-    if T_of(a) == T_of(b):
-        # only a linear candidate and its nearest variant share T (D34 F2)
-        return a, ("rules A and B give the same interval with different interpolation; "
-                   "rule A (loss-table corrected) is taken")
     k = a if T_of(a) >= T_of(b) else b
     return k, "rules A and B disagree; the longer interval is taken"
 
@@ -1980,8 +2012,11 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
     Spec: 10.2 items 1-8 and 14 (and the record listed after item 14), C.2,
     C.3; P18 decision; P23 (measurement and production self-cal use the same
     rules); D34 F3 (candidate step for mixed integration times,
-    :func:`geometry_candidates`) and F2 (nearest-interpolation variants when
-    ``2 D_eff(T_hat) > 1 rad^2``, :func:`adjacent_solution_structure`).
+    :func:`geometry_candidates`) and F2 (when ``2 D_eff(T_hat) > 1 rad^2``,
+    :func:`adjacent_solution_structure`, the nearest variant of the interval
+    chosen from the linear candidates replaces it when its paired held-out
+    coherence is higher by more than ``NEAREST_PAIRED_SIGMA`` sigma; the
+    per-interval comparisons are in ``interpolation["paired"]``).
 
     ``state``: the current data (DATA of the last accepted stage, MODEL of
     its image) with ``phi0`` tracked to state 0. ``chain``: the accepted
@@ -2071,10 +2106,13 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
     bases = reference_bases(chain, geom, splits, combine_spw, refant, minblperant)
     results: Dict[int, Dict[str, Any]] = {}
 
+    sums_of: Dict[int, Tuple[List[Dict[str, Any]], np.ndarray]] = {}
+
     def run_g2(k: int) -> Dict[str, Any]:
         c = cands[k]
         g2 = holdout_coherence(state, geom, c, bases, splits, s_rows, combine_spw, refant,
-                               minblperant)
+                               minblperant, keep_sums=True)
+        sums_of[k] = (g2.pop("_sums"), g2.pop("_present"))
         lc = loss_correction(state, geom, c, splits, s_rows, combine_spw)
         ci = corrected_improvement(g2["dV_raw"], lc["corr"], c["T_s"], T_prev, corr_prev)
         res = {"index": k, **g2, **lc, **ci}
@@ -2085,45 +2123,9 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
 
     for k in to_eval:
         run_g2(k)
-
-    # D34 F2 (provisional): when 2 D_eff(T_hat) from adjacent solutions exceeds
-    # 1 rad^2, every G1-passing interval gets a nearest-interpolation variant
-    # (same solutions, applied piecewise constant); G2 evaluates the variants
-    # of the intervals it evaluates, and the same rules choose among all.
-    nearest_of: Dict[int, int] = {}
-    if stage == 1:
-        rec["interpolation"] = {"computed": False, "trigger": False,
-                                "reason": "stage 1 (one solution per EB): no adjacent solutions"}
-    else:
-        rec["interpolation"] = adjacent_solution_structure(state, geom, cands[k_pred], s_rows,
-                                                           combine_spw, refant, minblperant, dfun)
-    if rec["interpolation"]["trigger"]:
-        for k in passing:
-            c = cands[k]
-            if c["kind"] not in ("int", "scan"):
-                continue
-            nc = {kk: vv for kk, vv in c.items()
-                  if kk not in ("index", "g2", "evaluated", "V_atm", "V_th", "V_pred", "kappa_full")}
-            nc.update({"label": f"{c['label']}_nearest", "interp": "nearest", "linear_index": k,
-                       "index": len(cands), "g1": dict(c["g1"])})
-            if np.isfinite(r_med) and r_med > 0:
-                nc.update(predict_residual_variance(state, geom, nc, dfun, r_med, combine_spw))
-            nc["evaluated"] = False
-            cands.append(nc)
-            nearest_of[k] = nc["index"]
-        for k in to_eval:
-            if k in nearest_of:
-                run_g2(nearest_of[k])
-
     evald = [dict(results[k], V_held=results[k]["V_held"]) for k in sorted(results)]
     ka = rule_a(evald)
-    passing_b = passing
-    if nearest_of:
-        # rule B steps one interval shorter within the interpolation of the held-out argmin
-        arg = int(min(evald, key=lambda e: e["V_held"])["index"])
-        if cands[arg].get("interp") == "nearest":
-            passing_b = [nearest_of.get(k, k) for k in passing]
-    kb = rule_b(evald, passing_b)
+    kb = rule_b(evald, passing)
     if kb is not None and kb not in results:
         if not (mode == "time" and _single_integration(cands[kb])):
             run_g2(kb)
@@ -2132,6 +2134,61 @@ def evaluate_stage(stage: int, state: VisSummary, chain: List[StageSolve], geom:
         kc, why = ka, why + "; rule B's interval cannot be scored by the even/odd split, rule A taken"
     rec["rule_A"] = cands[ka]["label"] if ka is not None else None
     rec["rule_B"] = cands[kb]["label"] if kb is not None else None
+
+    # D34 F2 (provisional): when 2 D_eff(T_hat) from adjacent solutions exceeds
+    # 1 rad^2, every interval G2 evaluated gets a nearest-interpolation variant
+    # (same solutions, applied piecewise constant), compared with the linear
+    # candidate of the same interval on the same held-out rows. The interval is
+    # chosen above from the linear candidates only, so a nearest variant never
+    # moves T; it replaces the chosen linear candidate when its paired held-out
+    # coherence is higher by more than NEAREST_PAIRED_SIGMA sigma (one-sided).
+    if stage == 1:
+        rec["interpolation"] = {"computed": False, "trigger": False,
+                                "reason": "stage 1 (one solution per EB): no adjacent solutions"}
+    else:
+        rec["interpolation"] = adjacent_solution_structure(state, geom, cands[k_pred], s_rows,
+                                                           combine_spw, refant, minblperant, dfun)
+    ip = rec["interpolation"]
+    linear_kc = kc
+    if ip["trigger"]:
+        paired: List[Dict[str, Any]] = []
+        for k in sorted(k for k in results if cands[k]["kind"] in ("int", "scan")):
+            c = cands[k]
+            nc = {kk: vv for kk, vv in c.items()
+                  if kk not in ("index", "g2", "evaluated", "V_atm", "V_th", "V_pred", "kappa_full")}
+            nc.update({"label": f"{c['label']}_nearest", "interp": "nearest", "linear_index": k,
+                       "index": len(cands), "g1": dict(c["g1"])})
+            if np.isfinite(r_med) and r_med > 0:
+                nc.update(predict_residual_variance(state, geom, nc, dfun, r_med, combine_spw))
+            nc["evaluated"] = False
+            cands.append(nc)
+            run_g2(nc["index"])
+            pd = paired_coherence_difference(sums_of[nc["index"]][0], sums_of[k][0],
+                                             sums_of[k][1])
+            thr = NEAREST_PAIRED_SIGMA * pd["sigma"]
+            replace = bool(np.isfinite(pd["sigma"]) and pd["delta"] > thr
+                           and pd["delta"] > _PAIRED_NUMERICAL_TOL)
+            entry = {"T_s": float(c["T_s"]), "linear": c["label"], "nearest": nc["label"],
+                     "C_held_linear": results[k]["C_held"],
+                     "C_held_nearest": results[nc["index"]]["C_held"],
+                     "delta": pd["delta"], "sigma_delta": pd["sigma"],
+                     "n_jackknife": pd["n_jackknife"], "threshold": float(thr),
+                     "nearest_wins": replace}
+            paired.append(entry)
+            nc["paired"] = {kk: entry[kk] for kk in ("delta", "sigma_delta", "threshold",
+                                                     "nearest_wins")}
+            if k == kc and replace:
+                kc = nc["index"]
+        ip["paired"] = paired
+        ip["paired_rule"] = (f"the nearest variant replaces the linear candidate of the same "
+                             f"interval when C_held(nearest) - C_held(linear) > "
+                             f"{NEAREST_PAIRED_SIGMA:g} sigma (paired antenna delete-one "
+                             f"jackknife); the interval is chosen from the linear candidates")
+        if kc != linear_kc:
+            e = [x for x in paired if x["linear"] == cands[linear_kc]["label"]][0]
+            why += (f"; nearest interpolation replaces linear at {cands[linear_kc]['label']} "
+                    f"(paired held-out coherence {e['delta']:+.4f} > {NEAREST_PAIRED_SIGMA:g} "
+                    f"sigma = {e['threshold']:.4f})")
     rec["chosen"] = cands[kc]["label"] if kc is not None else None
     rec["chosen_reason"] = why
     rec["chosen_interp"] = cands[kc].get("interp", "linear")

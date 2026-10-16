@@ -132,15 +132,20 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
   SPEC 10.2 item 6, D34 F2, provisional).** From stage 2 on, the solutions of
   the predicted best interval are solved once on all data; when
   `2 D_eff(T_hat)` from the changes of adjacent solutions, solution noise
-  removed, exceeds 1 rad^2, every G1-passing interval gets a nearest-
-  interpolation variant (`"<label>_nearest"`), G2 evaluates the variants of
-  the intervals it evaluates, and the same rules choose. A stage that picks a
-  nearest variant is applied with the nearest form of
-  `GainCalConfig.applycal_interp` (`linearPDperobs` -> `nearestPDperobs`) and
-  records it in `solve["applycal"]["interp"]`. The adjacent-solution
-  quantities are recorded in `selection["interpolation"]`, the choice in
-  `selection["chosen_interp"]`. When the trigger does not fire, the stage
-  decisions are unchanged.
+  removed, exceeds 1 rad^2, every interval G2 evaluated gets a nearest-
+  interpolation variant (`"<label>_nearest"`), compared with the linear
+  candidate of the same interval on the same held-out rows
+  (`C_held(nearest) - C_held(linear)` with the paired antenna delete-one
+  jackknife). The interval is chosen by rules A/B from the linear candidates
+  as before, so a nearest variant never moves it; the nearest variant
+  replaces the chosen interval's linear candidate only when it is better by
+  more than 2 sigma (`NEAREST_PAIRED_SIGMA`, one-sided). Such a stage is
+  applied with the nearest form of `GainCalConfig.applycal_interp`
+  (`linearPDperobs` -> `nearestPDperobs`) and records it in
+  `solve["applycal"]["interp"]`. The adjacent-solution quantities and the
+  per-interval comparisons are recorded in `selection["interpolation"]`
+  (`paired`), the choice in `selection["chosen_interp"]`. When the trigger
+  does not fire, the stage decisions are unchanged.
 
 ### Changed
 

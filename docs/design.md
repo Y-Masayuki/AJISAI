@@ -143,9 +143,11 @@ coarse grid of candidates suffices.
    optimum; when they disagree the longer interval is taken. When the
    changes of adjacent solutions at the predicted best interval give
    `2 D_eff > 1 rad^2` (solution noise removed), linear interpolation can
-   break down: nearest-interpolation variants of the intervals join G2 and
-   are chosen by the same rules (provisional); a stage that picks one is
-   applied with nearest interpolation.
+   break down: the evaluated intervals are also evaluated with nearest
+   interpolation, on the same held-out rows. The interval is still chosen
+   from the linear candidates; its nearest variant replaces it only when
+   its held-out coherence is higher by more than 2 paired-jackknife sigma
+   (provisional), and the stage is then applied with nearest interpolation.
 6. *Acceptance*: the stage is applied only when the loss-corrected held-out
    improvement exceeds `max(1 sigma, 0.001)`. From stage 2 on, the
    reference is the state re-solved on the training half with each stage's

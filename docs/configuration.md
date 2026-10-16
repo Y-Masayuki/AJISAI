@@ -369,9 +369,9 @@ the lines you need.
     requires a linear interpolation: its predictions and held-out
     evaluation model applycal's linear interpolation between solutions. A
     stage switches to the nearest form of this string (`nearestPDperobs`)
-    only when its held-out evaluation chose a nearest-interpolation
-    candidate, which is considered only when adjacent solutions differ by
-    more than 1 rad rms (`2 D_eff > 1 rad^2`).
+    only when adjacent solutions differ by more than 1 rad rms
+    (`2 D_eff > 1 rad^2`) and nearest interpolation beats linear at the
+    chosen interval on held-out integrations by more than 2 sigma.
 
 `applymode: str = "calonly"`
 :   applycal mode. `"calonly"` ensures that flagged solutions do NOT
