@@ -178,7 +178,9 @@ cfg = AJISAIConfig(
     vis="/path/to/data.ms",
     # Optional: shift the source to the phase center first
     phase_shift=True,
-    # Optional: supply phase center manually (frame is required)
+    # Optional: supply phase center manually (frame is required). RA is read
+    # as hours and Dec as degrees, whichever separators are used (":", ".",
+    # "h m s" / "d m s"); AJISAI passes CASA only radians.
     phase_center=("16:25:45.0", "-24:12:23.0", "ICRS"),
     # Sub-configs
     imaging=ImagingConfig(robust=0.5, mask_mode="auto-multithresh"),

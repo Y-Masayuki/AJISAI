@@ -230,6 +230,68 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 
 ### Fixed
 
+- **A user `phase_center` with a `:`-separated declination went to CASA as
+  hours.** The documented form `("16:25:45.0", "-24:12:23.0", "ICRS")` was
+  passed to `phaseshift` as it was; CASA reads `-24:12:23.0` as a time
+  (-363.1 deg, i.e. Dec -3.1 deg), about 21 deg off, without a message (with
+  frame `"J2000"` it also reached `fixplanets`; on a simulated MS the result
+  was 167 deg off). `phase_center` is now parsed when the configuration is
+  validated: RA as hours, Dec as degrees whatever the separators (`:`, `.`,
+  `h m s` / `d m s`, spaces, or an angle with a unit), with range checks, and
+  CASA receives only radians (`ajisai.ms_utils.parse_ra_dec`,
+  `casa_direction_string`).
+- **The phase shift left FIELD, SOURCE and the image 20-32 mas off.** The
+  shift ran `phaseshift`, then `fixplanets` with the target converted to
+  J2000 by astropy's FK5 (whose frame-tie constants differ from CASA's J2000,
+  the IAU 2000 frame bias, by 20-25 mas), then relabelled the result as ICRS
+  (31.6 mas off on real ALMA data; 25.5 mas without the relabel). It now
+  converts the target with `casatools.measures` into the frame of the field's
+  PHASE_DIR, runs `phaseshift` with a radian phase centre in that frame, and
+  writes FIELD PHASE_DIR, DELAY_DIR, REFERENCE_DIR and SOURCE.DIRECTION with
+  the new helper `ajisai.ms_utils.write_field_direction`, each cell converted
+  into its own frame (per row for ALMA's variable-reference columns). No
+  `fixplanets`, no UVW recomputation (UVW and DATA are `phaseshift`'s own),
+  no label change; exact (< 1e-6 mas on simulated MSs) for ICRS data and for
+  genuine J2000 data, with the target in either frame. The read-back offsets
+  are recorded (`derived.phase_shift.readback_offset_mas`). `phaseshift`
+  alone is not enough: CASA 6.5 writes J2000 numbers into an ICRS-coded
+  PHASE_DIR and leaves DELAY_DIR, REFERENCE_DIR and SOURCE unchanged.
+- **Phase shift of a field other than field 0.** CASA 6.5 `phaseshift`
+  renumbers the selected field from 0, and the pipeline went on with the old
+  field id. The field is now found in the shifted MS by name
+  (`ajisai.ms_utils.field_id_by_name`) and `resolved_field_id` follows it.
+- **The auto-detected phase centre** (brightest pixel of the dirty image) is
+  read in radians at the pixel centre from the image's coordinate system;
+  `imstat`'s `maxposf` string (rounded to 1 ms of time, up to 15 mas) is no
+  longer used.
+- **`icrs_to_j2000` used astropy's FK5.** It now converts with
+  `casatools.measures` (CASA's J2000) and needs CASA; the output layout is
+  kept (RA `:`, Dec `.`), with a new `precision` argument (default 7
+  decimals of seconds, < 2 micro-arcseconds; was 5). `rad_to_radec` and
+  `rad_to_radec_from_imfit` write the declination with `.` separators (CASA
+  reads `:` as hours) and no longer use astropy.
+- **J2000 -> ICRS relabel of the input.** The FIELD and SOURCE frame codes
+  are mapped through each column's MEASINFO TabRefTypes/TabRefCodes instead
+  of the hard-coded 0/21; fixed-reference FIELD columns are relabelled like
+  SOURCE.DIRECTION (previously skipped); a column that cannot be relabelled
+  is warned about and recorded instead of being skipped silently;
+  `relabel_J2000_to_ICRS` returns a record of what it changed
+  (`derived.working_vis.relabel`). When and by default how the input is
+  relabelled is unchanged; when the relabel is applied to data that are not
+  ALMA or were observed on or after 2015-10-01 (Cycle 3), a warning is
+  recorded (`derived.working_vis.relabel_caveat`): the label-only relabel is
+  right only for ALMA data before Cycle 3 (ICRS numbers labelled J2000) and
+  moves genuine J2000 numbers by the frame bias (up to about 23 mas).
+- Tests: the simulated MS (`tests/casa_sim.py`) has the FIELD layout of a
+  real ALMA MS by default (PhaseDir_Ref, DelayDir_Ref, RefDir_Ref and the
+  variable-reference MEASINFO keywords; `alma_field_layout`), and can store
+  its directions in ICRS (`frame="ICRS"`). `tests/test_casa_frames.py` checks
+  the conversions against `casatools.measures`, the phase shift for an ICRS
+  and a genuine-J2000 MS with the target in ICRS and J2000 and the relabel on
+  and off (FIELD, SOURCE within 0.01 mas; UVW and DATA identical to
+  `phaseshift`'s), the renumbered field, the auto-detected target and the
+  code-mapped relabel.
+
 - **Model prediction missed an edge channel (ft and the LSRK/TOPO offset).** tclean sets an mfs
   image's frequency range to the data's range in LSRK, and `ft` compares the TOPO channel
   frequencies with it: when the LSRK/TOPO offset exceeds half of the outermost channel, that

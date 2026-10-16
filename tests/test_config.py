@@ -161,11 +161,36 @@ def test_phase_center_j2000_accepted(existing_vis):
     AJISAI(cfg)._validate_inputs()
 
 
+def test_phase_center_colon_dec_is_parsed_as_degrees(existing_vis):
+    """The documented form must not reach CASA, which reads '-24:12:23.0' as hours
+    (-363.1 deg, i.e. Dec -3.1 deg): AJISAI parses it to radians at validation."""
+    import math
+    cfg = AJISAIConfig(
+        vis=existing_vis,
+        phase_shift=True,
+        phase_center=("16:25:45.0", "-24:12:23.0", "icrs"),
+    )
+    aj = AJISAI(cfg)
+    aj._validate_inputs()
+    pc = aj._derived["phase_center"]
+    assert pc["frame"] == "ICRS"
+    assert math.degrees(pc["ra_rad"]) == pytest.approx(246.4375)
+    assert math.degrees(pc["dec_rad"]) == pytest.approx(-(24 + 12 / 60 + 23 / 3600))
+    for dec in ("-24.12.23.0", "-24d12m23.0s"):
+        aj = AJISAI(AJISAIConfig(vis=existing_vis, phase_shift=True,
+                                 phase_center=("16h25m45.0s", dec, "J2000")))
+        aj._validate_inputs()
+        assert aj._derived["phase_center"]["dec_rad"] == pytest.approx(pc["dec_rad"], abs=1e-12)
+
+
 @pytest.mark.parametrize("bad_center", [
     ("16:25:45.0", "-24:12:23.0", "B1950"),       # wrong frame
     ("16:25:45.0", "-24:12:23.0"),                # only 2 elements
     (1.0, 2.0, "ICRS"),                            # numeric instead of strings
     "not a tuple",                                  # not a tuple
+    ("16:25:45.0", "-24.2064", "ICRS"),           # Dec without a unit
+    ("16:25:45.0", "-94:00:00", "ICRS"),          # Dec out of range
+    ("25:00:00", "-24:12:23.0", "ICRS"),          # RA out of range
 ])
 def test_phase_center_invalid_raises(existing_vis, bad_center):
     cfg = AJISAIConfig(vis=existing_vis, phase_shift=True, phase_center=bad_center)

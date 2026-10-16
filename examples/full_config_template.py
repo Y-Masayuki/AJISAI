@@ -126,7 +126,10 @@ cfg = AJISAIConfig(
     plots=plots,
     # Phase shift (off by default). With phase_center=None the brightest pixel of the
     # dirty image becomes the phase center; or give (ra, dec, frame), frame "ICRS" or
-    # "J2000", e.g. ("16:25:45.0", "-24:12:23.0", "ICRS").
+    # "J2000", e.g. ("16:25:45.0", "-24:12:23.0", "ICRS") or
+    # ("16h25m45.0s", "-24d12m23.0s", "ICRS"): RA in hours, Dec in degrees whatever
+    # the separators (AJISAI converts them to radians; CASA alone would read a
+    # ':'-separated Dec as hours).
     phase_shift=False,
     phase_center=None,
     # Reference antenna: "hybrid" (default) | "geometric_center" | "flag_stats"

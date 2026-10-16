@@ -18,6 +18,24 @@ import numpy as np
 
 ARCSEC = math.pi / 180.0 / 3600.0
 
+# FIELD direction columns of a real ALMA MS (2016.1.00459.S_TM1, read with
+# casatools): PHASE_DIR, DELAY_DIR and REFERENCE_DIR have a variable reference,
+# an int column named in MEASINFO['VarRefCol'] whose codes map to frames through
+# TabRefTypes/TabRefCodes (AZEL/AZELNE and AZELGEO/AZELNEGEO share codes).
+ALMA_TAB_REF_TYPES = (
+    "J2000", "JMEAN", "JTRUE", "APP", "B1950", "B1950_VLA", "BMEAN", "BTRUE",
+    "GALACTIC", "HADEC", "AZEL", "AZELSW", "AZELNE", "AZELGEO", "AZELSWGEO",
+    "AZELNEGEO", "JNAT", "ECLIPTIC", "MECLIPTIC", "TECLIPTIC", "SUPERGAL", "ITRF",
+    "TOPO", "ICRS", "MERCURY", "VENUS", "MARS", "JUPITER", "SATURN", "URANUS",
+    "NEPTUNE", "PLUTO", "SUN", "MOON", "COMET",
+)
+ALMA_TAB_REF_CODES = (
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 10, 12, 13, 12, 14, 15, 16, 17, 18, 19,
+    20, 21, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+)
+FIELD_REF_COLUMNS = (("PHASE_DIR", "PhaseDir_Ref"), ("DELAY_DIR", "DelayDir_Ref"),
+                     ("REFERENCE_DIR", "RefDir_Ref"))
+
 DEFAULT_SOURCE = (
     # flux (Jy), dx ("), dy ("), major ("), minor ("), pa (deg)
     (0.060, 0.00, 0.00, 0.50, 0.35, 30.0),
@@ -50,12 +68,24 @@ def simulate_ms(
     date: str = "2017/05/01/00:00:00",
     ra: str = "16h00m00.0s",
     dec: str = "-30d00m00.0s",
+    alma_field_layout: bool = True,
+    frame: str = "J2000",
 ) -> str:
-    """Simulate one execution block into ``msname`` (DATA only; FIELD labelled J2000).
+    """Simulate one execution block into ``msname`` (DATA only).
 
     ``nchan`` and ``chan_mhz`` are per spw, so spws with different channel
     counts (the case that makes tclean drop data, see the consistency checks)
-    can be built.
+    can be built. ``ra``/``dec`` (and the source) are J2000 directions.
+
+    ``alma_field_layout=True`` (default) gives FIELD the layout of a real
+    ALMA MS: int columns PhaseDir_Ref, DelayDir_Ref, RefDir_Ref and the
+    variable-reference MEASINFO keywords (``give_alma_field_layout``). The
+    simulator writes fixed-reference columns, on which CASA tasks such as
+    ``phaseshift`` and ``fixplanets`` behave differently.
+
+    ``frame`` is the frame of the stored FIELD and SOURCE directions: "J2000"
+    (genuine J2000 numbers, as simulated) or "ICRS" (converted with
+    casatools.measures, so the directions are physically the same).
     """
     import casatasks
     import casatools
@@ -150,4 +180,100 @@ def simulate_ms(
     casatasks.split(vis=raw, outputvis=msname, datacolumn="data")
     shutil.rmtree(raw)
     me.done()
+    if alma_field_layout:
+        give_alma_field_layout(msname)
+    if frame != "J2000":
+        set_direction_frame(msname, frame)
     return msname
+
+
+def give_alma_field_layout(msname: str) -> None:
+    """Give the FIELD direction columns ALMA's variable-reference layout.
+
+    For each of PHASE_DIR, DELAY_DIR and REFERENCE_DIR with a fixed reference,
+    an int column (``PhaseDir_Ref`` etc., described as in a real ALMA MS) is
+    added and filled with the code of the column's current frame, and the
+    MEASINFO keyword becomes ``{'type': 'direction', 'VarRefCol': ...,
+    'TabRefTypes': ..., 'TabRefCodes': ...}``. The stored numbers and the
+    physical directions are unchanged.
+    """
+    import casatools
+
+    types = list(ALMA_TAB_REF_TYPES)
+    tb = casatools.table()
+    tb.open(msname + "/FIELD", nomodify=False)
+    try:
+        nrow = tb.nrows()
+        for col, refcol in FIELD_REF_COLUMNS:
+            mi = tb.getcolkeyword(col, "MEASINFO")
+            if "VarRefCol" in mi:
+                continue
+            code = ALMA_TAB_REF_CODES[types.index(str(mi.get("Ref", "J2000")))]
+            tb.addcols({refcol: {"valueType": "int", "dataManagerType": "StandardStMan",
+                                 "dataManagerGroup": "StandardStMan", "option": 0,
+                                 "maxlen": 0, "comment": ""}})
+            tb.putcol(refcol, np.full(nrow, code, dtype=np.int32))
+            tb.putcolkeyword(col, "MEASINFO", {
+                "type": "direction", "VarRefCol": refcol,
+                "TabRefTypes": np.array(types),
+                "TabRefCodes": np.array(ALMA_TAB_REF_CODES, dtype=np.uint64),
+            })
+    finally:
+        tb.close()
+
+
+def _direction_frames(tb, col: str):
+    mi = tb.getcolkeyword(col, "MEASINFO")
+    if "VarRefCol" in mi:
+        types = [str(t) for t in mi["TabRefTypes"]]
+        codes = [int(c) for c in mi["TabRefCodes"]]
+        return [types[codes.index(int(c))] for c in tb.getcol(mi["VarRefCol"])]
+    return [str(mi.get("Ref", "J2000"))] * tb.nrows()
+
+
+def set_direction_frame(msname: str, frame: str) -> None:
+    """Store every FIELD and SOURCE direction in ``frame`` (numbers converted, labels set).
+
+    The numbers are converted with casatools.measures from each cell's own
+    frame, and the reference codes (variable reference) or MEASINFO Ref
+    (fixed) are set to ``frame``: the physical directions are unchanged.
+    """
+    import casatools
+
+    me = casatools.measures()
+    qa = casatools.quanta()
+    tb = casatools.table()
+
+    def conv(ra, dec, f_in):
+        m = me.measure(me.direction(f_in, qa.quantity(float(ra), "rad"),
+                                    qa.quantity(float(dec), "rad")), frame)
+        return m["m0"]["value"], m["m1"]["value"]
+
+    try:
+        tables = (("FIELD", [c for c, _ in FIELD_REF_COLUMNS]), ("SOURCE", ["DIRECTION"]))
+        for table, cols in tables:
+            if not os.path.isdir(msname + "/" + table):
+                continue
+            tb.open(msname + "/" + table, nomodify=False)
+            try:
+                for col in cols:
+                    frames = _direction_frames(tb, col)
+                    for r in range(tb.nrows()):
+                        cell = np.array(tb.getcell(col, r), dtype=float)
+                        if cell.ndim == 2:
+                            cell[0, 0], cell[1, 0] = conv(cell[0, 0], cell[1, 0], frames[r])
+                        else:
+                            cell[0], cell[1] = conv(cell[0], cell[1], frames[r])
+                        tb.putcell(col, r, cell)
+                    mi = tb.getcolkeyword(col, "MEASINFO")
+                    if "VarRefCol" in mi:
+                        types = [str(t) for t in mi["TabRefTypes"]]
+                        code = int(mi["TabRefCodes"][types.index(frame)])
+                        tb.putcol(mi["VarRefCol"], np.full(tb.nrows(), code, dtype=np.int32))
+                    else:
+                        mi["Ref"] = frame
+                        tb.putcolkeyword(col, "MEASINFO", mi)
+            finally:
+                tb.close()
+    finally:
+        me.done()

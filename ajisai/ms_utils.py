@@ -5,7 +5,7 @@ ajisai_ms_utils.py
 ==================
 Measurement-set query utilities for AJISAI.
 
-This module provides native casatools/astropy implementations of the small
+This module provides native casatools/numpy implementations of the small
 subset of analysisUtils (Todd Hunter / NRAO) functions that AJISAI relies on.
 By containing these helpers in a single file, AJISAI removes its dependency
 on the full 110,000-line analysisUtils.py module, which is no longer actively
@@ -22,7 +22,12 @@ Replaced analysisUtils functions:
     4. getBaselineStats          -> get_baseline_at_percentile()
     5. pickCellSize              -> pick_cell_imsize(rule="percentile")
     6. rad2radec                 -> rad_to_radec()
-    7. ICRSToJ2000               -> icrs_to_j2000()
+    7. ICRSToJ2000               -> icrs_to_j2000()  (casatools.measures)
+
+It also holds AJISAI's sky-direction helpers: parsing user coordinates
+(RA in hours, Dec in degrees) into radians, frame conversion with
+casatools.measures, and writing a direction into FIELD/SOURCE in each
+column's own frame (the phase-shift step).
 
 Validation against the original analysisUtils:
     Test MS: V883Ori 232 GHz, 90-percentile baseline = 3293.48 m
@@ -35,7 +40,9 @@ License: MIT
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1053,7 +1060,444 @@ def pick_cell_imsize(
 
 
 # ============================================================================
-# Coordinate utilities (replace rad2radec and ICRSToJ2000 via astropy)
+# Sky directions: parsing, formatting, frame conversion, FIELD/SOURCE writes
+# ============================================================================
+# CASA reads a ':'-separated declination as a time: '-24:12:23.0' becomes
+# -363.1 deg, i.e. Dec -3.1 deg, without any message. AJISAI therefore parses
+# every user coordinate itself (RA in hours, Dec in degrees, whatever the
+# separators) and passes CASA only radian strings ('ICRS 4.25rad -0.42rad').
+# Frames are converted with casatools.measures, never with astropy: astropy's
+# FK5 uses other frame-tie constants (USNO Circular 179) and differs from
+# CASA's J2000 (the IAU 2000 frame bias) by 20-25 mas.
+
+#: Frames in which AJISAI converts and writes directions. ICRS <-> J2000 is a
+#: fixed rotation (the frame bias, at most about 23 mas); frames that need an
+#: epoch or an observatory position are refused rather than guessed.
+SKY_FRAMES = ("ICRS", "J2000")
+
+_TWO_PI = 2.0 * math.pi
+_MAS_PER_RAD = ARCSEC_PER_RAD * 1e3
+
+_RA_PATTERNS = (
+    re.compile(r"^(\d{1,2}):(\d{1,2}):(\d{1,2}(?:\.\d*)?)$"),
+    re.compile(r"^(\d{1,2})h\s*(\d{1,2})m\s*(\d{1,2}(?:\.\d*)?)s?$", re.IGNORECASE),
+    re.compile(r"^(\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d*)?)$"),
+)
+_DEC_PATTERNS = (
+    re.compile(r"^(\d{1,3}):(\d{1,2}):(\d{1,2}(?:\.\d*)?)$"),
+    re.compile(r"^(\d{1,3})\.(\d{1,2})\.(\d{1,2}(?:\.\d*)?)$"),
+    re.compile(r"^(\d{1,3})d\s*(\d{1,2})m\s*(\d{1,2}(?:\.\d*)?)s?$", re.IGNORECASE),
+    re.compile(r"^(\d{1,3})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d*)?)$"),
+)
+_UNIT_ANGLE = re.compile(r"^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(rad|deg)$",
+                         re.IGNORECASE)
+
+
+def _angle_with_unit(text: str) -> Optional[float]:
+    """Radians of an angle written with an explicit unit ('4.21rad', '241.4deg'); else None."""
+    m = _UNIT_ANGLE.match(text)
+    if m is None:
+        return None
+    value = float(m.group(1))
+    return math.radians(value) if m.group(2).lower() == "deg" else value
+
+
+def parse_ra(text: str) -> float:
+    """Right ascension string -> radians in [0, 2 pi).
+
+    Sexagesimal RA is in hours: ``'HH:MM:SS.s'``, ``'HHhMMmSS.ss'`` or
+    ``'HH MM SS.s'``. An angle with a unit (``'241.4deg'``, ``'4.21rad'``) is
+    also accepted. ``'.'``-separated RA is refused (CASA would read it as
+    degrees).
+    """
+    s = str(text).strip()
+    value = _angle_with_unit(s)
+    if value is not None:
+        return value % _TWO_PI
+    body = s[1:].strip() if s.startswith("+") else s
+    for pattern in _RA_PATTERNS:
+        m = pattern.match(body)
+        if m is None:
+            continue
+        h, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if h >= 24 or mi >= 60 or sec >= 60.0:
+            raise ValueError(f"right ascension {text!r} out of range (HH < 24, MM < 60, SS < 60)")
+        return math.radians(15.0 * (h + mi / 60.0 + sec / 3600.0))
+    raise ValueError(
+        f"cannot parse right ascension {text!r}; give hours as 'HH:MM:SS.s', "
+        f"'HHhMMmSS.ss' or 'HH MM SS.s', or an angle with a unit ('241.4deg', '4.21rad')"
+    )
+
+
+def parse_dec(text: str) -> float:
+    """Declination string -> radians in [-pi/2, pi/2].
+
+    Sexagesimal Dec is always in degrees, whichever separators are used:
+    ``'-24:12:23.0'``, ``'-24.12.23.0'`` (CASA's form), ``'-24d12m23.0s'`` or
+    ``'-24 12 23.0'``. An angle with a unit (``'-24.2064deg'``,
+    ``'-0.4225rad'``) is also accepted; a bare decimal number is refused
+    (its unit would be a guess).
+    """
+    s = str(text).strip()
+    value = _angle_with_unit(s)
+    if value is not None:
+        if abs(value) > math.pi / 2.0:
+            raise ValueError(f"declination {text!r} out of range (|Dec| <= 90 deg)")
+        return value
+    sign = 1.0
+    body = s
+    if body[:1] in ("+", "-"):
+        sign = -1.0 if body[0] == "-" else 1.0
+        body = body[1:].strip()
+    for pattern in _DEC_PATTERNS:
+        m = pattern.match(body)
+        if m is None:
+            continue
+        d, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        deg = d + mi / 60.0 + sec / 3600.0
+        if mi >= 60 or sec >= 60.0 or deg > 90.0:
+            raise ValueError(f"declination {text!r} out of range (|Dec| <= 90, MM < 60, SS < 60)")
+        return sign * math.radians(deg)
+    raise ValueError(
+        f"cannot parse declination {text!r}; give degrees as 'DD:MM:SS.s', 'DD.MM.SS.s', "
+        f"'DDdMMmSS.ss' or 'DD MM SS.s', or an angle with a unit ('-24.2deg', '-0.42rad')"
+    )
+
+
+def parse_ra_dec(ra: str, dec: str) -> Tuple[float, float]:
+    """(RA, Dec) strings -> radians: RA in hours, Dec in degrees.
+
+    See :func:`parse_ra` and :func:`parse_dec` for the accepted forms.
+    """
+    return parse_ra(ra), parse_dec(dec)
+
+
+def _sexagesimal_fields(value: float, precision: int) -> Tuple[int, int, int, int]:
+    """Whole units, minutes, seconds and the ``precision``-digit fraction of a value >= 0.
+
+    The value is rounded once, at the last printed digit, so that a carry
+    (59.9999996 s) propagates into the minutes and units.
+    """
+    scale = 10 ** int(precision)
+    total = int(round(value * 3600.0 * scale))
+    units, rem = divmod(total, 3600 * scale)
+    minutes, rem = divmod(rem, 60 * scale)
+    seconds, frac = divmod(rem, scale)
+    return units, minutes, seconds, frac
+
+
+def _seconds_text(seconds: int, frac: int, precision: int) -> str:
+    return f"{seconds:02d}" + (f".{frac:0{precision}d}" if precision > 0 else "")
+
+
+def format_ra(ra_rad: float, precision: int = 5, sep: str = ":") -> str:
+    """RA in radians -> ``'HH:MM:SS.sssss'`` (hours; ``precision`` decimals of seconds)."""
+    hours = (math.degrees(float(ra_rad)) % 360.0) / 15.0
+    h, m, s, f = _sexagesimal_fields(hours, precision)
+    return f"{h % 24:02d}{sep}{m:02d}{sep}{_seconds_text(s, f, precision)}"
+
+
+def format_dec(dec_rad: float, precision: int = 5, sep: str = ".") -> str:
+    """Dec in radians -> ``'+DD.MM.SS.sssss'`` (degrees; ``precision`` decimals of seconds).
+
+    The default ``'.'`` separators are the form CASA reads as an angle; with
+    ``':'`` CASA would read the declination as a time (hours).
+    """
+    deg = math.degrees(float(dec_rad))
+    sign = "-" if deg < 0 else "+"
+    d, m, s, f = _sexagesimal_fields(abs(deg), precision)
+    return f"{sign}{d:02d}{sep}{m:02d}{sep}{_seconds_text(s, f, precision)}"
+
+
+def casa_direction_string(frame: str, ra_rad: float, dec_rad: float) -> str:
+    """``'<frame> <ra>rad <dec>rad'`` with single spaces: the form AJISAI passes to CASA.
+
+    Radians with 15 decimals (1e-15 rad, far below a micro-arcsecond) leave
+    nothing to CASA's sexagesimal parser.
+    """
+    return f"{frame} {float(ra_rad):.15f}rad {float(dec_rad):.15f}rad"
+
+
+def _check_frame(frame: str) -> str:
+    f = str(frame).strip().upper()
+    if f not in SKY_FRAMES:
+        raise ValueError(f"direction frame {frame!r} is not supported; AJISAI converts and "
+                         f"writes directions only in {SKY_FRAMES}")
+    return f
+
+
+def convert_direction(ra_rad: float, dec_rad: float, frame_from: str,
+                      frame_to: str) -> Tuple[float, float]:
+    """The same physical direction in another frame (casatools.measures).
+
+    Frames are those of :data:`SKY_FRAMES`. Returns ``(ra, dec)`` in radians
+    with RA in [0, 2 pi). With equal frames the input is returned (RA
+    wrapped) without calling CASA.
+    """
+    f_in, f_out = _check_frame(frame_from), _check_frame(frame_to)
+    if f_in == f_out:
+        return float(ra_rad) % _TWO_PI, float(dec_rad)
+    _require_casa()
+    me = casatools.measures()
+    qa = casatools.quanta()
+    try:
+        m = me.measure(me.direction(f_in, qa.quantity(float(ra_rad), "rad"),
+                                    qa.quantity(float(dec_rad), "rad")), f_out)
+    finally:
+        me.done()
+    return float(m["m0"]["value"]) % _TWO_PI, float(m["m1"]["value"])
+
+
+def angular_offset_mas(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Great-circle distance between two directions in the same frame, in mas (haversine)."""
+    s = (math.sin((dec2 - dec1) / 2.0) ** 2
+         + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2.0) ** 2)
+    return 2.0 * math.asin(min(1.0, math.sqrt(s))) * _MAS_PER_RAD
+
+
+# --- Reference frames of MS direction columns ---------------------------------
+# A direction column carries a MEASINFO keyword. A fixed reference has
+# MEASINFO['Ref'] for the whole column; a variable reference (ALMA's FIELD
+# table) names an integer column in MEASINFO['VarRefCol'] whose codes map to
+# frame names through MEASINFO['TabRefTypes'] / ['TabRefCodes']. The codes are
+# read from that table, never assumed (0 = J2000 and 21 = ICRS in current
+# casacore, but the mapping belongs to the table).
+
+def frame_of_code(measinfo: Dict[str, Any], code: int) -> str:
+    """Frame name of a reference code through MEASINFO TabRefTypes/TabRefCodes.
+
+    A code listed twice (AZEL and AZELNE share one) maps to its first name.
+    """
+    types = [str(t) for t in measinfo.get("TabRefTypes", [])]
+    codes = [int(c) for c in measinfo.get("TabRefCodes", [])]
+    for t, c in zip(types, codes):
+        if c == int(code):
+            return t
+    raise ValueError(f"reference code {int(code)} is not in MEASINFO TabRefCodes")
+
+
+def code_of_frame(measinfo: Dict[str, Any], frame: str) -> int:
+    """Reference code of a frame name through MEASINFO TabRefTypes/TabRefCodes."""
+    types = [str(t) for t in measinfo.get("TabRefTypes", [])]
+    codes = [int(c) for c in measinfo.get("TabRefCodes", [])]
+    if frame not in types or len(codes) != len(types):
+        raise ValueError(f"frame {frame!r} is not in MEASINFO TabRefTypes")
+    return codes[types.index(frame)]
+
+
+def direction_frames(measinfo: Dict[str, Any], ref_codes=None,
+                     nrow: Optional[int] = None) -> List[str]:
+    """Per-row frame names of a direction column.
+
+    ``measinfo`` is the column's MEASINFO keyword. For a variable reference
+    (``'VarRefCol'`` present) ``ref_codes`` are the values of that column;
+    for a fixed reference every one of ``nrow`` rows has ``MEASINFO['Ref']``
+    (J2000 when absent, casacore's default).
+    """
+    if "VarRefCol" in measinfo:
+        if ref_codes is None:
+            raise ValueError(f"variable-reference column {measinfo['VarRefCol']!r}: "
+                             f"its codes are needed")
+        return [frame_of_code(measinfo, c) for c in np.asarray(ref_codes).ravel()]
+    if nrow is None:
+        raise ValueError("nrow is needed for a fixed-reference column")
+    return [str(measinfo.get("Ref", "J2000"))] * int(nrow)
+
+
+def _column_measinfo(tb, column: str) -> Dict[str, Any]:
+    keywords = tb.getcolkeywords(column) or {}
+    return dict(keywords.get("MEASINFO", {}))
+
+
+def _column_frames(tb, column: str) -> List[str]:
+    """Per-row frames of a direction column of an open casatools table."""
+    mi = _column_measinfo(tb, column)
+    if "VarRefCol" in mi:
+        return direction_frames(mi, ref_codes=tb.getcol(str(mi["VarRefCol"])))
+    return direction_frames(mi, nrow=tb.nrows())
+
+
+def field_direction_frame(vis: str, field_id: int, column: str = "PHASE_DIR") -> str:
+    """Frame of one FIELD row's direction column (per row for a variable reference)."""
+    _require_casa()
+    tb = casatools.table()
+    tb.open(vis + "/FIELD")
+    try:
+        return _column_frames(tb, column)[int(field_id)]
+    finally:
+        tb.close()
+
+
+def field_id_by_name(vis: str, name: str) -> int:
+    """FIELD_ID of the field called ``name``.
+
+    When several FIELD rows carry the name, the one with rows in MAIN is
+    returned; anything still ambiguous (or no match) raises ``ValueError``.
+    Used after tasks that may reindex FIELD (CASA 6.5 ``phaseshift`` with a
+    field selection renumbers the selected field from 0).
+    """
+    names = [str(n) for n in _casa_column_reader(vis + "/FIELD", "NAME")]
+    matches = [i for i, n in enumerate(names) if n == str(name)]
+    if len(matches) > 1:
+        present = set(int(x) for x in np.unique(_casa_column_reader(vis, "FIELD_ID")))
+        matches = [i for i in matches if i in present]
+    if len(matches) != 1:
+        raise ValueError(f"field {name!r} matches FIELD rows {matches} of {vis}; "
+                         f"expected exactly one")
+    return matches[0]
+
+
+_FIELD_DIRECTION_COLUMNS = ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR")
+
+
+def write_field_direction(ms: str, field_ids, ra_rad: float, dec_rad: float,
+                          frame: str) -> Dict[str, Any]:
+    """Write one direction into FIELD PHASE_DIR, DELAY_DIR, REFERENCE_DIR and SOURCE.DIRECTION.
+
+    The direction ``(ra_rad, dec_rad)`` in ``frame`` is converted with
+    casatools.measures into the frame of every cell it is written to: per row
+    for a variable-reference column (ALMA's ``PhaseDir_Ref`` etc., codes
+    mapped through MEASINFO TabRefTypes/TabRefCodes), the column's
+    ``MEASINFO['Ref']`` for a fixed one. No reference code or label is
+    changed, so the physical direction is exact in whatever frames the MS
+    uses. Higher-order polynomial terms (``NUM_POLY > 0``) are set to zero.
+
+    SOURCE rows are those of the SOURCE_IDs of ``field_ids``; a SOURCE_ID
+    that other FIELD rows (not rewritten) also use is left unchanged and
+    reported. Fields with an ephemeris (``EPHEMERIS_ID >= 0``) are refused.
+    UVW and the visibilities are not touched (this is the step after
+    ``phaseshift``, which shifts the data and computes UVW itself).
+
+    Returns a record of what was written (for the run's justification).
+    """
+    _require_casa()
+    target_frame = _check_frame(frame)
+    fids = [int(f) for f in field_ids]
+    record: Dict[str, Any] = {
+        "method": "ajisai.ms_utils.write_field_direction",
+        "field_ids": fids,
+        "target": {"frame": target_frame, "ra_rad": float(ra_rad), "dec_rad": float(dec_rad)},
+        "field": {},
+        "source": {"source_ids": [], "rows": [], "left_unchanged": {}},
+    }
+    cache: Dict[str, Tuple[float, float]] = {}
+
+    def in_frame(f: str) -> Tuple[float, float]:
+        if f not in cache:
+            cache[f] = convert_direction(ra_rad, dec_rad, target_frame, f)
+        return cache[f]
+
+    tb = casatools.table()
+    tb.open(ms + "/FIELD", nomodify=False)
+    try:
+        nrow = tb.nrows()
+        bad = [f for f in fids if not 0 <= f < nrow]
+        if bad:
+            raise ValueError(f"FIELD rows {bad} not in {ms}/FIELD ({nrow} rows)")
+        cols = tb.colnames()
+        if "EPHEMERIS_ID" in cols:
+            eph = tb.getcol("EPHEMERIS_ID")
+            moving = [f for f in fids if int(eph[f]) >= 0]
+            if moving:
+                raise ValueError(f"FIELD rows {moving} of {ms} use an ephemeris; a fixed "
+                                 f"direction cannot be written for them")
+        src_ids = [int(x) for x in tb.getcol("SOURCE_ID")]
+        num_poly = [int(x) for x in tb.getcol("NUM_POLY")] if "NUM_POLY" in cols else [0] * nrow
+        for col in _FIELD_DIRECTION_COLUMNS:
+            if col not in cols:
+                continue
+            frames = _column_frames(tb, col)
+            written: Dict[str, Any] = {}
+            for f in fids:
+                ra_f, dec_f = in_frame(frames[f])
+                cell = np.array(tb.getcell(col, f), dtype=float)
+                cell[:, :] = 0.0
+                cell[0, 0] = ra_f
+                cell[1, 0] = dec_f
+                tb.putcell(col, f, cell)
+                written[str(f)] = {"frame": frames[f], "ra_rad": ra_f, "dec_rad": dec_f}
+            record["field"][col] = written
+        record["num_poly_zeroed"] = [f for f in fids if num_poly[f] > 0]
+    finally:
+        tb.close()
+
+    wanted = sorted({src_ids[f] for f in fids if src_ids[f] >= 0})
+    others = {src_ids[g] for g in range(len(src_ids)) if g not in fids}
+    for sid in wanted:
+        if sid in others:
+            record["source"]["left_unchanged"][str(sid)] = (
+                "SOURCE_ID also used by FIELD rows that were not rewritten")
+    sids = [s for s in wanted if s not in others]
+    if not sids:
+        return record
+    if not os.path.isdir(ms + "/SOURCE"):
+        record["source"]["left_unchanged"]["all"] = "no SOURCE table"
+        return record
+    tb.open(ms + "/SOURCE", nomodify=False)
+    try:
+        if tb.nrows() == 0 or "DIRECTION" not in tb.colnames():
+            record["source"]["left_unchanged"]["all"] = "SOURCE has no rows or no DIRECTION"
+            return record
+        frames = _column_frames(tb, "DIRECTION")
+        sid_col = [int(x) for x in tb.getcol("SOURCE_ID")]
+        rows = [r for r, s in enumerate(sid_col) if s in sids]
+        for r in rows:
+            ra_s, dec_s = in_frame(frames[r])
+            cell = np.array(tb.getcell("DIRECTION", r), dtype=float)
+            cell[0] = ra_s
+            cell[1] = dec_s
+            tb.putcell("DIRECTION", r, cell)
+        record["source"]["source_ids"] = sids
+        record["source"]["rows"] = rows
+        record["source"]["frames"] = sorted({frames[r] for r in rows})
+    finally:
+        tb.close()
+    return record
+
+
+def field_direction_offsets(ms: str, field_id: int, ra_rad: float, dec_rad: float,
+                            frame: str) -> Dict[str, Any]:
+    """Offsets (mas) of a FIELD row's three directions and its SOURCE rows from a direction.
+
+    Every stored direction is converted from its own frame into ``frame``
+    with casatools.measures before the offset is taken. Read-only.
+    """
+    _require_casa()
+    target_frame = _check_frame(frame)
+    out: Dict[str, Any] = {"field": {}, "source": {}}
+    tb = casatools.table()
+    tb.open(ms + "/FIELD")
+    try:
+        sid = int(tb.getcell("SOURCE_ID", int(field_id)))
+        for col in _FIELD_DIRECTION_COLUMNS:
+            if col not in tb.colnames():
+                continue
+            fr = _column_frames(tb, col)[int(field_id)]
+            cell = np.asarray(tb.getcell(col, int(field_id)), dtype=float)
+            a, d = convert_direction(cell[0, 0], cell[1, 0], fr, target_frame)
+            out["field"][col] = angular_offset_mas(a, d, ra_rad, dec_rad)
+    finally:
+        tb.close()
+    if sid >= 0 and os.path.isdir(ms + "/SOURCE"):
+        tb.open(ms + "/SOURCE")
+        try:
+            if tb.nrows() and "DIRECTION" in tb.colnames():
+                frames = _column_frames(tb, "DIRECTION")
+                for r, s in enumerate(int(x) for x in tb.getcol("SOURCE_ID")):
+                    if s != sid:
+                        continue
+                    cell = np.asarray(tb.getcell("DIRECTION", r), dtype=float)
+                    a, d = convert_direction(cell[0], cell[1], frames[r], target_frame)
+                    out["source"][str(r)] = angular_offset_mas(a, d, ra_rad, dec_rad)
+        finally:
+            tb.close()
+    values = list(out["field"].values()) + list(out["source"].values())
+    out["max_mas"] = max(values) if values else None
+    return out
+
+
+# ============================================================================
+# Coordinate strings (replace rad2radec and ICRSToJ2000)
 # ============================================================================
 def rad_to_radec(
     ra_rad: float,
@@ -1065,26 +1509,21 @@ def rad_to_radec(
     """Convert RA/Dec from radians to a sexagesimal string.
 
     Replaces analysisUtils.rad2radec when called with explicit ra/dec values.
-    Uses astropy for portable, well-tested coordinate formatting.
 
     Parameters
     ----------
     ra_rad, dec_rad : radians
-    hms_dms         : if True, output like 'HH:MM:SS.ss DD:MM:SS.ss';
-                      if False, output decimal degrees.
+    hms_dms         : if True, output like ``'HH:MM:SS.sssss +DD.MM.SS.sssss'``
+                      (RA in hours with ':' separators, Dec in degrees with
+                      '.' separators: CASA reads a ':'-separated declination
+                      as hours); if False, decimal degrees.
     delimiter       : separator between RA and Dec.
-    precision       : decimal places on seconds field.
+    precision       : decimal places on the seconds field (or on the degrees).
     """
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-
-    c = SkyCoord(ra=ra_rad * u.rad, dec=dec_rad * u.rad, frame="icrs")
     if hms_dms:
-        ra_str = c.ra.to_string(unit=u.hour, sep=":", precision=precision, pad=True)
-        dec_str = c.dec.to_string(unit=u.deg, sep=":", precision=precision,
-                                  pad=True, alwayssign=True)
-        return f"{ra_str}{delimiter}{dec_str}"
-    return f"{c.ra.deg:.{precision}f}{delimiter}{c.dec.deg:.{precision}f}"
+        return f"{format_ra(ra_rad, precision)}{delimiter}{format_dec(dec_rad, precision)}"
+    ra_deg = math.degrees(float(ra_rad)) % 360.0
+    return f"{ra_deg:.{precision}f}{delimiter}{math.degrees(float(dec_rad)):.{precision}f}"
 
 
 def rad_to_radec_from_imfit(
@@ -1099,7 +1538,8 @@ def rad_to_radec_from_imfit(
     Replaces ``analysisUtils.rad2radec(imfitdict=...)`` usage in the
     original AJISAI script. The imfit dict structure is
     ``imfitdict['deconvolved']['component0']['shape']['direction']``
-    with ``m0`` = RA (radians) and ``m1`` = Dec (radians).
+    with ``m0`` = RA (radians) and ``m1`` = Dec (radians). The string has
+    the layout of :func:`rad_to_radec` (Dec with '.' separators).
     """
     comp = imfitdict["deconvolved"][f"component{component}"]
     direction = comp["shape"]["direction"]
@@ -1113,10 +1553,9 @@ def _sexagesimal_to_colon(token: str) -> str:
     """Normalise a single sexagesimal token to ':'-separated form.
 
     CASA / analysisUtils declination strings use '.' as the *field*
-    separator, e.g. ``-34.17.38.348`` (= -34d 17m 38.348s). astropy cannot
-    parse that directly, so convert the field separators to ':' while
-    preserving the fractional seconds. RA tokens (already ':'-separated) and
-    unrecognised tokens are returned unchanged for astropy to handle.
+    separator, e.g. ``-34.17.38.348`` (= -34d 17m 38.348s). Convert the field
+    separators to ':' while preserving the fractional seconds. RA tokens
+    (already ':'-separated) and unrecognised tokens are returned unchanged.
     """
     if ":" in token:
         return token
@@ -1129,7 +1568,7 @@ def _sexagesimal_to_colon(token: str) -> str:
     elif len(fields) == 4:        # DD.MM.SS.ffff  -> seconds = SS.ffff
         d, m, s = fields[0], fields[1], f"{fields[2]}.{fields[3]}"
     else:
-        return token             # unknown layout; let astropy try as-is
+        return token             # unknown layout; left to the caller's parser
     return f"{sign}{d}:{m}:{s}"
 
 
@@ -1140,10 +1579,11 @@ def _split_radec(coord_str: str) -> tuple:
 
     * CASA / analysisUtils form ``'HH:MM:SS.s DD.MM.SS.s'`` -- RA uses ':'
       separators, Dec uses '.' separators. This is what ``imstat`` /
-      ``au.rad2radec`` emit and is the layout AJISAI actually feeds in.
+      ``au.rad2radec`` emit.
     * Space-separated form ``'HH MM SS.s DD MM SS.s'`` (6 whitespace tokens).
 
-    Both are returned with ':'-separated RA and Dec so astropy can parse them.
+    Both are returned ':'-separated; :func:`parse_dec` reads the
+    declination as degrees.
     """
     tokens = coord_str.split()
     if len(tokens) == 2:
@@ -1156,35 +1596,32 @@ def _split_radec(coord_str: str) -> tuple:
     )
 
 
-def icrs_to_j2000(coord_str: str) -> str:
-    """Convert an ICRS sexagesimal coordinate string to J2000 (FK5).
+def icrs_to_j2000(coord_str: str, precision: int = 7) -> str:
+    """Convert an ICRS sexagesimal coordinate string to J2000 as CASA defines it.
 
-    Replaces analysisUtils.ICRSToJ2000. Uses astropy. The two frames share
-    the same origin at epoch J2000.0, so the on-sky position is unchanged and
-    the returned coordinate label is numerically almost identical to the
-    input; AJISAI uses this for CASA's ``fixplanets`` / ``phasecenter``
-    arguments, which need an explicit J2000 label.
+    Replaces analysisUtils.ICRSToJ2000. The conversion is
+    ``casatools.measures`` ICRS -> J2000, i.e. the IAU 2000 frame bias that
+    CASA applies whenever it relates the two frames: a fixed rotation, so the
+    returned numbers differ from the input by up to about 23 mas while the
+    direction is the same. astropy's FK5 is not used: its frame-tie
+    constants (USNO Circular 179) differ from CASA's J2000 by 20-25 mas.
 
     Input may be either the CASA / analysisUtils layout
     ``'HH:MM:SS.s DD.MM.SS.s'`` (RA ':'-separated, Dec '.'-separated -- the
     format emitted by ``imstat``'s ``maxposf`` and ``au.rad2radec``) or the
-    space-separated ``'HH MM SS.s DD MM SS.s'`` layout.
+    space-separated ``'HH MM SS.s DD MM SS.s'`` layout; the declination is
+    read as degrees in either case.
 
-    The output preserves the CASA convention: RA with ':' separators and Dec
-    with '.' separators (e.g. ``'15:45:06.32 -34.17.38.34'``). This matters
-    because CASA interprets ':' in a declination as a time (hours) value, so
-    Dec must use '.' separators to be parsed as an angle downstream.
+    The output keeps the CASA convention: RA with ':' separators and Dec
+    with '.' separators (e.g. ``'15:45:06.3210123 -34.17.38.3341234'``), with
+    ``precision`` decimals of seconds (the default 7 keeps the string within
+    2 micro-arcseconds of the conversion). The '.' matters because CASA
+    interprets ':' in a declination as a time (hours). Requires CASA.
     """
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-
     ra_str, dec_str = _split_radec(coord_str)
-    c_icrs = SkyCoord(ra=ra_str, dec=dec_str, unit=(u.hourangle, u.deg), frame="icrs")
-    c_j2000 = c_icrs.transform_to("fk5")  # FK5 J2000.0
-    ra_out = c_j2000.ra.to_string(unit=u.hour, sep=":", precision=5, pad=True)
-    dec_out = c_j2000.dec.to_string(unit=u.deg, sep=".", precision=5,
-                                    pad=True, alwayssign=True)
-    return f"{ra_out} {dec_out}"
+    ra, dec = parse_ra_dec(ra_str, dec_str)
+    ja, jd = convert_direction(ra, dec, "ICRS", "J2000")
+    return f"{format_ra(ja, precision)} {format_dec(jd, precision)}"
 
 
 # ============================================================================

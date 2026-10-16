@@ -89,8 +89,19 @@ from .ms_utils import (
     get_antenna_flag_stats,
     get_dish_diameter_m,
     pick_cell_imsize,
-    icrs_to_j2000,
     read_vis_summary,
+    SKY_FRAMES,
+    parse_ra_dec,
+    rad_to_radec,
+    casa_direction_string,
+    convert_direction,
+    code_of_frame,
+    field_direction_frame,
+    field_id_by_name,
+    write_field_direction,
+    field_direction_offsets,
+    _column_frames,
+    _column_measinfo,
     CELL_RULES,
     _CHUNK_SAMPLES,
     _primary_beam_fwhm_arcsec,
@@ -310,6 +321,9 @@ class AJISAIConfig:
     # If phase_center is given, it must be a 3-tuple (ra, dec, frame) where
     # frame is either "ICRS" or "J2000". This lets advanced users supply
     # sub-pixel-accurate coordinates from their own imfit/Gaussian fit.
+    # RA is read as hours and Dec as degrees whatever the separators
+    # (':' '.' 'h m s' 'd m s' or spaces) and converted to radians at
+    # validation; CASA only ever receives radians.
     # Example: phase_center=("16:25:45.0", "-24:12:23.0", "ICRS")
     phase_center: Optional[Tuple[str, str, str]] = None
 
@@ -338,7 +352,9 @@ class AJISAIConfig:
     # column and every relabelling lives in copies under results_dir. When
     # this is True and the input carries J2000 frame codes, a copy
     # (intermediate/input_icrs.ms) is relabelled J2000 -> ICRS (frame code
-    # only; coordinates are not converted) and used as the working MS.
+    # only; coordinates are not converted) and used as the working MS. That
+    # is right for ALMA data observed before Cycle 3 (ICRS numbers labelled
+    # J2000); for other data a warning is recorded (relabel_caveat).
     relabel_j2000_to_icrs: bool = True
     # Who drives this run: "user" (standalone) or "asebi" (the ASEBI pipeline).
     # With "asebi", interactive masking is refused (viewer-free operation).
@@ -1208,16 +1224,50 @@ def final_depth_decision(
     }
 
 
-def _relabel_needed(ref_code_columns, source_direction_ref: Optional[str]) -> bool:
+def _relabel_needed(field_frames, source_frames) -> bool:
     """Would :func:`relabel_J2000_to_ICRS` change anything?
 
-    ``ref_code_columns``: the FIELD ``*_Ref`` integer columns (0 = J2000);
-    ``source_direction_ref``: the SOURCE.DIRECTION MEASINFO reference.
+    ``field_frames``: per-row frame names of the FIELD direction columns
+    (one sequence per column); ``source_frames``: those of SOURCE.DIRECTION.
+    Frame names come from the MEASINFO keywords (variable-reference codes
+    mapped through TabRefTypes/TabRefCodes), never from assumed codes.
     """
-    for col in ref_code_columns:
-        if np.any(np.asarray(col) == 0):
+    for frames in list(field_frames) + [source_frames or []]:
+        if any(str(f) == "J2000" for f in frames):
             return True
-    return source_direction_ref == "J2000"
+    return False
+
+
+# Start of ALMA Cycle 3 (2015-10-01 00:00 UTC) as an MJD in seconds, the unit
+# of the MS TIME columns. ALMA data observed before it carry a J2000 label on
+# ICRS numbers (ALMA knowledgebase), which a label-only relabel corrects.
+ALMA_CYCLE3_START_MJD_S = float(
+    (datetime(2015, 10, 1) - datetime(1858, 11, 17)).days * 86400)
+
+
+def _relabel_caveat(telescope_names, start_mjd_s: Optional[float]) -> Optional[str]:
+    """Why a label-only J2000 -> ICRS relabel may be wrong for these data (None when it is right).
+
+    The relabel changes the frame label and keeps the numbers. That is the
+    correction for ALMA data observed before Cycle 3 (ICRS numbers labelled
+    J2000); for any other data with a J2000 label the numbers are genuine
+    J2000 and the relabel moves every direction by the frame bias (up to
+    about 23 mas).
+    """
+    names = sorted({str(n).strip().upper() for n in telescope_names})
+    reasons = []
+    if not names or any(n not in ("ALMA", "ACA") for n in names):
+        reasons.append(f"TELESCOPE_NAME {names} is not ALMA")
+    if start_mjd_s is None:
+        reasons.append("the observation start time is unknown")
+    elif float(start_mjd_s) >= ALMA_CYCLE3_START_MJD_S:
+        reasons.append("the observation starts on or after 2015-10-01 (ALMA Cycle 3)")
+    if not reasons:
+        return None
+    return ("the label-only J2000 -> ICRS relabel is only right for ALMA data observed "
+            "before Cycle 3 (ICRS numbers labelled J2000); here " + " and ".join(reasons)
+            + ", so J2000 numbers may be genuine and the relabel moves them by the frame "
+              "bias (up to about 23 mas)")
 
 
 # ============================================================================
@@ -1275,90 +1325,127 @@ def _safe_rmtree_glob(parent, pattern: str) -> None:
         _safe_rmtree_path(p)
 
 
-def relabel_J2000_to_ICRS(msfile: str, verbose: bool = False) -> None:
+def _relabel_column(tb, column: str) -> Dict[str, Any]:
+    """Relabel J2000 -> ICRS in one direction column of an open table (numbers unchanged)."""
+    mi = _column_measinfo(tb, column)
+    if "VarRefCol" in mi:
+        refcol = str(mi["VarRefCol"])
+        j2000, icrs = code_of_frame(mi, "J2000"), code_of_frame(mi, "ICRS")
+        codes = np.asarray(tb.getcol(refcol))
+        rows = np.flatnonzero(codes == j2000)
+        if rows.size:
+            codes = codes.copy()
+            codes[rows] = icrs
+            tb.putcol(refcol, codes)
+        return {"reference": "variable", "ref_column": refcol, "j2000_code": j2000,
+                "icrs_code": icrs, "rows_relabelled": [int(r) for r in rows]}
+    ref = str(mi.get("Ref", "J2000"))   # casacore's default when no Ref is stored
+    if ref == "J2000":
+        mi.setdefault("type", "direction")
+        mi["Ref"] = "ICRS"
+        tb.putcolkeyword(column, "MEASINFO", mi)
+        return {"reference": "fixed", "ref": "J2000 -> ICRS (whole column)",
+                "rows_relabelled": list(range(tb.nrows()))}
+    return {"reference": "fixed", "ref": ref, "rows_relabelled": []}
+
+
+def relabel_J2000_to_ICRS(msfile: str, verbose: bool = False) -> Dict[str, Any]:
     """
     Relabel J2000 frame entries in FIELD and SOURCE tables to ICRS.
 
-    Ported from AJISAI.py. Addresses the J2000/ICRS confusion that has
-    historically caused CASA imaging tasks to error on archival ALMA data.
-    Operates in place on the MS; safe to call repeatedly (idempotent). The
-    pipeline calls it only on its own copies (never on the input MS).
+    Ported from AJISAI.py. A label-only change: the numbers are kept, so it
+    is right for ALMA data observed before Cycle 3, whose ICRS numbers carry
+    a J2000 label, and wrong (by the frame bias, up to about 23 mas) for
+    genuine J2000 numbers. Operates in place on the MS; safe to call
+    repeatedly (idempotent). The pipeline calls it only on its own copies
+    (never on the input MS).
+
+    FIELD PHASE_DIR, DELAY_DIR and REFERENCE_DIR and SOURCE.DIRECTION are
+    handled alike: for a variable-reference column the J2000 rows get the
+    ICRS code, both codes read from the column's MEASINFO
+    TabRefTypes/TabRefCodes; a fixed-reference column labelled J2000 is
+    relabelled as a whole. A table that cannot be relabelled is reported
+    with a warning and in the returned record (``errors``), never skipped
+    silently.
+
+    Returns
+    -------
+    dict
+        ``{"FIELD": {column: record}, "SOURCE": {...}, "errors": [...]}``.
     """
     _require_casa()
+    out: Dict[str, Any] = {"FIELD": {}, "SOURCE": {}, "errors": []}
     tb = casatools.table()
-    # FIELD table: PhaseDir_Ref / DelayDir_Ref / RefDir_Ref columns use integer
-    # codes; 0 = J2000, 21 = ICRS in CASA's MEASINFO convention.
-    tb.open(msfile + "/FIELD", nomodify=False)
-    try:
-        for colname in ("PhaseDir_Ref", "DelayDir_Ref", "RefDir_Ref"):
-            if colname in tb.colnames():
-                a = tb.getcol(colname)
-                changed = False
-                for i in range(len(a)):
-                    if a[i] == 0:
-                        a[i] = 21
-                        changed = True
-                if changed:
-                    tb.putcol(colname, a)
-                    if verbose:
-                        print(f"[AJISAI] FIELD.{colname}: J2000→ICRS")
-    finally:
-        tb.close()
-    # SOURCE table: DIRECTION column has a frame keyword
-    tb.open(msfile + "/SOURCE", nomodify=False)
-    try:
+    for table, columns in (("FIELD", ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR")),
+                           ("SOURCE", ("DIRECTION",))):
+        path = msfile + "/" + table
+        if not os.path.isdir(path):
+            out[table]["absent"] = True
+            continue
         try:
-            keys = tb.getcolkeywords("DIRECTION")
-            if keys.get("MEASINFO", {}).get("Ref") == "J2000":
-                keys["MEASINFO"]["Ref"] = "ICRS"
-                tb.putcolkeywords("DIRECTION", keys)
-                if verbose:
-                    print("[AJISAI] SOURCE.DIRECTION: J2000→ICRS")
-        except Exception:
-            pass
-    finally:
-        tb.close()
+            tb.open(path, nomodify=False)
+        except Exception as exc:  # recorded and warned, not swallowed
+            msg = f"relabel_J2000_to_ICRS: cannot open {path}: {exc}"
+            out["errors"].append(msg)
+            warnings.warn(msg)
+            continue
+        try:
+            for col in columns:
+                if col not in tb.colnames():
+                    continue
+                try:
+                    rec = _relabel_column(tb, col)
+                except Exception as exc:  # recorded and warned, not swallowed
+                    msg = f"relabel_J2000_to_ICRS: {table}.{col} not relabelled: {exc}"
+                    out["errors"].append(msg)
+                    warnings.warn(msg)
+                    continue
+                out[table][col] = rec
+                if verbose and rec["rows_relabelled"]:
+                    print(f"[AJISAI] {table}.{col}: J2000 -> ICRS "
+                          f"({len(rec['rows_relabelled'])} rows, label only)")
+        finally:
+            tb.close()
+    return out
 
 
-def _max_pixel_world_coords(imagename: str) -> Dict[str, str]:
+def _max_pixel_world_coords(imagename: str) -> Dict[str, Any]:
     """World coordinates of the brightest pixel in a CASA image.
 
-    Uses casatasks.imstat (always succeeds; the max pixel always exists)
-    and reads the image's reference frame via casatools.image.
+    Uses casatasks.imstat for the pixel (always succeeds; the max pixel
+    always exists) and the image's coordinate system for its direction, in
+    radians at the pixel centre (``imstat``'s ``maxposf`` string is rounded
+    to milliseconds of time, i.e. up to 15 mas, and is not used).
 
     Returns
     -------
     dict with keys:
-        ra    : RA sexagesimal string (no whitespace)
-        dec   : Dec sexagesimal string (no whitespace)
+        ra_rad, dec_rad : direction of the pixel centre (radians)
         frame : "ICRS", "J2000", "B1950", etc. (whatever the image declares)
+        ra, dec : the same direction as strings (RA hours with ':', Dec
+                  degrees with '.'), for the record only
+        pixel : the pixel indices from imstat
     """
     _require_casa()
     stats = casatasks.imstat(imagename=imagename, stokes="I")
-    maxposf = stats["maxposf"]
-    # maxposf is comma-separated: "RA, Dec, Stokes, Frequency"
-    parts = [p.strip() for p in maxposf.split(",")]
-    if len(parts) < 2:
-        raise RuntimeError(
-            f"imstat returned unexpected maxposf format: {maxposf!r}"
-        )
-    ra = parts[0].replace(" ", "")
-    dec = parts[1].replace(" ", "")
-    # Read the image's reference frame
+    pixel = [int(p) for p in np.asarray(stats["maxpos"]).ravel()]
     ia = casatools.image()
+    qa = casatools.quanta()
     ia.open(imagename)
     try:
         cs = ia.coordsys()
         try:
-            ref = cs.referencecode("direction")
-            # referencecode returns either a string or a list of strings
-            frame = ref[0] if isinstance(ref, (list, tuple)) else ref
-            frame = str(frame).upper()
+            world = cs.toworld([float(p) for p in pixel], "m")["measure"]["direction"]
         finally:
             cs.done()
     finally:
         ia.close()
-    return {"ra": ra, "dec": dec, "frame": frame}
+    ra_rad = float(qa.convert(world["m0"], "rad")["value"]) % (2.0 * math.pi)
+    dec_rad = float(qa.convert(world["m1"], "rad")["value"])
+    frame = str(world["refer"]).upper()
+    ra, dec = rad_to_radec(ra_rad, dec_rad, precision=7).split()
+    return {"ra_rad": ra_rad, "dec_rad": dec_rad, "frame": frame, "ra": ra, "dec": dec,
+            "pixel": pixel}
 
 
 def _compute_avg_integration_time(vis: str, field: Optional[str] = None) -> float:
@@ -1808,13 +1895,24 @@ Infrastructure
             ra, dec, frame = cfg.phase_center
             if not isinstance(ra, str) or not isinstance(dec, str):
                 raise ValueError(
-                    "phase_center RA and Dec must be sexagesimal strings, "
-                    f"e.g. ('16:25:45.0', '-24:12:23.0', 'ICRS'); got ({ra!r}, {dec!r})"
+                    "phase_center RA and Dec must be strings (RA in hours, Dec in "
+                    "degrees), e.g. ('16:25:45.0', '-24:12:23.0', 'ICRS') or "
+                    f"('16h25m45.0s', '-24d12m23.0s', 'ICRS'); got ({ra!r}, {dec!r})"
                 )
-            if frame not in ("ICRS", "J2000"):
+            if not isinstance(frame, str) or frame.upper() not in SKY_FRAMES:
                 raise ValueError(
                     f"phase_center frame must be 'ICRS' or 'J2000'; got {frame!r}"
                 )
+            # Parsed here, not by CASA: CASA reads a ':'-separated Dec as hours
+            # ('-24:12:23.0' -> Dec -3.1 deg). Only radians are passed on.
+            try:
+                ra_rad, dec_rad = parse_ra_dec(ra, dec)
+            except ValueError as exc:
+                raise ValueError(f"phase_center: {exc}") from exc
+            self._derived["phase_center"] = {
+                "frame": frame.upper(), "ra_rad": ra_rad, "dec_rad": dec_rad,
+                "ra": ra, "dec": dec,
+            }
             if not cfg.phase_shift:
                 warnings.warn(
                     "phase_center is set but phase_shift=False; the coordinates "
@@ -2023,6 +2121,8 @@ Infrastructure
         cfg = self.cfg
         assert self.workdir is not None
         working = cfg.vis
+        relabel_record: Optional[Dict[str, Any]] = None
+        caveat: Optional[str] = None
         if not cfg.relabel_j2000_to_icrs:
             reason = "relabel_j2000_to_icrs=False: the input MS is used as it is (read-only)"
         elif not _ms_needs_relabel(cfg.vis):
@@ -2031,11 +2131,17 @@ Infrastructure
             copy = self.workdir / "intermediate" / "input_icrs.ms"
             _safe_rmtree_path(copy)
             _copy_ms(cfg.vis, copy)
-            relabel_J2000_to_ICRS(str(copy), verbose=cfg.verbose)
+            relabel_record = relabel_J2000_to_ICRS(str(copy), verbose=cfg.verbose)
             working = str(copy)
             reason = ("the input carries J2000 frame codes; a copy was relabelled "
                       "J2000 -> ICRS (frame code only, coordinates unchanged) so that the "
                       "input MS is never written")
+            names, start = _observation_telescopes_and_start(cfg.vis)
+            caveat = _relabel_caveat(names, start)
+            if caveat is not None:
+                warnings.warn(f"[AJISAI] {caveat}")
+                if cfg.verbose:
+                    print(f"[AJISAI]   WARN: {caveat}")
         self._derived["input_vis"] = cfg.vis
         self._derived["working_vis"] = working
         self.justification["derived"]["working_vis"] = {
@@ -2044,6 +2150,9 @@ Infrastructure
             "relabel_j2000_to_icrs": cfg.relabel_j2000_to_icrs,
             "reason": reason,
         }
+        if relabel_record is not None:
+            self.justification["derived"]["working_vis"]["relabel"] = relabel_record
+            self.justification["derived"]["working_vis"]["relabel_caveat"] = caveat
         if cfg.verbose:
             print(f"[AJISAI] working MS            : {working}")
 
@@ -2263,25 +2372,47 @@ Infrastructure
         With ``phase_shift=True``:
 
         * If ``cfg.phase_center is None``: the source location is auto-detected
-          by reading the world coordinates of the brightest pixel of the
-          dirty image (method A: pixel-accurate, never fails, no user input).
+          as the centre of the brightest pixel of the dirty image (method A:
+          pixel-accurate, never fails, no user input), read in radians from
+          the image's coordinate system.
 
         * If ``cfg.phase_center`` is a ``(ra, dec, frame)`` tuple where
           ``frame`` is ``"ICRS"`` or ``"J2000"``: the user-supplied
-          coordinates are used. This route is intended for advanced users
+          coordinates are used (parsed to radians at validation: RA in
+          hours, Dec in degrees). This route is intended for advanced users
           who need sub-pixel accuracy (e.g. from their own imfit on the
           dirty image, or from VLBI / multi-wavelength astrometry).
 
-        Frame handling:
-            ``casatasks.fixplanets`` only supports the ``J2000`` frame.
-            ICRS inputs are converted to J2000 with astropy
-            (``icrs_to_j2000``) before fixplanets is called. The MS frame
-            label is restored to ICRS afterwards via
-            ``relabel_J2000_to_ICRS``, matching the original AJISAI behavior.
+        Frame handling (exact in any frame the MS uses):
+
+        1. The frame W of the target field's PHASE_DIR is read from the
+           working MS (per row for ALMA's variable-reference columns, codes
+           mapped through MEASINFO TabRefTypes/TabRefCodes).
+        2. The target is converted into W with ``casatools.measures`` when
+           its frame differs (never with astropy, whose FK5 differs from
+           CASA's J2000 by 20-25 mas).
+        3. ``phaseshift(phasecenter="W <ra>rad <dec>rad")`` shifts the data
+           and computes UVW (radians only: CASA reads a ':'-separated Dec
+           as hours).
+        4. The target field is found in the output by name (CASA 6.5
+           ``phaseshift`` renumbers the selected field from 0).
+        5. FIELD PHASE_DIR, DELAY_DIR, REFERENCE_DIR and SOURCE.DIRECTION
+           are written with :func:`ajisai.ms_utils.write_field_direction`,
+           each converted into its own frame. ``phaseshift`` alone is not
+           enough: CASA 6.5 writes J2000 numbers into an ICRS-coded
+           PHASE_DIR (off by the frame bias, up to about 23 mas) and leaves
+           DELAY_DIR, REFERENCE_DIR and SOURCE at the old centre.
+
+        ``fixplanets`` is not used: it writes its numbers unconverted with a
+        J2000 code, refuses other frames, and with ``fixuvw=True``
+        recomputes UVW from the ANTENNA table (0.5 m wrong for ALMA's DV
+        antennas). No frame label is changed here; the read-back offsets of
+        all written directions from the target are recorded.
 
         The shifted MS is written to
         ``<workdir>/intermediate/phaseshifted.ms``, and
-        ``self._derived['working_vis']`` is updated to point to it. All
+        ``self._derived['working_vis']`` (and ``resolved_field_id``, when
+        the field was renumbered) is updated to point to it. All
         subsequent CASA tasks (initial CLEAN, self-cal iterations) operate
         on the shifted MS.
         """
@@ -2300,11 +2431,13 @@ Infrastructure
                 print("[AJISAI] phase shift           : skipped (phase_shift=False)")
             return
 
-        # === Resolve the target coordinates ===
+        # === Resolve the target direction (radians, with its frame) ===
         if cfg.phase_center is not None:
             ra, dec, frame = cfg.phase_center
-            frame = frame.upper()
+            frame = str(frame).upper()
+            ra_rad, dec_rad = parse_ra_dec(ra, dec)
             source_label = "user-specified"
+            pixel = None
         else:
             dirty_image = Path(_image_name(self.workdir / "intermediate" / "dirty", 1))
             if not dirty_image.exists():
@@ -2313,76 +2446,97 @@ Infrastructure
                     "but dirty.image was not found at "
                     f"{dirty_image}. _make_dirty_image must run first."
                 )
-            coords = _max_pixel_world_coords(str(dirty_image))
-            ra, dec, frame = coords["ra"], coords["dec"], coords["frame"]
-            source_label = (
-                f"auto: max pixel of dirty image (frame={frame})"
-            )
-
-        # === Convert to J2000 for fixplanets ===
-        if frame == "ICRS":
-            j2000_radec = icrs_to_j2000(f"{ra} {dec}")
-            # j2000_radec is "HH:MM:SS.s DD:MM:SS.s"
-        elif frame == "J2000":
-            j2000_radec = f"{ra} {dec}"
-        else:
+            peak = _max_pixel_world_coords(str(dirty_image))
+            ra, dec, frame = peak["ra"], peak["dec"], peak["frame"]
+            ra_rad, dec_rad = peak["ra_rad"], peak["dec_rad"]
+            pixel = peak["pixel"]
+            source_label = f"auto: max pixel of dirty image (frame={frame})"
+        if frame not in SKY_FRAMES:
             # Image was in some other frame (e.g. B1950); refuse rather than guess
             raise RuntimeError(
-                f"Auto-detected image frame is {frame!r}, but phase shifting "
-                f"only supports ICRS or J2000. Specify cfg.phase_center "
-                f"explicitly with a supported frame."
+                f"The target frame is {frame!r}, but phase shifting only supports "
+                f"{SKY_FRAMES}. Specify cfg.phase_center explicitly with a supported frame."
             )
 
-        # === Phaseshift to new MS ===
+        # === The target in the frame of the field's PHASE_DIR ===
+        working = self._derived["working_vis"]
+        field_in = str(self._derived["resolved_field_id"])
+        ms_frame = field_direction_frame(working, int(field_in), "PHASE_DIR")
+        if ms_frame not in SKY_FRAMES:
+            raise RuntimeError(
+                f"PHASE_DIR of field {field_in} in {working} is in frame {ms_frame!r}; "
+                f"phase shifting supports only {SKY_FRAMES}"
+            )
+        ra_w, dec_w = convert_direction(ra_rad, dec_rad, frame, ms_frame)
+        phasecenter = casa_direction_string(ms_frame, ra_w, dec_w)
+
+        # === Phaseshift to new MS (data and UVW) ===
         shifted_vis = str(self.workdir / "intermediate" / "phaseshifted.ms")
         _safe_rmtree_path(shifted_vis)
         casatasks.phaseshift(
-            vis=self._derived["working_vis"],
+            vis=working,
             outputvis=shifted_vis,
             keepmms=True,
-            field=self._derived["resolved_field_id"],
+            field=field_in,
             spw="",
             scan="",
             intent="",
             array="",
             observation="",
             datacolumn="all",
-            phasecenter=f"{frame} {ra} {dec}",
+            phasecenter=phasecenter,
         )
 
-        # === Fix planet labels (J2000 only) ===
-        casatasks.fixplanets(
-            vis=shifted_vis,
-            field=self._derived["resolved_field_id"],
-            direction=f"J2000 {j2000_radec}",
-        )
-
-        # === Restore ICRS label on the shifted MS (CASA hygiene) ===
-        if cfg.relabel_j2000_to_icrs:
-            relabel_J2000_to_ICRS(shifted_vis, verbose=cfg.verbose)
+        # === FIELD and SOURCE directions, each in its own frame ===
+        field_name = self._derived.get("resolved_field_name")
+        if field_name is not None:
+            field_out = field_id_by_name(shifted_vis, str(field_name))
+        else:
+            field_out = int(field_in)
+        written = write_field_direction(shifted_vis, [field_out], ra_w, dec_w, ms_frame)
+        check = field_direction_offsets(shifted_vis, field_out, ra_rad, dec_rad, frame)
 
         # === Update state ===
         self._derived["working_vis"] = shifted_vis
         self._derived["phase_shift_applied"] = True
+        if str(field_out) != field_in:
+            self._derived["input_field_id"] = field_in
+            self._derived["resolved_field_id"] = str(field_out)
         self.justification["derived"]["phase_shift"] = {
             "applied": True,
             "source": source_label,
             "input_frame": frame,
             "input_ra": ra,
             "input_dec": dec,
-            "j2000_for_fixplanets": j2000_radec,
+            "target_rad": {"frame": frame, "ra": ra_rad, "dec": dec_rad},
+            "dirty_max_pixel": pixel,
+            "ms_frame": ms_frame,
+            "phasecenter": phasecenter,
+            "field_id_in": int(field_in),
+            "field_id_out": int(field_out),
             "shifted_vis": shifted_vis,
+            "field_source_write": written,
+            "readback_offset_mas": check,
             "reason": (
-                f"shifted source to phase center; source location was "
-                f"{source_label}; fixplanets called in J2000"
-                + ("; MS frame label restored to ICRS" if cfg.relabel_j2000_to_icrs else "")
+                f"shifted source to phase center; source location was {source_label}; "
+                f"phaseshift to the target in the field's frame {ms_frame} "
+                f"(casatools.measures), then FIELD PHASE_DIR/DELAY_DIR/REFERENCE_DIR and "
+                f"SOURCE.DIRECTION written in their own frames; no fixplanets, UVW from "
+                f"phaseshift, no frame label changed"
             ),
         }
 
         if cfg.verbose:
             print(f"[AJISAI] phase shift applied   : {source_label}")
-            print(f"[AJISAI]   target {frame:<5s}        : {ra}, {dec}")
-            print(f"[AJISAI]   J2000 (fixplanets)   : {j2000_radec}")
+            target_text = rad_to_radec(ra_rad, dec_rad, precision=7)
+            print(f"[AJISAI]   target {frame:<5s}        : {target_text}")
+            print(f"[AJISAI]   phasecenter          : {phasecenter}")
+            if check.get("max_mas") is not None:
+                print(f"[AJISAI]   read-back offset     : {check['max_mas']:.3g} mas (max over "
+                      f"FIELD/SOURCE)")
+            if str(field_out) != field_in:
+                print(f"[AJISAI]   field id             : {field_in} -> {field_out} "
+                      f"(renumbered by phaseshift)")
             print(f"[AJISAI]   shifted vis          : {shifted_vis}")
 
     # ----------------------------------------------------------------------
@@ -4260,26 +4414,48 @@ def _copy_ms(src, dst) -> None:
 
 
 def _ms_needs_relabel(msfile: str) -> bool:
-    """Read-only check: would :func:`relabel_J2000_to_ICRS` change ``msfile``?"""
+    """Read-only check: would :func:`relabel_J2000_to_ICRS` change ``msfile``?
+
+    Reads the per-row frames of the FIELD direction columns and of
+    SOURCE.DIRECTION from their MEASINFO keywords (codes mapped through
+    TabRefTypes/TabRefCodes).
+    """
     _require_casa()
     tb = casatools.table()
     tb.open(msfile + "/FIELD")
     try:
-        cols = [tb.getcol(c) for c in ("PhaseDir_Ref", "DelayDir_Ref", "RefDir_Ref")
-                if c in tb.colnames()]
+        field_frames = [_column_frames(tb, c) for c in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR")
+                        if c in tb.colnames()]
     finally:
         tb.close()
-    source_ref = None
+    source_frames: List[str] = []
     if os.path.isdir(msfile + "/SOURCE"):
         tb.open(msfile + "/SOURCE")
         try:
-            try:
-                source_ref = tb.getcolkeywords("DIRECTION").get("MEASINFO", {}).get("Ref")
-            except Exception:
-                source_ref = None
+            if "DIRECTION" in tb.colnames():
+                source_frames = _column_frames(tb, "DIRECTION")
         finally:
             tb.close()
-    return _relabel_needed(cols, source_ref)
+    return _relabel_needed(field_frames, source_frames)
+
+
+def _observation_telescopes_and_start(msfile: str) -> Tuple[List[str], Optional[float]]:
+    """TELESCOPE_NAME values and the earliest TIME_RANGE start (MJD seconds) of OBSERVATION."""
+    _require_casa()
+    path = msfile + "/OBSERVATION"
+    if not os.path.isdir(path):
+        return [], None
+    tb = casatools.table()
+    tb.open(path)
+    try:
+        if tb.nrows() == 0:
+            return [], None
+        names = [str(n) for n in tb.getcol("TELESCOPE_NAME")]
+        tr = np.asarray(tb.getcol("TIME_RANGE"), dtype=float)
+    finally:
+        tb.close()
+    starts = tr[0][tr[0] > 0] if tr.ndim == 2 else np.asarray([])
+    return names, (float(starts.min()) if starts.size else None)
 
 
 def _read_image_plane(path) -> np.ndarray:

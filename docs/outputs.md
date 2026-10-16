@@ -189,7 +189,9 @@ decision AJISAI made. Top-level keys:
     - `refant`: chosen antenna, strategy, flag thresholds, full candidate
       list with positions and flag fractions.
     - `working_vis`: the MS the pipeline read (the input, or its relabelled
-      copy) and why.
+      copy) and why; with a relabel, what was relabelled (`relabel`) and,
+      for data other than pre-Cycle-3 ALMA data, the warning
+      `relabel_caveat`.
     - `cellsize`, `imsize`, `dish_diameter`: cell size (rule, u_max) and
       image size with the formula used; the dish diameter read from
       `ANTENNA/DISH_DIAMETER`.
@@ -205,7 +207,12 @@ decision AJISAI made. Top-level keys:
       `predicted_effective_beam_arcsec`: when `uvtaper` is set.
     - `beam_check`: comparison of actual dirty-image beam vs predicted.
     - `dirty_image`: peak/RMS/DR of the dirty image.
-    - `phase_shift`: whether applied, target coordinates, source frame.
+    - `phase_shift`: whether applied; the target (strings and radians,
+      with its frame); the frame of the field's `PHASE_DIR` and the
+      `phasecenter` passed to `phaseshift`; the field id before and after
+      (phaseshift renumbers the selected field); what was written to FIELD
+      and SOURCE (`field_source_write`) and the read-back offsets from the
+      target in mas (`readback_offset_mas`).
 
 `iterations`
 :   List of per-iteration records (same as `metrics.csv` rows, but with

@@ -69,17 +69,32 @@ the lines you need.
 :   Manual phase-center override. When provided alongside
     `phase_shift=True`, AJISAI uses these coordinates instead of
     auto-detecting from the dirty image. Form: `(ra, dec, frame)`,
-    where `frame` is `"ICRS"` or `"J2000"`. Example:
+    where `frame` is `"ICRS"` or `"J2000"`. RA is read as hours and Dec
+    as degrees, whichever separators are used (`:`, `.`, `h m s` /
+    `d m s`, or spaces); an angle with a unit (`"241.4deg"`, `"-0.42rad"`)
+    is also accepted. Examples:
 
     ```python
     phase_center=("16:25:45.0", "-24:12:23.0", "ICRS")
+    phase_center=("16h25m45.0s", "-24d12m23.0s", "J2000")
     ```
 
+    The strings are converted to radians when the configuration is
+    validated, and CASA receives only radians: CASA itself would read a
+    `:`-separated declination as a time (`-24:12:23.0` as -363.1 deg, i.e.
+    Dec -3.1 deg).
+
     :::{note}
-    `casatasks.fixplanets` only supports `"J2000"`, so AJISAI converts
-    `"ICRS"` inputs to J2000 via astropy before calling fixplanets and
-    restores the MS frame label to ICRS afterwards. This is transparent
-    to the user.
+    How the shift is done: the target is converted (with
+    `casatools.measures`) into the frame of the field's `PHASE_DIR` in the
+    working MS, `phaseshift` shifts the data and computes UVW, and then
+    FIELD `PHASE_DIR`, `DELAY_DIR`, `REFERENCE_DIR` and `SOURCE.DIRECTION`
+    are written with the target, each converted into its own frame
+    (`ajisai.ms_utils.write_field_direction`). `fixplanets` is not used
+    and no frame label is changed, so the result is exact (well below
+    0.01 mas) for ICRS data and for genuine J2000 data alike. The
+    read-back offsets are recorded in `justification.json`
+    (`derived.phase_shift.readback_offset_mas`).
     :::
 
 ### Strategy switches
@@ -140,7 +155,12 @@ the lines you need.
     carries J2000 frame codes, a copy (`intermediate/input_icrs.ms`) is
     relabelled J2000 -> ICRS (the frame code only; coordinates are not
     converted) and used as the working MS, as v0.2 did in place. `False`
-    keeps the input frame (the input is then read directly).
+    keeps the input frame (the input is then read directly). The
+    label-only relabel is right for ALMA data observed before Cycle 3
+    (ICRS numbers labelled J2000); for other data (not ALMA, or observed
+    on or after 2015-10-01) AJISAI warns and records the caveat
+    (`derived.working_vis.relabel_caveat`), because genuine J2000
+    numbers relabelled as ICRS move by the frame bias (up to about 23 mas).
 
 `caller: str = "user"`
 :   Who drives the run: `"user"` (standalone) or `"asebi"` (the ASEBI

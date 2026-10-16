@@ -24,6 +24,8 @@ from ajisai.core import (
     _model_images,
     _noise_stokes,
     _relabel_needed,
+    _relabel_caveat,
+    ALMA_CYCLE3_START_MJD_S,
     aperture_flux_terms,
     final_depth_decision,
     imaging_consistency_problems,
@@ -237,10 +239,30 @@ def test_model_zero_channels():
 
 
 def test_relabel_needed():
-    assert _relabel_needed([np.array([0, 21])], None)
-    assert not _relabel_needed([np.array([21, 21])], "ICRS")
-    assert _relabel_needed([], "J2000")
+    """Frames come from the MEASINFO keywords (codes mapped through TabRefTypes/Codes)."""
+    assert _relabel_needed([["J2000", "ICRS"]], [])
+    assert not _relabel_needed([["ICRS", "ICRS"]], ["ICRS"])
+    assert _relabel_needed([], ["J2000"])
     assert not _relabel_needed([], None)
+    assert not _relabel_needed([["ICRS"], ["ICRS"], ["ICRS"]], ["ICRS", "ICRS"])
+
+
+def test_alma_cycle3_start():
+    # 2015-10-01 00:00 UTC = MJD 57296, in seconds (the MS TIME unit)
+    assert ALMA_CYCLE3_START_MJD_S == 57296 * 86400.0
+
+
+def test_relabel_caveat():
+    """The label-only relabel is right only for ALMA data observed before Cycle 3."""
+    before, after = ALMA_CYCLE3_START_MJD_S - 86400.0, ALMA_CYCLE3_START_MJD_S
+    assert _relabel_caveat(["ALMA"], before) is None
+    assert _relabel_caveat(["ALMA", "ACA"], before) is None
+    msg = _relabel_caveat(["ALMA"], after)
+    assert "Cycle 3" in msg and "not ALMA" not in msg
+    msg = _relabel_caveat(["EVLA"], before)
+    assert "not ALMA" in msg and "2015-10-01" not in msg
+    assert "unknown" in _relabel_caveat(["ALMA"], None)
+    assert "not ALMA" in _relabel_caveat([], before)
 
 
 # ---------------------------------------------------------------------------
