@@ -252,6 +252,23 @@ explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
   puts two integrations of a scan into one cell when the scan starts a
   half-integer number of integrations after the first (it undercounted the
   observing time, SNR rate +8 % on such a simulation).
+- **gaincal's solution time is the weighted mean of its rows' times** (audit
+  item 6). The model of a solution's time was the unweighted mean of its
+  integration times; gaincal weights each row by its weight over the channels
+  where both parallel hands are unflagged (CASA 6.5.1: WEIGHT x10 on the first
+  of six integrations, 6.0 s instead of 15.0 s; half the channels flagged
+  counts half; a channel with one hand flagged counts nothing). The summary
+  now carries that row weight (`VisSummary.w`, `reduce_visibilities()["W"]`)
+  and the solution times are weighted. Nearest interpolation (D34 F2) gave
+  every row its own interval's solution; CASA gives the solution nearest in
+  time (ties to the earlier), which with weighted times can be the next
+  interval's (WEIGHT x10 on integrations 0 and 3 of 3-integration intervals:
+  integration 2 takes the second solution). `_row_nearest` now picks by the
+  full-data solution times; in G2 a held-out row takes the training solution
+  of that interval. Evenly weighted data give the previous records bit for
+  bit (23 simulations). For a solution over several scans CASA also weights
+  each scan by the coherent amplitude of its phase-only solve (0.05 s on a
+  simulated EB); that part is not modelled.
 - **gaincal's time grid starts at the first row of a scan, fully flagged rows
   included** (audit item 5). `read_vis_summary` drops rows without valid data,
   so a scan whose first integration was flagged was modelled from the second

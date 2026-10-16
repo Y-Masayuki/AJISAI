@@ -198,3 +198,139 @@ def test_gaincal_grid_from_a_fully_flagged_first_integration(eb):
     assert got.size == want.size
     np.testing.assert_allclose(got, want, rtol=0, atol=1e-3)
     assert old.size != got.size or not np.allclose(old, got, rtol=0, atol=1e-3)
+
+
+@pytest.fixture(scope="module")
+def steps(tmp_path_factory):
+    """A 1 Jy point source, one 60 s scan of 6 s integrations, antenna phases that step every 3
+    integrations: inside each 3-integration solution the data are coherent, so gaincal's solution
+    time is the weighted mean of its rows' times, and the solutions differ from interval to
+    interval (which one a row receives is visible)."""
+    import casatasks
+    import casatools
+    from tests.casa_sim import simulate_ms
+    work = tmp_path_factory.mktemp("ajisai_soltime")
+    ms = simulate_ms(str(work / "steps.ms"), nant=8, freq_ghz=(230.0,), nchan=(4,),
+                     chan_mhz=(250.0,), scans=1, scan_s=60.0, int_s=6.0, noise="1mJy",
+                     phase_rms_deg=0.0, seed=4, source=((1.0, 0.0, 0.0, 0.001, 0.001, 0.0),))
+    rng = np.random.default_rng(7)
+    step_phase = rng.uniform(-1.0, 1.0, (4, 8))            # (interval, antenna) rad
+    tb = casatools.table()
+    tb.open(ms, nomodify=False)
+    try:
+        t = tb.getcol("TIME")
+        a1 = tb.getcol("ANTENNA1")
+        a2 = tb.getcol("ANTENNA2")
+        k = np.searchsorted(np.unique(t), t) // 3
+        d = tb.getcol("DATA")
+        tb.putcol("DATA", d * np.exp(1j * (step_phase[k, a1] - step_phase[k, a2]))[None, None, :])
+    finally:
+        tb.close()
+    casatasks.clearcal(vis=ms, addmodel=True)
+    return {"work": work, "ms": ms, "t0": float(t.min())}
+
+
+def _edit_rows(ms, times, fn):
+    import casatools
+    tb = casatools.table()
+    tb.open(ms, nomodify=False)
+    try:
+        t = tb.getcol("TIME")
+        sel = np.zeros(t.size, bool)
+        for x in times:
+            sel |= np.abs(t - x) < 1e-3
+        fn(tb, sel)
+    finally:
+        tb.close()
+
+
+def _solve_and_compare(ms, ct_name, cand_n=3):
+    import casatasks
+    from ajisai import solint as so
+    from ajisai.ms_utils import read_vis_summary
+    vs = read_vis_summary(ms)
+    geom = so.geometry(vs)
+    cand = [c for c in so.geometry_candidates(geom) if c.get("n_int") == cand_n][0]
+    ct = ms.replace(".ms", ct_name)
+    shutil.rmtree(ct, ignore_errors=True)
+    casatasks.gaincal(vis=ms, caltable=ct, solint=cand["gaincal_solint"], combine="", calmode="p",
+                      gaintype="T", refant="0", minsnr=0.0, minblperant=4)
+    tab = _cols(ct, ["TIME", "ANTENNA1", "CPARAM"])
+    got = np.sort(tab["TIME"][tab["ANTENNA1"] == 1])
+    units = so.solution_units(vs, geom, cand, combine_spw=False)
+    plain = _without_time_info(vs)
+    old = np.sort(so.solution_units(plain, so.geometry(plain), cand, combine_spw=False).time)
+    return vs, geom, cand, units, ct, tab, got, np.sort(units.time), old
+
+
+def test_solution_time_is_weighted_and_nearest_follows_it(steps):
+    """WEIGHT x10 on integrations 0 and 3 (audit exp16): solutions at 1.5 s and 19.5 s from the
+    scan start; applycal 'nearestPD' gives integration 2 the second interval's solution."""
+    import casatasks
+    from ajisai import solint as so
+    ms = str(steps["work"] / "w10.ms")
+    shutil.rmtree(ms, ignore_errors=True)
+    shutil.copytree(steps["ms"], ms)
+    t0 = steps["t0"]
+
+    def up(tb, sel):
+        w = tb.getcol("WEIGHT")
+        w[:, sel] *= 10.0
+        tb.putcol("WEIGHT", w)
+        tb.putcol("SIGMA", 1.0 / np.sqrt(w))
+    _edit_rows(ms, [t0, t0 + 18.0], up)
+    vs, geom, cand, units, ct, tab, got, want, old = _solve_and_compare(ms, "_w10.G")
+    print(f"\n[solution time] table {np.round(got - t0, 4).tolist()}; model "
+          f"{np.round(want - t0, 4).tolist()}; unweighted model {np.round(old - t0, 4).tolist()}")
+    np.testing.assert_allclose(got - t0, [1.5, 19.5, 42.0, 54.0], rtol=0, atol=1e-3)
+    np.testing.assert_allclose(got, want, rtol=0, atol=1e-3)
+    assert np.max(np.abs(old - got)) > 1.0
+    # nearest interpolation: the solution each row receives
+    casatasks.applycal(vis=ms, gaintable=[ct], interp=["nearestPD"], applymode="calonly",
+                       calwt=[False], flagbackup=False)
+    import casatools
+    tb = casatools.table()
+    tb.open(ms)
+    try:
+        q = tb.query("ANTENNA1==0 && ANTENNA2==5")
+        try:
+            rt = q.getcol("TIME")
+            applied = np.angle(q.getcol("CORRECTED_DATA")[0, 0] / q.getcol("DATA")[0, 0])
+        finally:
+            q.close()
+    finally:
+        tb.close()
+    sol5 = np.angle(tab["CPARAM"][0, 0, tab["ANTENNA1"] == 5])[np.argsort(tab["TIME"][tab["ANTENNA1"] == 5])]
+    # refant 0: CORRECTED = DATA / (g_0 g_5*) = DATA exp(i phi_5)
+    took = [int(np.argmin(np.abs(np.angle(np.exp(1j * (a - sol5)))))) for a in applied]
+    zero = np.zeros(rt.size, int)
+    lo, _, _ = so._row_nearest(units, rt, zero, zero)
+    print(f"[solution time] CASA nearest took solutions {took}; model {lo.tolist()}")
+    assert took[2] == 1 and took == lo.tolist()
+
+
+def test_solution_time_drops_channels_with_a_flagged_hand(steps):
+    """Half the channels flagged on integration 0 count half; integration 3 with one hand flagged
+    counts nothing (gaintype 'T' drops a channel with either hand flagged)."""
+    ms = str(steps["work"] / "flags.ms")
+    shutil.rmtree(ms, ignore_errors=True)
+    shutil.copytree(steps["ms"], ms)
+    t0 = steps["t0"]
+
+    def half(tb, sel):
+        f = tb.getcol("FLAG")
+        f[:, :2, sel] = True
+        tb.putcol("FLAG", f)
+
+    def one_hand(tb, sel):
+        f = tb.getcol("FLAG")
+        f[0, :, sel] = True
+        tb.putcol("FLAG", f)
+    _edit_rows(ms, [t0], half)
+    _edit_rows(ms, [t0 + 18.0], one_hand)
+    vs, geom, cand, units, ct, tab, got, want, old = _solve_and_compare(ms, "_flags.G")
+    print(f"\n[solution time] flags: table {np.round(got - t0, 4).tolist()}; model "
+          f"{np.round(want - t0, 4).tolist()}; unweighted model {np.round(old - t0, 4).tolist()}")
+    # (0 x 0.5 + 6 + 12) / 2.5 = 7.2 s; (24 + 30) / 2 = 27 s
+    np.testing.assert_allclose(got - t0, [7.2, 27.0, 42.0, 54.0], rtol=0, atol=1e-3)
+    np.testing.assert_allclose(got, want, rtol=0, atol=1e-3)

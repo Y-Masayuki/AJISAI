@@ -65,7 +65,8 @@ start of each scan (:func:`geometry`), not the distinct TIME values: after
 time averaging of data that lacked rows, the rows of one bin carry
 different TIMEs (each the mean of the rows present). gaincal's intervals
 are modelled from the actual row TIMEs on its grid from the first row of
-the scan, fully flagged rows included (:func:`solution_units`).
+the scan, fully flagged rows included, and a solution's time is the
+weighted mean of its rows' times (:func:`solution_units`).
 
 CASA is never imported here; ``ajisai.ms_utils.read_vis_summary`` fills a
 :class:`VisSummary` from a measurement set.
@@ -144,6 +145,9 @@ _PAIRED_NUMERICAL_TOL = 1e-9
 # grid the TIME values follow (D38 e; unaveraged data keep the integration
 # time of the distinct-time rule exactly).
 _IT_SPACING_RTOL = 1e-3
+# Two solution times nearer to a row than this (s) are a tie for nearest
+# interpolation; ties go to the earlier solution, as CASA's applycal does.
+_NEAREST_TIE_S = 1e-3
 
 
 # ============================================================================
@@ -273,11 +277,15 @@ class VisSummary:
     Time axis (ASEBI SPEC 4 item 4, D38 e; read by
     ``ajisai.ms_utils.read_vis_summary``): ``interval`` is the INTERVAL of
     each row (s), from which :func:`geometry` places the rows on integration
-    slots; ``scan_bounds`` maps (observation, scan) to the first and last
-    TIME of all rows of the scan, fully flagged rows included (gaincal's
-    time grid starts at the first of them). Without them (summaries built
-    directly, e.g. in tests) the distinct TIME values are the integrations
-    and the grid starts at the first row of the summary.
+    slots; ``w`` the weight of the row in gaincal's solution time (the
+    WEIGHT, or WEIGHT_SPECTRUM, of the channels whose two parallel hands are
+    unflagged, summed over both hands: gaintype 'T' drops a channel with
+    either hand flagged); ``scan_bounds`` maps (observation, scan) to the
+    first and last TIME of all rows of the scan, fully flagged rows
+    included (gaincal's time grid starts at the first of them). Without
+    them (summaries built directly, e.g. in tests) the distinct TIME values
+    are the integrations, the solution times are unweighted and the grid
+    starts at the first row of the summary.
     """
     time: np.ndarray
     obs: np.ndarray
@@ -295,6 +303,7 @@ class VisSummary:
     phi0: Optional[np.ndarray] = None
     source: str = ""
     interval: Optional[np.ndarray] = None
+    w: Optional[np.ndarray] = None
     scan_bounds: Optional[Dict[Tuple[int, int], Tuple[float, float]]] = None
 
     def __post_init__(self):
@@ -307,7 +316,7 @@ class VisSummary:
         for name in ("obs", "scan", "spw", "a1", "a2", "y", "P"):
             if getattr(self, name).shape != (n,):
                 raise ValueError(f"VisSummary.{name} must have shape ({n},)")
-        for name in ("interval",):
+        for name in ("interval", "w"):
             if getattr(self, name) is not None:
                 setattr(self, name, np.asarray(getattr(self, name), dtype=float))
                 if getattr(self, name).shape != (n,):
@@ -366,6 +375,13 @@ def reduce_visibilities(data, model, flag, weight, flag_row=None, corr_types=Non
     :data:`PARALLEL_HANDS`; all correlations when ``None``) of unflagged,
     finite, positively weighted samples enter. ``halves=True`` adds the sums
     over the lower and upper half of the channels (``nchan >= 2``).
+
+    ``W`` is the weight of the row in gaincal's solution time (ASEBI SPEC
+    10.2 item 14, D38; time audit 2026-10-16, item 6): the weights of both
+    parallel hands summed over the channels where both are valid (gaintype
+    'T' drops a channel with either hand flagged; a channel flagged in half
+    the band counts half), CASA 6.5.1 ``tests/test_casa_time_axis.py``; with
+    one parallel hand, its weights.
     """
     data = np.asarray(data)
     model = np.asarray(model)
@@ -387,11 +403,17 @@ def reduce_visibilities(data, model, flag, weight, flag_row=None, corr_types=Non
     ww = np.where(okm, w, 0.0)
     prod = ww * v * np.conj(m)
     pw = ww * np.abs(m) ** 2
+    if data.shape[0] >= 2:
+        both = ok[0] & ok[-1]
+        wt = np.where(both, w[0] + w[-1], 0.0).sum(axis=0)
+    else:
+        wt = np.where(ok, w, 0.0).sum(axis=(0, 1))
     out = {
         "y": prod.sum(axis=(0, 1)),
         "P": pw.sum(axis=(0, 1)),
         "S": np.where(ok, data, 0.0).sum(axis=(0, 1)),
         "n_valid": ok.sum(axis=(0, 1)),
+        "W": wt,
     }
     nchan = data.shape[1]
     if halves and nchan >= 2:
@@ -1133,10 +1155,11 @@ def _single_integration(cand: Dict[str, Any]) -> bool:
 class Units:
     """Solution intervals of one candidate: row -> unit, and per-unit time and group."""
     of_row: np.ndarray        # unit index of every row (-1: none)
-    time: np.ndarray          # solution time per unit (mean of its integration times)
+    time: np.ndarray          # solution time per unit (weighted mean time of its rows)
     obs: np.ndarray           # observation per unit
     group: np.ndarray         # spw per unit, or -1 when spws are combined
     n_times: np.ndarray       # integrations per unit
+    time_full: Optional[np.ndarray] = None   # solution time of the full data (production)
 
 
 def solution_units(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine_spw: bool,
@@ -1145,16 +1168,21 @@ def solution_units(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine
 
     Spec: 10.2 item 3 (fractional intervals at scan ends), P18 3.3 (gaincal
     re-partitions at scan boundaries), 10.2 item 14 (table and data times
-    matched by nearest); D38 (time audit 2026-10-16, item 5).
+    matched by nearest); D38 (time audit 2026-10-16, items 5 and 6).
 
     "eb": one interval per observation (``combine='scan'``); "scan": one
     per scan; "int": gaincal's fixed time grid inside each scan,
     ``floor((t - t_first)/solint)`` of each row's own TIME, with ``t_first``
     the first row of the scan, fully flagged rows included
     (``Geometry.scan_origin``; ``'int'``: every distinct TIME).
-    The solution time is the mean of the integration (slot) times of the
-    unit (that of the rows in ``rows`` when given, e.g. the training half).
-    ``n_times``: integrations (slots) per unit.
+    The solution time is the mean time of the unit's rows weighted by
+    ``VisSummary.w``: gaincal's solution TIME (CASA 6.5.1 and 6.7.0: WEIGHT
+    x10 on the first of six integrations puts the solution at 6.0 s instead
+    of 15.0 s; for a solution over several scans CASA also weights each scan
+    by the coherent amplitude of its phase-only solve, which is left out).
+    Without row weights, the mean of the unit's integration times. Only the
+    rows in ``rows`` count when given (e.g. the training half). ``n_times``:
+    integrations (slots) per unit.
     """
     key = (cand["kind"], cand.get("n_int"), cand.get("gaincal_solint"), bool(combine_spw),
            vs.n_rows)
@@ -1162,6 +1190,15 @@ def solution_units(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine
     if base is None:
         base = _unit_assignment(vs, geom, cand, combine_spw)
         geom.cache[key] = base
+    of_row, ukey, pair_unit, pair_time, pair_row, n_times = base
+    utime = _unit_times(vs, base, rows)
+    full = utime if rows is None else _unit_times(vs, base, None)
+    return Units(of_row=of_row, time=utime, obs=ukey[0], group=ukey[1], n_times=n_times,
+                 time_full=full)
+
+
+def _unit_times(vs: VisSummary, base, rows: Optional[np.ndarray]) -> np.ndarray:
+    """Solution time of every unit from the rows in ``rows`` (all when None); NaN without rows."""
     of_row, ukey, pair_unit, pair_time, pair_row, n_times = base
     nu = ukey.shape[1]
     if rows is None:
@@ -1172,7 +1209,15 @@ def solution_units(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine
     t_cnt = np.bincount(pair_unit[sel], minlength=nu).astype(float)
     with np.errstate(invalid="ignore"):
         utime = np.where(t_cnt > 0, t_sum / np.where(t_cnt > 0, t_cnt, 1.0), np.nan)
-    return Units(of_row=of_row, time=utime, obs=ukey[0], group=ukey[1], n_times=n_times)
+    if vs.w is not None and nu:
+        use = np.ones(vs.n_rows, bool) if rows is None else np.asarray(rows, bool)
+        ok = use & (of_row >= 0) & np.isfinite(vs.w) & (vs.w > 0)
+        t0 = float(vs.time.min())
+        w_sum = np.bincount(of_row[ok], vs.w[ok], minlength=nu)
+        wt_sum = np.bincount(of_row[ok], vs.w[ok] * (vs.time[ok] - t0), minlength=nu)
+        has_w = w_sum > 0
+        utime = np.where(has_w, t0 + wt_sum / np.where(has_w, w_sum, 1.0), utime)
+    return utime
 
 
 def _unit_assignment(vs: VisSummary, geom: Geometry, cand: Dict[str, Any], combine_spw: bool):
@@ -1331,14 +1376,16 @@ def nearest_weights(eval_times, sol_times) -> Tuple[np.ndarray, np.ndarray, np.n
     Spec: 10.2 item 6 (D34 F2: nearest interpolation), C.2 (nearest =
     piecewise constant, ``a = 1/((beta+1)(beta+2))``). Ties go to the earlier
     solution, as CASA 6.5.1 applycal 'nearest' does
-    (``tests/test_casa_solint.py``).
+    (``tests/test_casa_solint.py``); distances within :data:`_NEAREST_TIE_S`
+    are a tie (rounding of the solution times).
     """
     st = np.asarray(sol_times, dtype=float)
     t = np.asarray(eval_times, dtype=float)
     k = np.searchsorted(st, t, side="right") - 1
     lo = np.clip(k, 0, st.size - 1)
     hi = np.clip(k + 1, 0, st.size - 1)
-    pick = np.where((k >= 0) & (np.abs(st[hi] - t) < np.abs(t - st[lo])), hi, lo)
+    later = (k >= 0) & (np.abs(st[hi] - t) < np.abs(t - st[lo]) - _NEAREST_TIE_S)
+    pick = np.where(later, hi, lo)
     return pick, pick.copy(), np.zeros(t.size)
 
 
@@ -1364,28 +1411,35 @@ def kappa_geometry(eval_times, sol_times, interp: str = "linear") -> float:
 
 def _row_nearest(units: Units, row_time: np.ndarray, row_obs: np.ndarray,
                  row_group: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``(lo, hi, f)`` of nearest interpolation for every row: its own solution interval.
+    """``(lo, hi, f)`` of nearest interpolation for every row: the solution production gives it.
 
-    Spec: 10.2 item 6 (D34 F2), 10 item 3 ('perobs'). The rows are all rows
-    of the run (``units.of_row`` order). A row takes the solution of the
-    interval it falls in; that is CASA's nearest solution time for gaincal's
-    intervals (only the last interval of a scan can be shorter, and a tie
-    goes to the earlier solution, the row's own). When that interval has no
-    solution time (no training row of a G2 split in it), the nearest
-    solution time of the same observation and group. A flagged nearest
-    solution leaves the row uncorrected: CASA 6.5.1 'nearest' does not skip
-    it (``tests/test_casa_solint.py``).
+    Spec: 10.2 item 6 (D34 F2), 10 item 3 ('perobs'); D38 (time audit
+    2026-10-16, item 6). The rows are all rows of the run (``units.of_row``
+    order). CASA's applycal 'nearest' gives a row the solution whose time is
+    nearest to the row's TIME (same observation and group), ties (within
+    :data:`_NEAREST_TIE_S`) to the earlier one (``tests/test_casa_solint.py``).
+    The times are those of the full-data solutions (``Units.time_full``,
+    gaincal's weighted times): with WEIGHT x10 on integrations 0 and 3 of
+    3-integration intervals the solutions sit at 1.5 s and 19.5 s and
+    integration 2 (12 s) gets the second interval's solution
+    (``tests/test_casa_time_axis.py``); with even weights an interior row gets
+    its own interval. The value is the unit's solution in ``units`` (in G2 the
+    training-half solution of the interval production would use), among the
+    units that have one. A flagged nearest solution leaves the row
+    uncorrected: CASA 6.5.1 'nearest' does not skip it.
     """
-    own = units.of_row
-    n = own.size
-    has = np.zeros(n, bool)
-    if units.time.size:
-        has = (own >= 0) & np.isfinite(units.time[np.maximum(own, 0)])
-    lo = np.where(has, own, -1).astype(np.int64)
-    rest = np.flatnonzero(~has)
-    if rest.size:
-        l2, h2, f2 = _row_brackets(units, row_time[rest], row_obs[rest], row_group[rest])
-        lo[rest] = np.where(f2 > 0.5, h2, l2)
+    n = row_time.size
+    lo = np.full(n, -1, dtype=np.int64)
+    ref = units.time if units.time_full is None else units.time_full
+    for o, g in set(zip(units.obs.tolist(), units.group.tolist())):
+        uidx = np.flatnonzero((units.obs == o) & (units.group == g) & np.isfinite(units.time)
+                              & np.isfinite(ref))
+        if uidx.size == 0:
+            continue
+        uidx = uidx[np.argsort(ref[uidx], kind="stable")]
+        sel = np.flatnonzero((row_obs == o) & (row_group == g))
+        pick, _, _ = nearest_weights(row_time[sel], ref[uidx])
+        lo[sel] = uidx[pick]
     return lo, lo.copy(), np.zeros(n)
 
 

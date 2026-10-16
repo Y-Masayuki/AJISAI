@@ -686,7 +686,8 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
     Cross-correlations of the field only; per row the sums of
     :func:`ajisai.solint.reduce_visibilities` over the parallel hands
     (WEIGHT_SPECTRUM when the column holds values, else WEIGHT), the UV
-    distance (m), the INTERVAL and, with ``band_halves=True``, the sums over
+    distance (m), the INTERVAL, the row's weight in gaincal's solution time
+    (``W`` of the reduction) and, with ``band_halves=True``, the sums over
     the lower and upper half of each spw's channels. Rows without any valid
     sample are dropped; the first and last TIME of every (observation, scan)
     are taken over all its rows before that, fully flagged rows included
@@ -708,7 +709,7 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
     finally:
         tb.close()
     parts: Dict[str, List[np.ndarray]] = {k: [] for k in (
-        "time", "obs", "scan", "spw", "a1", "a2", "y", "P", "S", "uv", "yh", "Ph", "iv")}
+        "time", "obs", "scan", "spw", "a1", "a2", "y", "P", "S", "uv", "yh", "Ph", "iv", "w")}
     bounds: Dict[Tuple[int, int], Tuple[float, float]] = {}
     tb.open(vis)
     try:
@@ -747,6 +748,7 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
                     parts["obs"].append(o_all[keep])
                     parts["scan"].append(s_all[keep])
                     parts["iv"].append(sub.getcol("INTERVAL", start, nr)[keep])
+                    parts["w"].append(red["W"][keep])
                     parts["spw"].append(np.full(int(keep.sum()), int(dd_spw[dd])))
                     parts["a1"].append(sub.getcol("ANTENNA1", start, nr)[keep])
                     parts["a2"].append(sub.getcol("ANTENNA2", start, nr)[keep])
@@ -776,7 +778,7 @@ def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = 
         P=cat["P"][order], antenna_names=names, S=cat["S"][order], uvdist_m=cat["uv"][order],
         y_half=pick(cat["yh"]) if band_halves else None,
         P_half=pick(cat["Ph"]) if band_halves else None, source=str(vis),
-        interval=cat["iv"][order], scan_bounds=bounds)
+        interval=cat["iv"][order], w=cat["w"][order], scan_bounds=bounds)
 
 
 def _update_scan_bounds(bounds: Dict[Tuple[int, int], Tuple[float, float]], obs, scan, time) -> None:

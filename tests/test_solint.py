@@ -552,7 +552,8 @@ def test_nearest_rows_take_their_own_interval_and_a_flagged_one_is_not_skipped()
     t = np.arange(0, 48, 6.0)       # 0, 6, ..., 42
     zero = np.zeros(t.size, int)
     lo, hi, f = so._row_nearest(units, t, zero, zero)
-    # own interval; rows of interval 2 (30, 36 s) take the nearest solution time (39 s)
+    # the nearest solution time is the own interval here; rows of interval 2 (30, 36 s) take
+    # the nearest solution time that exists (39 s)
     assert lo.tolist() == [0, 0, 1, 1, 1, 3, 3, 3] and np.all(f == 0)
     values = np.array([[0.1], [0.2], [0.3], [0.4]])
     good = np.array([[True], [False], [True], [True]])
@@ -560,6 +561,92 @@ def test_nearest_rows_take_their_own_interval_and_a_flagged_one_is_not_skipped()
     # the flagged solution of interval 1 leaves its own rows uncorrected (calonly)
     assert ok.tolist() == [True, True, False, False, False, True, True, True]
     np.testing.assert_allclose(val[ok], [0.1, 0.1, 0.4, 0.4, 0.4])
+
+
+# ---------------------------------------------------------------------------
+# gaincal's solution time is weighted (time audit 2026-10-16, item 6; D38)
+# ---------------------------------------------------------------------------
+def _one_scan_summary(weights, n_ant=5):
+    """One scan of 10 integrations (6 s) with per-integration row weights."""
+    t = np.arange(10) * 6.0
+    a1, a2 = np.triu_indices(n_ant, 1)
+    nb = a1.size
+    n = t.size * nb
+    return so.VisSummary(time=np.repeat(t, nb), obs=np.zeros(n, int), scan=np.ones(n, int),
+                         spw=np.zeros(n, int), a1=np.tile(a1, t.size), a2=np.tile(a2, t.size),
+                         y=np.ones(n, complex), P=np.ones(n), antenna_names=[f"A{k}" for k in range(n_ant)],
+                         interval=np.full(n, 6.0), w=np.repeat(np.asarray(weights, float), nb))
+
+
+def test_solution_time_is_the_weighted_mean_of_its_rows():
+    """CASA 6.5.1/6.7.0: WEIGHT x10 on integration 0 of a 6-integration solution: 6.0 s, not 15.0 s."""
+    w = np.ones(10)
+    w[0] = 10.0
+    vs = _one_scan_summary(w)
+    geom = so.geometry(vs)
+    cand = {"kind": "int", "n_int": 6, "gaincal_solint": "35.2500s"}
+    u = so.solution_units(vs, geom, cand, combine_spw=False)
+    np.testing.assert_allclose(sorted(u.time), [6.0, 45.0], rtol=0, atol=1e-9)
+    # without row weights: the mean of the integration times (the rule before)
+    plain = so.VisSummary(time=vs.time, obs=vs.obs, scan=vs.scan, spw=vs.spw, a1=vs.a1, a2=vs.a2,
+                          y=vs.y, P=vs.P, antenna_names=vs.antenna_names, interval=vs.interval)
+    u0 = so.solution_units(plain, so.geometry(plain), cand, combine_spw=False)
+    np.testing.assert_allclose(sorted(u0.time), [15.0, 45.0], rtol=0, atol=1e-9)
+    # a training half counts its own rows only; the full-data time is kept for nearest
+    even = (geom.k_in_scan % 2) == 0
+    ue = so.solution_units(vs, geom, cand, combine_spw=False, rows=even)
+    np.testing.assert_allclose(sorted(ue.time), [(0 * 10 + 12 + 24) / 12, 42.0], rtol=0, atol=1e-9)
+    np.testing.assert_allclose(sorted(ue.time_full), [6.0, 45.0], rtol=0, atol=1e-9)
+
+
+def test_nearest_follows_the_weighted_solution_times():
+    """WEIGHT x10 on integrations 0 and 3 of 3-integration intervals: solutions at 1.5 s and 19.5 s;
+    CASA's nearest gives integration 2 (12 s) the second interval's solution (audit exp16)."""
+    w = np.ones(10)
+    w[[0, 3]] = 10.0
+    vs = _one_scan_summary(w)
+    geom = so.geometry(vs)
+    cand = {"kind": "int", "n_int": 3, "gaincal_solint": "17.6250s"}
+    u = so.solution_units(vs, geom, cand, combine_spw=False)
+    np.testing.assert_allclose(u.time[:2], [1.5, 19.5], rtol=0, atol=1e-9)
+    t = np.arange(10) * 6.0
+    zero = np.zeros(t.size, int)
+    lo, _, _ = so._row_nearest(u, t, zero, zero)
+    assert lo.tolist()[:6] == [0, 0, 1, 1, 1, 1]
+    # evenly weighted: every row keeps its own interval (ties go to the earlier, the own one)
+    ue = so.solution_units(_one_scan_summary(np.ones(10)), geom, cand, combine_spw=False)
+    lo_e, _, _ = so._row_nearest(ue, t, zero, zero)
+    assert lo_e.tolist() == [0, 0, 0, 1, 1, 1, 2, 2, 2, 3]
+
+
+def test_training_half_rows_get_the_solution_of_the_interval_production_uses():
+    """G2 nearest variants: a held-out row takes the training solution of the interval whose
+    full-data solution is nearest, not the nearer training-half time (an even split puts held-out
+    rows halfway between two training times)."""
+    vs = _one_scan_summary(np.ones(10))
+    geom = so.geometry(vs)
+    cand = {"kind": "int", "n_int": 4, "gaincal_solint": "23.6250s"}
+    odd = (geom.k_in_scan % 2) == 1
+    u = so.solution_units(vs, geom, cand, combine_spw=False, rows=odd)
+    np.testing.assert_allclose(u.time, [12.0, 36.0, 54.0], rtol=0, atol=1e-9)     # slots 1,3 / 5,7 / 9
+    lo, _, _ = so._row_nearest(u, vs.time, vs.obs, vs.spw)
+    # slot 4 (24 s) is 12 s from both training times; production gives it its own interval (1)
+    assert np.all(lo[geom.k_in_scan == 4] == 1)
+    assert np.array_equal(lo, u.of_row)
+
+
+def test_reduce_visibilities_row_weight_of_the_solution_time():
+    """``W``: both parallel hands' weights over the channels where both are valid (gaintype 'T')."""
+    data = np.ones((2, 4, 3), complex)
+    model = np.ones((2, 4, 3), complex)
+    flag = np.zeros((2, 4, 3), bool)
+    weight = np.array([[1.0, 1.0, 2.0], [1.0, 1.0, 3.0]])
+    flag[:, :2, 1] = True                  # row 1: half the channels flagged (both hands)
+    flag[0, :, 2] = True                   # row 2: one hand flagged everywhere
+    out = so.reduce_visibilities(data, model, flag, weight, corr_types=[9, 12])
+    np.testing.assert_allclose(out["W"], [8.0, 4.0, 0.0])
+    one = so.reduce_visibilities(data[:1], model[:1], flag[:1], weight[:1], corr_types=[9])
+    np.testing.assert_allclose(one["W"], [4.0, 2.0, 0.0])
 
 
 def test_kappa_and_the_box_coefficient_of_nearest_interpolation():

@@ -122,6 +122,7 @@ def concat(parts):
     obs = np.concatenate([np.full(v.n_rows, k, int) for k, (v, _) in enumerate(parts)])
     halves = all(v.y_half is not None for v, _ in parts)
     with_iv = all(v.interval is not None for v, _ in parts)
+    with_w = all(v.w is not None for v, _ in parts)
     vs = so.VisSummary(time=cat["time"], obs=obs, scan=cat["scan"], spw=cat["spw"], a1=cat["a1"],
                        a2=cat["a2"], y=cat["y"], P=cat["P"],
                        antenna_names=list(parts[0][0].antenna_names), S=cat["y"].copy(),
@@ -129,7 +130,8 @@ def concat(parts):
                        y_half=np.concatenate([v.y_half for v, _ in parts], axis=1) if halves else None,
                        P_half=np.concatenate([v.P_half for v, _ in parts], axis=1) if halves else None,
                        interval=(np.concatenate([v.interval for v, _ in parts]) if with_iv
-                                 else None))
+                                 else None),
+                       w=np.concatenate([v.w for v, _ in parts]) if with_w else None)
     order = np.lexsort((vs.time, vs.a2, vs.a1, vs.spw, vs.obs))
     return reorder(vs, order), [p for _, p in parts]
 
@@ -177,7 +179,7 @@ def time_average(vs, nbin, drop=0.0, seed=0):
                         S=tot(vs.S) if vs.S is not None else None, uvdist_m=uv,
                         y_half=tot(vs.y_half) if vs.y_half is not None else None,
                         P_half=tot(vs.P_half) if vs.P_half is not None else None,
-                        interval=tot(vs.interval))
+                        interval=tot(vs.interval), w=tot(vs.w) if vs.w is not None else None)
     order = np.lexsort((out.time, out.a2, out.a1, out.spw, out.obs))
     return reorder(out, order), uk[5][order]
 
@@ -192,7 +194,7 @@ def reorder(vs, order):
                          spw=vs.spw[order], a1=vs.a1[order], a2=vs.a2[order], y=vs.y[order],
                          P=vs.P[order], antenna_names=list(vs.antenna_names), S=pick(vs.S),
                          uvdist_m=pick(vs.uvdist_m), y_half=pick(vs.y_half),
-                         P_half=pick(vs.P_half), interval=pick(vs.interval),
+                         P_half=pick(vs.P_half), interval=pick(vs.interval), w=pick(vs.w),
                          scan_bounds=vs.scan_bounds)
 
 
@@ -203,7 +205,8 @@ def rotate(vs, rowphase, state0):
                         y=vs.y * e, P=vs.P, antenna_names=vs.antenna_names, S=vs.S * e,
                         uvdist_m=vs.uvdist_m,
                         y_half=None if vs.y_half is None else vs.y_half * e[None, :],
-                        P_half=vs.P_half, interval=vs.interval, scan_bounds=vs.scan_bounds)
+                        P_half=vs.P_half, interval=vs.interval, w=vs.w,
+                        scan_bounds=vs.scan_bounds)
     new.track_phase(state0)
     return new
 
