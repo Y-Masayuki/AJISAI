@@ -45,8 +45,9 @@ def test_default_config_smoke(existing_vis):
     assert cfg.refant_flag_threshold == 0.25
     assert cfg.rms_method == "sigma_clip_excl"
     assert cfg.rms_target_radius_arcsec is None
-    assert cfg.quality_metric == "dynamic_range"
+    assert cfg.quality_metric == "dynamic_range"      # mode="fixed" only
     assert cfg.on_iter_anomaly == "log_only"
+    assert cfg.schedule.mode == "data"
     assert cfg.verbose is True
     assert cfg.show_banner is True
 
@@ -87,11 +88,19 @@ def test_default_data_hygiene_options(existing_vis):
     assert cfg.relabel_j2000_to_icrs is True
 
 
-def test_default_schedule_is_three_phase_one_amp():
-    """The locked-in design: 3 phase + 1 amp iterations."""
+def test_default_schedule_is_data_driven():
+    """v0.3: stages and solution intervals from the data (ASEBI SPEC v0.3 10.2)."""
     sched = SelfcalSchedule()
+    assert sched.mode == "data"
+    assert sched.amplitude == "never"
+
+
+def test_fixed_schedule_is_three_phase_one_amp():
+    """mode='fixed' keeps the v0.2 ladder: 3 phase + 1 amp iterations."""
+    sched = SelfcalSchedule(mode="fixed")
     assert len(sched.steps) == 4
     assert [s.calmode for s in sched.steps] == ["p", "p", "p", "a"]
+    assert [s.solint for s in sched.steps] == ["inf", "6*IT", "3*IT", "inf"]
     assert sched.steps[3].solnorm is True  # amp step must normalize
 
 
@@ -152,11 +161,36 @@ def test_phase_center_j2000_accepted(existing_vis):
     AJISAI(cfg)._validate_inputs()
 
 
+def test_phase_center_colon_dec_is_parsed_as_degrees(existing_vis):
+    """The documented form must not reach CASA, which reads '-24:12:23.0' as hours
+    (-363.1 deg, i.e. Dec -3.1 deg): AJISAI parses it to radians at validation."""
+    import math
+    cfg = AJISAIConfig(
+        vis=existing_vis,
+        phase_shift=True,
+        phase_center=("16:25:45.0", "-24:12:23.0", "icrs"),
+    )
+    aj = AJISAI(cfg)
+    aj._validate_inputs()
+    pc = aj._derived["phase_center"]
+    assert pc["frame"] == "ICRS"
+    assert math.degrees(pc["ra_rad"]) == pytest.approx(246.4375)
+    assert math.degrees(pc["dec_rad"]) == pytest.approx(-(24 + 12 / 60 + 23 / 3600))
+    for dec in ("-24.12.23.0", "-24d12m23.0s"):
+        aj = AJISAI(AJISAIConfig(vis=existing_vis, phase_shift=True,
+                                 phase_center=("16h25m45.0s", dec, "J2000")))
+        aj._validate_inputs()
+        assert aj._derived["phase_center"]["dec_rad"] == pytest.approx(pc["dec_rad"], abs=1e-12)
+
+
 @pytest.mark.parametrize("bad_center", [
     ("16:25:45.0", "-24:12:23.0", "B1950"),       # wrong frame
     ("16:25:45.0", "-24:12:23.0"),                # only 2 elements
     (1.0, 2.0, "ICRS"),                            # numeric instead of strings
     "not a tuple",                                  # not a tuple
+    ("16:25:45.0", "-24.2064", "ICRS"),           # Dec without a unit
+    ("16:25:45.0", "-94:00:00", "ICRS"),          # Dec out of range
+    ("25:00:00", "-24:12:23.0", "ICRS"),          # RA out of range
 ])
 def test_phase_center_invalid_raises(existing_vis, bad_center):
     cfg = AJISAIConfig(vis=existing_vis, phase_shift=True, phase_center=bad_center)
@@ -354,3 +388,21 @@ def test_config_can_be_dumped_to_json(existing_vis, tmp_path):
     assert roundtrip["vis"] == existing_vis
     assert roundtrip["imaging"]["uvtaper"] == ["100klambda"]
     assert roundtrip["rms_target_radius_arcsec"] is None
+
+
+def test_full_config_template_equals_the_defaults(monkeypatch):
+    """examples/full_config_template.py, run unchanged, is AJISAIConfig(vis=...)."""
+    from dataclasses import asdict
+    from pathlib import Path
+
+    seen = {}
+
+    def fake_run(self):
+        seen["cfg"] = self.cfg
+        return self
+    monkeypatch.setattr(AJISAI, "run", fake_run)
+    path = Path(__file__).resolve().parents[1] / "examples" / "full_config_template.py"
+    ns: dict = {}
+    exec(compile(path.read_text(), str(path), "exec"), ns)
+    cfg = seen["cfg"]
+    assert asdict(cfg) == asdict(AJISAIConfig(vis=cfg.vis))

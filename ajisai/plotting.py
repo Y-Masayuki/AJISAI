@@ -50,7 +50,8 @@ AJISAI_PURPLE = "#280a69"
 AJISAI_LIGHT_PURPLE = "#ddccff"
 
 #: Point colour per iteration ``status`` in the summary plot.
-STATUS_COLORS = {"ok": AJISAI_PURPLE, "anomaly": "orange", "skipped": "red"}
+STATUS_COLORS = {"ok": AJISAI_PURPLE, "anomaly": "orange", "skipped": "red",
+                 "rejected": "gray"}
 
 CALMODE_NAMES = {"p": "phase", "a": "amp", "ap": "amp+phase"}
 

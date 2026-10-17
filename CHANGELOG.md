@@ -7,13 +7,64 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Development version `0.3.0.dev0`. The changes below make AJISAI usable as the
-self-calibration engine of a larger pipeline (ASEBI) and fix data-hygiene
-issues; defaults stay usable for standalone runs, and the previous rules
-remain available as explicit options (`cell_rule="percentile"`,
+self-calibration engine of a larger pipeline (ASEBI), decide the phase
+self-calibration stages from the data, and fix data-hygiene issues; defaults
+stay usable for standalone runs, and the previous rules remain available as
+explicit options (`SelfcalSchedule(mode="fixed")`, `cell_rule="percentile"`,
 `threshold_mode="image_rms"`, `final_depth=()`).
 
 ### Added
 
+- **Data-driven phase self-calibration (`SelfcalSchedule(mode="data")`, the
+  new default).** The stages and their solution intervals follow the ASEBI
+  specification v0.3 (section 10.2, appendices C.2-C.3), implemented in the
+  new pure-numpy module `ajisai.solint`:
+  - measured from DATA, MODEL_DATA, WEIGHT and FLAG (read once per stage,
+    no gain solution and no image): the noise scale `s` per spw from adjacent
+    integrations, the solution-SNR rate `r_i` of every antenna
+    (`SNR_i(T) = r_i sqrt(T)`), the phase structure function `D_eff(tau)`
+    from the model-weighted lag correlation (power-law fit), and the
+    interpolation geometry `kappa`;
+  - stage 1 is one solution per execution block, applied unless its
+    loss-corrected held-out change is below -2 sigma;
+  - later stages: candidate intervals (divisors of the median scan length in
+    integrations, with non-divisors where neighbours differ by more than a
+    factor 2, the scan, the EB), G1 (predicted true SNR >= 5 for the typical
+    solution; solutions below 5 are flagged in the gain table so those
+    antennas keep the previous stage with `applymode="calonly"`), the
+    predicted residual phase variance `V(T)` on the actual times with the
+    coefficients of gaincal's linear interpolation and the CASA loss table
+    (`-ln C`: SNR 2 -> 0.844, ..., 20 -> 0.0027), and G2: the predicted
+    best, its neighbours and the EB solved in numpy on the even (odd)
+    integrations of each scan and evaluated on the odd (even) ones (band
+    halves when scans have fewer than four integrations), with an antenna
+    delete-one paired jackknife; rule A (loss-corrected argmin) and rule B
+    (one candidate shorter than the held-out argmin), the longer when they
+    disagree;
+  - acceptance when the corrected held-out improvement exceeds
+    `max(1 sigma, 0.001)`, against the accepted stages re-solved on the
+    training half with their own models, with the conditional two-sided
+    correction; at most three phase stages; the run stops at the first stage
+    that is not accepted; gaincal runs only for the chosen interval, with
+    `solint = n x IT - IT/(4M)` (gaincal bins each scan on a fixed time grid
+    from its first integration; the small offset keeps the grid edges clear of
+    the integrations, so every chunk holds exactly `n`);
+  - the best stage is the last accepted one; peak, RMS and dynamic range are
+    diagnostics only;
+  - every measured quantity, candidate, gate, rule answer, decision and
+    reason is recorded in `justification.json["stages"][k]["selection"]`,
+    with a summary in `justification.json["selfcal"]`; stages that were
+    evaluated but not applied appear with `status: "rejected"`.
+  The amplitude stage of the specification is not included yet
+  (`SelfcalSchedule.amplitude` accepts only `"never"`).
+- `ajisai.selfcal_measurement(vis, results_dir=..., ...)`: the measurement
+  self-calibration of one execution block for a calling pipeline (ASEBI),
+  with the same rules and no amplitude stage; `AJISAI.selfcal_summary()`
+  returns the stage decisions, tables, stage MSs and the best stage's image
+  and model.
+- `ajisai.ms_utils.read_vis_summary`: one read-only pass over DATA,
+  MODEL_DATA, WEIGHT and FLAG reduced per row (`sum w V M*`, `sum w |M|^2`).
+- `ajisai.FIXED_SCHEDULE_STEPS`: the v0.2 ladder.
 - **Image geometry and Taylor terms from the caller.** `ImagingConfig` gains
   `cell`, `imsize`, `reffreq` and `scales`; when given they are used for
   every `tclean` of the run (dirty image, initial CLEAN, each iteration,
@@ -66,8 +117,48 @@ remain available as explicit options (`cell_rule="percentile"`,
   `rms_method="annulus"`. The pipeline passes it to `compute_rms` for every
   image, and it is recorded in the `rms_info` of `justification.json`.
 
+- `solve.field`: the gaincal field selection is recorded with each stage (`SOLVE_INFO_KEYS`), so a caller can re-solve the stage exactly; the per-stage model images are documented as kept after the run.
+- **Mixed integration times (ASEBI SPEC 10.2 item 3, D34 F3).** When the
+  execution blocks of a run have different integration times, the candidate
+  solution intervals step by their least common multiple (times within 1 %
+  count as one; e.g. 2.016 s and 6.048 s -> 6.048 s), so that on every EB the
+  intervals line up with its integrations; one gaincal `solint` serves all
+  EBs. A least common multiple above 4x the longest integration time falls
+  back to the median integration time with a warning. Recorded in
+  `selection["measured"]["it_step"]` and `selfcal["it_step"]`
+  (`solint.integration_step`, `solint.geometry_candidates`). A single
+  integration time gives exactly the previous candidates.
+- **Nearest interpolation when linear interpolation can break down (ASEBI
+  SPEC 10.2 item 6, D34 F2, provisional).** From stage 2 on, the solutions of
+  the predicted best interval are solved once on all data; when
+  `2 D_eff(T_hat)` from the changes of adjacent solutions, solution noise
+  removed, exceeds 1 rad^2, every interval G2 evaluated gets a nearest-
+  interpolation variant (`"<label>_nearest"`), compared with the linear
+  candidate of the same interval on the same held-out rows
+  (`C_held(nearest) - C_held(linear)` with the paired antenna delete-one
+  jackknife). The interval is chosen by rules A/B from the linear candidates
+  as before, so a nearest variant never moves it; the nearest variant
+  replaces the chosen interval's linear candidate only when it is better by
+  more than 2 sigma (`NEAREST_PAIRED_SIGMA`, one-sided). Such a stage is
+  applied with the nearest form of `GainCalConfig.applycal_interp`
+  (`linearPDperobs` -> `nearestPDperobs`) and records it in
+  `solve["applycal"]["interp"]`. The adjacent-solution quantities and the
+  per-interval comparisons are recorded in `selection["interpolation"]`
+  (`paired`), the choice in `selection["chosen_interp"]`. When the trigger
+  does not fire, the stage decisions are unchanged.
+
 ### Changed
 
+- **Default self-calibration is `SelfcalSchedule(mode="data")`.** The v0.2
+  ladder (`inf -> 6*IT -> 3*IT -> amplitude inf`, best by dynamic range) is
+  `SelfcalSchedule(mode="fixed")`. Passing `steps` without `mode="fixed"`
+  raises `ValueError` instead of being silently ignored. `mode="data"`
+  requires `gaintype="T"`, `applymode="calonly"` and a linear
+  `applycal_interp` (the defaults); from `GainCalConfig.combine` it takes
+  only `"spw"` (and derives the applycal `spwmap` when none is given).
+- A failing `plotms` (e.g. no DISPLAY on a headless server) no longer fails
+  the run: the gain-table plots are skipped with a warning.
+- The summary figure draws stages that were not applied (`rejected`) in gray.
 - **The input MS is never written.** Previously the initial CLEAN saved its
   model into the input MS, the first iteration ran `applycal` on it (creating
   CORRECTED_DATA) and the J2000 -> ICRS relabelling edited it in place. Now
@@ -96,10 +187,14 @@ remain available as explicit options (`cell_rule="percentile"`,
 - **Dish diameter from the MS.** The primary beam uses the smallest dish in
   `ANTENNA/DISH_DIAMETER` (the largest primary beam); 12 m is only the
   fallback for an MS without the column (`pick_cell_imsize(diameter_m=None)`).
-- **Multiscale scales from the beam and the mask.** `0, b, 3b, 9b, ...` (b =
-  dirty-image beam in pixels) up to the largest scale whose support fits
-  inside the user mask region, so that CASA no longer ignores scales that are
-  too large for the mask; without a user mask, `0, b, 3b` as before.
+- **Multiscale scales.** The default stays `[0, 1, 3] x b` (b = the measured
+  dirty-image beam in pixels; v0.2 used the configured pixels per beam).
+  `multiscale_scales()` builds the ladder `0, b, 3b, 9b, ...` up to the
+  largest scale whose support fits inside a mask region, for callers that
+  choose it (ASEBI's final image); it is not the default, because which
+  scales serve a source best depends on its structure, the ladder was tested
+  on one source only, and on a single long-baseline EB it reached scales the
+  uv coverage does not see (see Fixed).
 - **Absolute CLEAN threshold in the self-cal loop.** Every self-cal image is
   CLEANed to `threshold_nsigma × sigma_th` (3 sigma_th), the same absolute
   threshold in every iteration, instead of `threshold_factor ×` the RMS of
@@ -135,6 +230,213 @@ remain available as explicit options (`cell_rule="percentile"`,
 
 ### Fixed
 
+- **The post-tclean range check was fooled by an off-centre reffreq; sumwt
+  is now compared with the data's weights** (ASEBI SPEC 10.3, D38 h;
+  convention audit 2026-10-16, spectral item 2). tclean centres an image's
+  frequency axis on reffreq and makes it `2 max|edge - reffreq|` wide, and
+  AJISAI passed `reffreq` to every tclean, the dirty image and nterms = 1
+  images included: with data from 216 to 234 GHz, an image of the 233 GHz
+  spw alone covered the band with reffreq 218 GHz and passed. Now `reffreq`
+  goes to mtmfs images only; the axis check is exact (the data's band without
+  reffreq, two-sided; `reffreq +- max|edge - reffreq|` with it), which also
+  stops the meaningless axes CASA 6.5.1 on a Mac writes for spws of unequal
+  channel counts; a natural-weighted reference image of the working MS
+  without reffreq (`checks` kind `reference`) and every natural-weighted
+  Stokes I image compare `sumwt` with the data's Stokes I weight sum
+  (`ms_utils.stokes_i_weight_sum`: `w_p + w_q` over the rows without
+  FLAG_ROW and the channels with both parallel hands unflagged,
+  WEIGHT_SPECTRUM where defined; CASA 6.5.1 equal to < 1e-8 in nine layouts,
+  `tests/test_casa_imaging_checks.py`; tolerance `SUMWT_RTOL = 1e-5`). The
+  same rule as ASEBI's engine checks (`asebi.engines.common`, d38b 1e6e80b):
+  `axis_problems`, `sumwt_problems`, `imaging_consistency_problems(...,
+  reffreq_hz=, exact_axis=, expected_sumwt=)`.
+- **Final-image flux bookkeeping as ASEBI SPEC 10.4 item 9 (D18 I3)**
+  (convention audit 2026-10-16, combine item 8). `aperture_flux_terms` took
+  Omega_R as the PSF volume within a circle of the aperture's area, sigma as
+  sigma_th, and `sigma_F = sigma sqrt(N_pix/Omega_R)`; on the SPEC's V1094 Sco
+  numbers that is 2.48 mJy where ASEBI's casa engine gives 1.54 mJy. Now, as
+  in ASEBI: Omega_R is the dirty beam summed over the aperture's own shape
+  (the CLEAN mask) carried so that its centroid falls on the PSF peak, sigma
+  is the residual rms outside the aperture (`residual_rms`: iterative 3-sigma
+  clipping about the median), and `sigma_F = sigma sqrt(N_pix Omega_beam) /
+  Omega_R` (`aperture_sigma_f`, `beam_area_pix`). On a fixed input AJISAI
+  gives ASEBI's numbers to the last digit (`tests/test_imaging_rules.py`).
+  The step records gain `residual_rms_jy`, `aperture_centre_pix`,
+  `aperture_shift_pix`, `sigma_source`; `aperture_radius_equiv_pix` is gone.
+- **The spwmap of a combined-spw table comes from the labels gaincal wrote**
+  (ASEBI SPEC 9 item 3, D38 d; convention audit 2026-10-16, combine item 3
+  and time item 3). `mode="data"` with `combine` containing `"spw"` mapped
+  every spw to the lowest spw with valid data in its observation. gaincal
+  does not always label a combined solution that way: a fully flagged lowest
+  spw still labels the solutions (the map [0, 1] left every spw-1 row
+  uncorrected), EBs of one setup merged by concat are labelled 0, 1, 1 per
+  observation (the map [0, 0] left observations 1 and 2 uncorrected), and a
+  lowest spw without rows in some intervals labels those solutions with the
+  next spw. The map is now built after gaincal from all rows of the table
+  (flagged solutions included), per observation; an observation with several
+  labels has the other labels' rows relabelled to its lowest one (the table is
+  rewritten in gaincal's row order, spw-time-antenna: relabelled rows left at
+  the end were mis-interpolated by applycal); when no single map serves every
+  observation, applycal runs per observation (`observation=`). Recorded in
+  `selection["spwmap"]` (labels, maps, relabelled rows) and in
+  `solve["applycal"]["spwmap_per_observation"]` (`spwmap` is then `[]`); a
+  configured `GainCalConfig.spwmap` that disagrees with the table is warned
+  about and not used (`solint.spwmap_from_labels`). Tests:
+  `tests/test_casa_spwmap.py` (the three cases with gaincal/applycal, and an
+  end-to-end run on two merged EBs: both observations corrected, rms phase
+  1.25/1.45 -> 0.28/0.28 rad). `tests/casa_sim.simulate_ms(shared_scans=True)`
+  gives every spw of a time block one scan number, as real data have
+  (gaincal combines spws only within a scan).
+- **`read_vis_summary` aborted on WEIGHT_SPECTRUM defined on some rows only**
+  (convention audit 2026-10-16, weights item 2). A concat of an MS with
+  WEIGHT_SPECTRUM and one without keeps the column when the earliest input
+  has it, defined on that input's rows only; the reader chose the weight
+  column per data description from its first row, and reading an undefined
+  cell aborts CASA 6.5.1 (the process exited with SIGABRT). Each row is now
+  read with its own column: WEIGHT_SPECTRUM where its cell is defined, WEIGHT
+  elsewhere (`ms_utils.weight_column_queries`, TaQL `ISDEFINED`), as tclean
+  does.
+- **Time-averaged data broke the time geometry of `mode="data"` (convention
+  audit 2026-10-16; ASEBI SPEC 4 item 4, D38 e).** `ajisai.solint.geometry`
+  took the distinct TIME values of a scan as its integrations. After time
+  averaging of a copy that had lost rows (split with keepflags=False drops
+  fully flagged baseline-integrations), mstransform writes for each baseline
+  the mean time of the rows present, so one bin carries several TIMEs: on a
+  simulated EB with 3 % of the rows missing and 18 s bins, 11-12 "integrations"
+  per scan instead of 4, an integration time of 6 s, no adjacent pairs for the
+  noise scale, the SNR rate x1.48 and 29.5 % of the rows on the wrong side of
+  the even/odd split; one bin per scan gave an integration time of 1 s (SNR
+  rate x8). The summary now carries INTERVAL (`VisSummary.interval`): the
+  rows are placed on integration slots of the median INTERVAL from the start
+  of each scan (G2's even/odd split is the slot parity, the noise scale pairs
+  adjacent slots, the integration grid of the SNR rate and the structure
+  function is scan offset + slot), and the integration time is the median
+  spacing of adjacent slots when it agrees with the median INTERVAL to 0.1 %
+  (unaveraged data: the previous value exactly), else the median INTERVAL.
+  Recorded in `selfcal["time_geometry"]`. Unaveraged data give the previous
+  stage records bit for bit (23 simulations). The integration grid no longer
+  puts two integrations of a scan into one cell when the scan starts a
+  half-integer number of integrations after the first (it undercounted the
+  observing time, SNR rate +8 % on such a simulation).
+- **gaincal's solution time is the weighted mean of its rows' times** (audit
+  item 6). The model of a solution's time was the unweighted mean of its
+  integration times; gaincal weights each row by its weight over the channels
+  where both parallel hands are unflagged (CASA 6.5.1: WEIGHT x10 on the first
+  of six integrations, 6.0 s instead of 15.0 s; half the channels flagged
+  counts half; a channel with one hand flagged counts nothing). The summary
+  now carries that row weight (`VisSummary.w`, `reduce_visibilities()["W"]`)
+  and the solution times are weighted. Nearest interpolation (D34 F2) gave
+  every row its own interval's solution; CASA gives the solution nearest in
+  time (ties to the earlier), which with weighted times can be the next
+  interval's (WEIGHT x10 on integrations 0 and 3 of 3-integration intervals:
+  integration 2 takes the second solution). `_row_nearest` now picks by the
+  full-data solution times; in G2 a held-out row takes the training solution
+  of that interval. Evenly weighted data give the previous records bit for
+  bit (23 simulations). For a solution over several scans CASA also weights
+  each scan by the coherent amplitude of its phase-only solve (0.05 s on a
+  simulated EB); that part is not modelled.
+- **gaincal's time grid starts at the first row of a scan, fully flagged rows
+  included** (audit item 5). `read_vis_summary` drops rows without valid data,
+  so a scan whose first integration was flagged was modelled from the second
+  (17 instead of gaincal's 18 solutions at 12 s; the G1 gate matched the
+  wrong solutions). The first and last TIME of every scan over all its rows
+  are now kept (`VisSummary.scan_bounds`) and the solution intervals start
+  there (`Geometry.scan_origin`).
+
+- **A user `phase_center` with a `:`-separated declination went to CASA as
+  hours.** The documented form `("16:25:45.0", "-24:12:23.0", "ICRS")` was
+  passed to `phaseshift` as it was; CASA reads `-24:12:23.0` as a time
+  (-363.1 deg, i.e. Dec -3.1 deg), about 21 deg off, without a message (with
+  frame `"J2000"` it also reached `fixplanets`; on a simulated MS the result
+  was 167 deg off). `phase_center` is now parsed when the configuration is
+  validated: RA as hours, Dec as degrees whatever the separators (`:`, `.`,
+  `h m s` / `d m s`, spaces, or an angle with a unit), with range checks, and
+  CASA receives only radians (`ajisai.ms_utils.parse_ra_dec`,
+  `casa_direction_string`).
+- **The phase shift left FIELD, SOURCE and the image 20-32 mas off.** The
+  shift ran `phaseshift`, then `fixplanets` with the target converted to
+  J2000 by astropy's FK5 (whose frame-tie constants differ from CASA's J2000,
+  the IAU 2000 frame bias, by 20-25 mas), then relabelled the result as ICRS
+  (31.6 mas off on real ALMA data; 25.5 mas without the relabel). It now
+  converts the target with `casatools.measures` into the frame of the field's
+  PHASE_DIR, runs `phaseshift` with a radian phase centre in that frame, and
+  writes FIELD PHASE_DIR, DELAY_DIR, REFERENCE_DIR and SOURCE.DIRECTION with
+  the new helper `ajisai.ms_utils.write_field_direction`, each cell converted
+  into its own frame (per row for ALMA's variable-reference columns). No
+  `fixplanets`, no UVW recomputation (UVW and DATA are `phaseshift`'s own),
+  no label change; exact (< 1e-6 mas on simulated MSs) for ICRS data and for
+  genuine J2000 data, with the target in either frame. The read-back offsets
+  are recorded (`derived.phase_shift.readback_offset_mas`). `phaseshift`
+  alone is not enough: CASA 6.5 writes J2000 numbers into an ICRS-coded
+  PHASE_DIR and leaves DELAY_DIR, REFERENCE_DIR and SOURCE unchanged.
+- **Phase shift of a field other than field 0.** CASA 6.5 `phaseshift`
+  renumbers the selected field from 0, and the pipeline went on with the old
+  field id. The field is now found in the shifted MS by name
+  (`ajisai.ms_utils.field_id_by_name`) and `resolved_field_id` follows it.
+- **The auto-detected phase centre** (brightest pixel of the dirty image) is
+  read in radians at the pixel centre from the image's coordinate system;
+  `imstat`'s `maxposf` string (rounded to 1 ms of time, up to 15 mas) is no
+  longer used.
+- **`icrs_to_j2000` used astropy's FK5.** It now converts with
+  `casatools.measures` (CASA's J2000) and needs CASA; the output layout is
+  kept (RA `:`, Dec `.`), with a new `precision` argument (default 7
+  decimals of seconds, < 2 micro-arcseconds; was 5). `rad_to_radec` and
+  `rad_to_radec_from_imfit` write the declination with `.` separators (CASA
+  reads `:` as hours) and no longer use astropy.
+- **J2000 -> ICRS relabel of the input.** The FIELD and SOURCE frame codes
+  are mapped through each column's MEASINFO TabRefTypes/TabRefCodes instead
+  of the hard-coded 0/21; fixed-reference FIELD columns are relabelled like
+  SOURCE.DIRECTION (previously skipped); a column that cannot be relabelled
+  is warned about and recorded instead of being skipped silently;
+  `relabel_J2000_to_ICRS` returns a record of what it changed
+  (`derived.working_vis.relabel`).
+- **The input relabel is applied only where it is right.** With
+  `relabel_j2000_to_icrs=True` (the default), a J2000-labelled input is
+  relabelled (on a copy, label only) only when it is ALMA data observed
+  before Cycle 3 (2015-10-01), whose J2000 label sits on ICRS numbers (ALMA
+  knowledgebase). Any other J2000 label (not ALMA, observed on or after
+  2015-10-01, or with an unknown start) is genuine J2000 and is kept; the
+  reason is warned about and recorded (`derived.working_vis.relabel_caveat`).
+  Before, every J2000 label was relabelled, which moves genuine J2000 numbers
+  by the frame bias (up to about 23 mas). Same rule as ASEBI (SPEC 4.1 item
+  10, D37, decided by the author 2026-10-16).
+- Tests: the simulated MS (`tests/casa_sim.py`) has the FIELD layout of a
+  real ALMA MS by default (PhaseDir_Ref, DelayDir_Ref, RefDir_Ref and the
+  variable-reference MEASINFO keywords; `alma_field_layout`), and can store
+  its directions in ICRS (`frame="ICRS"`). `tests/test_casa_frames.py` checks
+  the conversions against `casatools.measures`, the phase shift for an ICRS
+  and a genuine-J2000 MS with the target in ICRS and J2000 and the relabel on
+  and off (FIELD, SOURCE within 0.01 mas; UVW and DATA identical to
+  `phaseshift`'s), the renumbered field, the auto-detected target and the
+  code-mapped relabel.
+
+- **Model prediction missed an edge channel (ft and the LSRK/TOPO offset).** tclean sets an mfs
+  image's frequency range to the data's range in LSRK, and `ft` compares the TOPO channel
+  frequencies with it: when the LSRK/TOPO offset exceeds half of the outermost channel, that
+  channel gets MODEL_DATA = 0 (DG Tau B, a 2015 EB with 19.5 MHz channels at the low edge and a
+  +20 MHz offset; the model check stopped the run). `ft` now gets temporary copies of the model
+  images with only the spectral increment widened to cover the data plus the largest offset
+  (`spectral_cover_increment`); the predicted values are unchanged and the originals are never
+  modified. Recorded as `spectral_cover` in the `model_prediction` check. Test:
+  `tests/test_casa_predict_cover.py` reproduces the dropped channel on a simulated MS.
+- **Multiscale scales the data cannot see; empty initial CLEAN.** A scale is
+  now used only when its scale-PSF (the dirty PSF convolved twice with CASA's
+  multiscale component, as `MatrixCleaner` computes it) has its largest
+  magnitude at the component's own position; other scales, derived or given
+  in `ImagingConfig.scales`, are dropped (a given one with a warning) and
+  recorded in `derived.scales` (`candidates`, `psf_check`). With the
+  development default of that time (the ladder bounded by the mask region
+  only, since withdrawn), on the 8.5 km baselines of
+  V1094 Sco (2017 TM1, cell 6.2 mas) it reached 628 pix, whose scale-PSF
+  peaks at a negative sidelobe, CASA's multiscale minor cycle refused to
+  start ("As Peak of PSF is negative"), the initial CLEAN ended with an
+  all-zero model, and the run failed only at the model prediction of the
+  first stage with a misleading "no CLEAN components above the threshold".
+  The initial CLEAN (with `niter > 0`; a `niter = 0` dirty image expects no
+  model) now stops at once (`RuntimeError`, check `clean_model`) when its
+  model is empty, saying whether the minor cycle did not run (peak
+  inside the mask above the threshold) or there is no emission to CLEAN.
+  `justification.json` records the CASA log file (`casa_log`).
 - `rms_method="annulus"` could not be used from `AJISAIConfig`: the pipeline
   never passed a target radius to `compute_rms`, so `_validate_inputs` only
   warned and the run then failed with `ValueError` at the dirty-image

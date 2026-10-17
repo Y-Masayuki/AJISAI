@@ -6,7 +6,7 @@
 
 This module is a self-contained replacement for the small subset of
 ``analysisUtils`` functions AJISAI relies on. The functions here are
-implemented natively on top of ``casatools`` and ``astropy``, with no
+implemented natively on top of ``casatools`` and ``numpy``, with no
 dependency on the 110,000-line analysisUtils source.
 
 The math-only portions (``_smallest_5_smooth_at_least``,
@@ -70,6 +70,38 @@ Coordinate utilities
 .. autofunction:: ajisai.ms_utils.rad_to_radec_from_imfit
 
 .. autofunction:: ajisai.ms_utils.icrs_to_j2000
+
+.. autofunction:: ajisai.ms_utils.parse_ra_dec
+
+.. autofunction:: ajisai.ms_utils.parse_ra
+
+.. autofunction:: ajisai.ms_utils.parse_dec
+
+.. autofunction:: ajisai.ms_utils.format_ra
+
+.. autofunction:: ajisai.ms_utils.format_dec
+
+.. autofunction:: ajisai.ms_utils.casa_direction_string
+
+.. autofunction:: ajisai.ms_utils.convert_direction
+
+
+Directions in the FIELD and SOURCE tables
+-----------------------------------------
+
+.. autofunction:: ajisai.ms_utils.direction_frames
+
+.. autofunction:: ajisai.ms_utils.frame_of_code
+
+.. autofunction:: ajisai.ms_utils.code_of_frame
+
+.. autofunction:: ajisai.ms_utils.field_direction_frame
+
+.. autofunction:: ajisai.ms_utils.field_id_by_name
+
+.. autofunction:: ajisai.ms_utils.write_field_direction
+
+.. autofunction:: ajisai.ms_utils.field_direction_offsets
 
 
 Module-level helper for users

@@ -20,10 +20,14 @@ AJISAI is a fully automated, reproducible, and explainable self-calibration pipe
    cell size, image size, solution intervals, masking strategy, ...) is
    recorded in a structured `justification.json` file with the rationale,
    so the run is auditable and the choices are reproducible in publications.
-3. **Deterministic.** A fixed self-calibration schedule (3 phase iterations
-   + 1 amplitude iteration by default) runs to completion; the best image is
-   selected by dynamic range at the end. No adaptive rollback that would
-   make the result depend on run-order.
+3. **Deterministic and data-driven.** The phase self-calibration stages and
+   their solution intervals are decided from quantities measured in the data
+   (the solution SNR of every antenna, the phase structure function, the
+   noise scale) and accepted only when they improve the coherence of
+   integrations the gains were not solved from (the default
+   `SelfcalSchedule(mode="data")`). The same data and config always give the
+   same stages. The v0.2 fixed schedule (3 phase + 1 amplitude iterations,
+   best by dynamic range) remains available as `mode="fixed"`.
 4. **Read-only input.** The input measurement set is never written. Each
    self-calibration stage works on a temporary copy of the previous stage's
    data and keeps its own measurement set; the result is delivered as a
@@ -68,9 +72,10 @@ Full documentation is hosted on Read the Docs:
 
 To verify the pipeline end-to-end, AJISAI was run on the public
 [ALMA TW Hya Band 7 dataset](https://casaguides.nrao.edu/index.php?title=First_Look_at_Imaging_CASA_6)
-(Project 2011.0.00340.S) via `examples/run_twhya_demo.py`. With default
-settings, three phase + one amplitude self-cal iterations completed
-without any anomalies.
+(Project 2011.0.00340.S) via `examples/run_twhya_demo.py`. The figures and
+numbers below come from AJISAI v0.2.1, whose default was the fixed schedule
+(three phase + one amplitude iterations, now `SelfcalSchedule(mode="fixed")`);
+they will be regenerated with the v0.3 data-driven default.
 
 <p align="center">
   <img src="docs/_static/selfcal_summary.png" alt="TW Hya self-cal summary" width="500"/>
@@ -113,12 +118,12 @@ from ajisai import AJISAI, AJISAIConfig
 cfg = AJISAIConfig(vis="/path/to/data.ms")
 aj = AJISAI(cfg).run()
 
-print(aj.best_image)         # path to the best iteration's CLEAN image
-print(aj.best_metric_value)  # the dynamic range achieved
+print(aj.best_image)         # CLEAN image of the best (last accepted) stage
+print(aj.best_metric_value)  # its dynamic range (a diagnostic)
 print(aj.final_image)        # the final (deeper) image of the best iteration
 print(aj.final_ms)           # final_selfcal.ms: self-calibrated DATA only
 print(aj.metrics)            # per-iteration metrics (list of dicts)
-print(aj.stages)             # per-stage MS, image, model and solve information
+print(aj.stages)             # per-stage MS, image, model, solve and decision record
 print(aj.justification)      # full structured rationale
 ```
 
@@ -127,7 +132,7 @@ After the run, the working directory contains:
 ```
 ajisai_<projname>/
   ajisai_refant_selection.png   # which antenna was chosen, and why
-  metrics.csv                    # per-iteration peak / RMS / SNR / DR / beam
+  metrics.csv                    # per-stage peak / RMS / SNR / DR / beam
   selfcal_summary.png            # 4-panel diagnostic plot
   selfcal_images.png             # CLEAN image of every iteration, side by side
   justification.json             # structured rationale for every decision
@@ -160,7 +165,7 @@ for f in list_target_fields(vis):
 ## Advanced configuration
 
 `AJISAIConfig` exposes sub-configs for imaging, gain calibration, the
-self-cal schedule, and the diagnostic figures. All have defaults; override
+self-cal stages, and the diagnostic figures. All have defaults; override
 only what you need. For example:
 
 ```python
@@ -173,19 +178,31 @@ cfg = AJISAIConfig(
     vis="/path/to/data.ms",
     # Optional: shift the source to the phase center first
     phase_shift=True,
-    # Optional: supply phase center manually (frame is required)
+    # Optional: supply phase center manually (frame is required). RA is read
+    # as hours and Dec as degrees, whichever separators are used (":", ".",
+    # "h m s" / "d m s"); AJISAI passes CASA only radians.
     phase_center=("16:25:45.0", "-24:12:23.0", "ICRS"),
     # Sub-configs
     imaging=ImagingConfig(robust=0.5, mask_mode="auto-multithresh"),
     gaincal=GainCalConfig(minsnr=3.0, gaintype="T"),
-    schedule=SelfcalSchedule(steps=(
-        SelfcalStep("p", "inf",  label="phase_inf"),
-        SelfcalStep("p", "6*IT", label="phase_6IT"),
-        SelfcalStep("p", "3*IT", label="phase_3IT"),
-        SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
-    )),
+    # Default: stages and solution intervals from the data (at most three
+    # phase stages, each checked on held-out integrations)
+    schedule=SelfcalSchedule(mode="data"),
 )
 AJISAI(cfg).run()
+```
+
+Each stage's measured quantities, candidate intervals, gates and decision
+are recorded in `justification.json` (`stages[k]["selection"]`). The v0.2
+fixed ladder is one option away:
+
+```python
+schedule = SelfcalSchedule(mode="fixed", steps=(
+    SelfcalStep("p", "inf",  label="phase_inf"),
+    SelfcalStep("p", "6*IT", label="phase_6IT"),
+    SelfcalStep("p", "3*IT", label="phase_3IT"),
+    SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
+))
 ```
 
 Every option, with its default value and the allowed alternatives, is listed
@@ -213,7 +230,8 @@ best-effort basis; we usually reply within one to two weeks.
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for
 the development setup, testing and lint instructions, and the project's design
-policy (a deterministic fixed schedule; no adaptive rollback or heuristics).
+policy (deterministic decisions from measured quantities, recorded with their
+reasons; no decisions on the data the gains were solved from).
 
 ## License
 

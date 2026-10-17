@@ -9,9 +9,11 @@ pipeline for ALMA continuum data. It is designed around three principles:
     2. Justification-based: every parameter choice is logged to ``justification.json``
                            with a structured reason, so the pipeline is auditable
                            and the choices are reproducible in publications.
-    3. Deterministic:      a fixed self-cal schedule (3 phase + 1 amp by default),
-                           never adaptive rollback - all iterations complete and
-                           the best by dynamic range is selected at the end.
+    3. Data-driven:        the phase self-cal stages and their solution intervals
+                           are decided from quantities measured in the data and
+                           checked on held-out integrations (schedule.mode="data",
+                           default); the fixed v0.2 ladder remains as
+                           schedule.mode="fixed".
     4. Read-only input:    the input MS is never written; every stage works on
                            copies, and each stage's MS is kept.
 
@@ -24,7 +26,7 @@ Run from within CASA (or a Python environment with modular CASA installed)::
     cfg = AJISAIConfig(vis="/path/to/data.ms")
     aj = AJISAI(cfg).run()
 
-    print(aj.best_image)              # path to the best image
+    print(aj.best_image)              # image of the last accepted stage
     print(aj.justification)           # full structured rationale
 
 Multi-field workflow
@@ -52,6 +54,9 @@ from .core import (
     SelfcalStep,
     SelfcalSchedule,
     PlotConfig,
+    FIXED_SCHEDULE_STEPS,
+    # Entry point for a calling pipeline's measurement self-cal (ASEBI)
+    selfcal_measurement,
     # MS helpers that the orchestrator uses internally
     list_target_fields,
     # Image / RMS helpers
@@ -67,6 +72,8 @@ from .core import (
     final_depth_decision,
     aperture_flux_terms,
 )
+# Data-driven solution intervals (pure numpy; see ajisai.solint).
+from . import solint
 # Diagnostic figures (CASA-independent; see ajisai.plotting).
 from .plotting import (
     plot_refant_selection,
@@ -102,6 +109,9 @@ __all__ = [
     "SelfcalStep",
     "SelfcalSchedule",
     "PlotConfig",
+    "FIXED_SCHEDULE_STEPS",
+    "selfcal_measurement",
+    "solint",
     "list_target_fields",
     "get_array_info",
     "get_on_source_time",

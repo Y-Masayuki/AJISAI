@@ -24,6 +24,8 @@ from ajisai.core import (
     _model_images,
     _noise_stokes,
     _relabel_needed,
+    _relabel_caveat,
+    ALMA_CYCLE3_START_MJD_S,
     aperture_flux_terms,
     final_depth_decision,
     imaging_consistency_problems,
@@ -227,6 +229,42 @@ def test_consistency_detects_bad_frequency_axis():
     assert any("reference frequency" in p for p in problems)
 
 
+DATA = (215.9688e9, 233.9375e9)            # TOPO channel edges (ASEBI d38b R1 'equal' layout)
+
+
+def test_axis_without_reffreq_must_be_the_data_range():
+    """ASEBI SPEC 10.3 (D38 h), the rule of ASEBI's engines.common.axis_problems."""
+    from ajisai.core import axis_problems
+    lo, hi = DATA
+    # what tclean wrote (LSRK, -14 MHz): passes the exact test
+    assert axis_problems(224.9383e9, 17.9676e9, lo, hi, exact=True) == []
+    # a narrower axis (half the band dropped) fails both tests
+    bad = axis_problems(229.0e9, 10.0e9, lo, hi, exact=True)
+    assert any("does not cover" in p for p in bad) and any("without reffreq" in p for p in bad)
+    # Mac CASA 6.5.1 garbage: crval 0, or an axis that covers everything
+    assert "not finite/positive" in axis_problems(0.0, 9.27716e242, lo, hi, exact=True)[0]
+    wide = axis_problems(62.4537e9, 342.893e9, lo, hi, exact=True)
+    assert len(wide) == 1 and "without reffreq" in wide[0]
+    assert axis_problems(62.4537e9, 342.893e9, lo, hi) == []          # the cover test let it through
+
+
+def test_axis_with_reffreq_sees_the_far_edge_only():
+    from ajisai.core import axis_problems
+    lo, hi = 216.03e9, 233.94e9
+    ref = 218.0e9
+    w = 2.0 * max(abs(lo - ref), abs(hi - ref))
+    assert axis_problems(ref, w, lo, hi, reffreq_hz=ref, exact=True) == []
+    # only the 232-234 GHz spw imaged, reffreq near the dropped side: the same axis; sumwt sees it
+    assert axis_problems(ref, 2.0 * (233.94e9 - ref), lo, hi, reffreq_hz=ref, exact=True) == []
+    assert axis_problems(ref, 2.0 * (225.0e9 - ref), lo, hi, reffreq_hz=ref, exact=True)
+    assert axis_problems(ref, 3.1e231, lo, hi, reffreq_hz=ref, exact=True)
+    assert axis_problems(62.45e9, w, lo, hi, reffreq_hz=ref, exact=True)
+    # the audit's selection case: a third of the weight gridded
+    p = imaging_consistency_problems(218e9, 31.84e9, 10.0, lo, hi, reffreq_hz=218e9,
+                                     exact_axis=True, expected_sumwt=30.0)
+    assert len(p) == 1 and "0.333333" in p[0]
+
+
 def test_model_zero_channels():
     absmax = [0.06, 0.0, 0.05, 0.0, float("nan")]
     n_unflagged = [10, 10, 0, 0, 3]
@@ -237,10 +275,30 @@ def test_model_zero_channels():
 
 
 def test_relabel_needed():
-    assert _relabel_needed([np.array([0, 21])], None)
-    assert not _relabel_needed([np.array([21, 21])], "ICRS")
-    assert _relabel_needed([], "J2000")
+    """Frames come from the MEASINFO keywords (codes mapped through TabRefTypes/Codes)."""
+    assert _relabel_needed([["J2000", "ICRS"]], [])
+    assert not _relabel_needed([["ICRS", "ICRS"]], ["ICRS"])
+    assert _relabel_needed([], ["J2000"])
     assert not _relabel_needed([], None)
+    assert not _relabel_needed([["ICRS"], ["ICRS"], ["ICRS"]], ["ICRS", "ICRS"])
+
+
+def test_alma_cycle3_start():
+    # 2015-10-01 00:00 UTC = MJD 57296, in seconds (the MS TIME unit)
+    assert ALMA_CYCLE3_START_MJD_S == 57296 * 86400.0
+
+
+def test_relabel_caveat():
+    """The label-only relabel is right only for ALMA data observed before Cycle 3."""
+    before, after = ALMA_CYCLE3_START_MJD_S - 86400.0, ALMA_CYCLE3_START_MJD_S
+    assert _relabel_caveat(["ALMA"], before) is None
+    assert _relabel_caveat(["ALMA", "ACA"], before) is None
+    msg = _relabel_caveat(["ALMA"], after)
+    assert "Cycle 3" in msg and "not ALMA" not in msg
+    msg = _relabel_caveat(["EVLA"], before)
+    assert "not ALMA" in msg and "2015-10-01" not in msg
+    assert "unknown" in _relabel_caveat(["ALMA"], None)
+    assert "not ALMA" in _relabel_caveat([], before)
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +338,93 @@ def test_aperture_flux_terms_recovers_residual_flux():
     # Gaussian PSF = Gaussian CLEAN beam: no restored-flux bias.
     assert t["omega_clean_pix"] == pytest.approx(t["omega_r_pix"], rel=1e-3)
     assert abs(t["restored_bias_jy"]) < 1e-6
-    # sigma_F = sigma sqrt(N_pix / Omega_R)
-    assert t["sigma_f_jy"] == pytest.approx(1e-5 * math.sqrt(t["aperture_npix"] / t["omega_r_pix"]))
+    # sigma_F = sigma sqrt(N_pix Omega_beam) / Omega_R (ASEBI SPEC 10.4 item 9, D18 I3)
+    assert t["sigma_f_jy"] == pytest.approx(
+        1e-5 * math.sqrt(t["aperture_npix"] * t["omega_clean_pix"]) / t["omega_r_pix"], rel=1e-12)
+    assert t["sigma_source"] == "given" and t["residual_rms_jy"] == 1e-5
+
+
+# asebi.imaging (ASEBI 5cb9727) on _c8_fixed_input(), as casa_native.flux_terms calls it
+# (sigma = robust_rms(residual, exclude=mask), Omega_beam = beam_area_pix(bmaj, bmin, cell)):
+# local_runs/audit/ajisai_d38/c8_asebi_reference.py
+ASEBI_C8 = {
+    "F_model": 0.0042, "F_unc": 0.001737077431453104, "F_corr": 0.005937077431453104,
+    "omega_R_pix": 31.064537854891785, "n_pix": 444.0, "sigma_F": 9.215307298576333e-05,
+    "restored_bias": -0.0005825727410036254, "sigma": 1.9871884184057896e-05,
+    "omega_beam": 46.73996396259294,
+}
+
+
+def _c8_fixed_input():
+    """A fixed input for the flux bookkeeping: elliptical PSF (peak 1) with a negative sidelobe
+    ring, a residual source plus noise, two CLEAN components and an irregular, off-centre mask
+    (an ellipse and a small disk)."""
+    n, cell, bmaj, bmin = 128, 0.02, 0.15, 0.11
+    yy, xx = np.mgrid[:n, :n].astype(float)
+    sx = bmin / cell / (2 * math.sqrt(2 * math.log(2)))
+    sy = bmaj / cell / (2 * math.sqrt(2 * math.log(2)))
+    r = np.hypot(xx - 64, yy - 64)
+    psf = np.exp(-0.5 * (((xx - 64) / sx) ** 2 + ((yy - 64) / sy) ** 2))
+    psf -= 0.08 * np.exp(-0.5 * ((r - 12.0) / 2.5) ** 2)
+    psf[64, 64] = 1.0
+    rng = np.random.default_rng(42)
+    residual = (4e-4 * np.exp(-0.5 * (((xx - 70) / 6.0) ** 2 + ((yy - 52) / 4.0) ** 2))
+                + 2e-5 * rng.standard_normal((n, n)))
+    model = np.zeros((n, n))
+    model[50, 72] = 3e-3
+    model[55, 66] = 1.2e-3
+    u, v = xx - 69.8, yy - 51.3
+    ang = math.radians(30.0)
+    a = (u * math.cos(ang) + v * math.sin(ang)) / 14.0
+    b = (-u * math.sin(ang) + v * math.cos(ang)) / 9.0
+    mask = (a ** 2 + b ** 2 <= 1.0) | (np.hypot(xx - 80, yy - 40) <= 4.0)
+    return model, residual, psf, mask, cell, bmaj, bmin
+
+
+def test_aperture_flux_terms_gives_asebis_numbers():
+    """ASEBI SPEC 10.4 item 9 (D18 I3), one implementation with ASEBI's casa engine: on a fixed
+    input AJISAI gives the numbers of asebi.imaging.aperture_flux_terms + robust_rms +
+    beam_area_pix (ASEBI 5cb9727; local_runs/audit/ajisai_d38/c8_asebi_reference.py)."""
+    model, residual, psf, mask, cell, bmaj, bmin = _c8_fixed_input()
+    t = aperture_flux_terms(model, residual, psf, mask, cell, bmaj, bmin)
+    asebi = {"f_model_jy": ASEBI_C8["F_model"], "f_unc_jy": ASEBI_C8["F_unc"],
+             "f_corr_jy": ASEBI_C8["F_corr"], "omega_r_pix": ASEBI_C8["omega_R_pix"],
+             "aperture_npix": ASEBI_C8["n_pix"], "sigma_f_jy": ASEBI_C8["sigma_F"],
+             "restored_bias_jy": ASEBI_C8["restored_bias"], "residual_rms_jy": ASEBI_C8["sigma"],
+             "omega_clean_pix": ASEBI_C8["omega_beam"]}
+    for k, v in asebi.items():
+        assert t[k] == pytest.approx(v, rel=1e-12), k
+    # the transposed arrays (CASA images read as [x, y]) give the same numbers
+    tt = aperture_flux_terms(model.T, residual.T, psf.T, mask.T, cell, bmaj, bmin)
+    for k in asebi:
+        assert tt[k] == pytest.approx(t[k], rel=1e-12), k
+    # the previous rule: Omega_R over a circle of the mask's area about the PSF peak, and
+    # sigma sqrt(N_pix / Omega_R) (sigma_th = the residual rms here, to isolate the formula)
+    old_omega = psf_volume_within(psf, math.sqrt(t["aperture_npix"] / math.pi))
+    old = t["residual_rms_jy"] * math.sqrt(t["aperture_npix"] / old_omega)
+    assert old / t["sigma_f_jy"] == pytest.approx(0.80, abs=0.01)     # x1.6 on V1094 Sco
+
+
+def test_sigma_f_on_the_v1094_numbers():
+    """The SPEC's V1094 Sco numbers: residual rms 40.89 uJy, 1 690 757 pixels, beam 175.6 px,
+    Omega_R 458.6 px: 1.536 mJy (ASEBI), where AJISAI's previous formula gave 2.483 mJy."""
+    from ajisai.core import aperture_sigma_f
+    sf = aperture_sigma_f(4.089310917109791e-05, 1690757, 175.60688102090526, 458.63056445753966)
+    assert sf == pytest.approx(0.0015363794858863106, rel=1e-12)
+    old = 4.089310917109791e-05 * math.sqrt(1690757 / 458.63056445753966)
+    assert old == pytest.approx(2.483e-3, rel=1e-3)
+
+
+def test_residual_rms_clips_and_excludes_the_aperture():
+    from ajisai.core import residual_rms
+    rng = np.random.default_rng(1)
+    img = 1e-5 * rng.standard_normal((200, 200))
+    img[90:110, 90:110] += 1e-2                       # bright source, excluded by the aperture
+    ap = np.zeros(img.shape, bool)
+    ap[80:120, 80:120] = True
+    assert residual_rms(img, exclude=ap) == pytest.approx(1e-5, rel=0.03)
+    img[5, 5] = 1.0                                   # an outlier outside it is clipped
+    assert residual_rms(img, exclude=ap) == pytest.approx(1e-5, rel=0.03)
 
 
 def test_aperture_flux_terms_empty_aperture_raises():
@@ -347,3 +490,22 @@ def test_restored_bias_v1094_ratio():
     ratio = 458.6 / 175.0 - 1.0
     assert ratio == pytest.approx(1.62, abs=0.01)
     assert 6.6 * ratio == pytest.approx(10.7, abs=0.1)     # +11 mJy at 2 sigma
+
+
+# ---------------------------------------------------------------------------
+# Model prediction: the model's spectral range must cover the data (ft)
+# ---------------------------------------------------------------------------
+def test_spectral_cover_widens_only_when_the_image_misses_a_channel():
+    """DG Tau B, 2015 EB: tclean's mfs range began at 219.5245 GHz while the data's lowest edge
+    (a descending spw) was 219.5046 GHz, so ft wrote no model there. The widened increment keeps
+    the reference frequency, keeps the sign, and covers the data plus the LSRK/TOPO margin."""
+    from ajisai.core import spectral_cover_increment, _DOPPLER_TOLERANCE
+    ref, inc = 226.20413e9, 13.359292e9
+    lo, hi = 219.504590e9, 232.862603e9
+    new = spectral_cover_increment(ref, inc, lo, hi)
+    assert new is not None and new > abs(inc)
+    assert ref - new / 2 <= lo * (1 - _DOPPLER_TOLERANCE) + 1.0
+    assert ref + new / 2 >= hi * (1 + _DOPPLER_TOLERANCE) - 1.0
+    assert spectral_cover_increment(ref, -inc, lo, hi) < 0          # sign of the axis kept
+    # an axis that already covers the data with the margin is left alone
+    assert spectral_cover_increment(ref, 2.0 * (hi * 1.001 - ref), lo, hi) is None

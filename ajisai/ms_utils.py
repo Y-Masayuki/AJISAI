@@ -5,7 +5,7 @@ ajisai_ms_utils.py
 ==================
 Measurement-set query utilities for AJISAI.
 
-This module provides native casatools/astropy implementations of the small
+This module provides native casatools/numpy implementations of the small
 subset of analysisUtils (Todd Hunter / NRAO) functions that AJISAI relies on.
 By containing these helpers in a single file, AJISAI removes its dependency
 on the full 110,000-line analysisUtils.py module, which is no longer actively
@@ -22,7 +22,12 @@ Replaced analysisUtils functions:
     4. getBaselineStats          -> get_baseline_at_percentile()
     5. pickCellSize              -> pick_cell_imsize(rule="percentile")
     6. rad2radec                 -> rad_to_radec()
-    7. ICRSToJ2000               -> icrs_to_j2000()
+    7. ICRSToJ2000               -> icrs_to_j2000()  (casatools.measures)
+
+It also holds AJISAI's sky-direction helpers: parsing user coordinates
+(RA in hours, Dec in degrees) into radians, frame conversion with
+casatools.measures, and writing a direction into FIELD/SOURCE in each
+column's own frame (the phase-shift step).
 
 Validation against the original analysisUtils:
     Test MS: V883Ori 232 GHz, 90-percentile baseline = 3293.48 m
@@ -35,7 +40,9 @@ License: MIT
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -669,6 +676,235 @@ def get_uv_max(vis: str, field: Optional[str] = None) -> Dict[str, Any]:
     return best
 
 
+def weight_column_queries(colnames, query: str) -> List[Tuple[str, str]]:
+    """(TaQL query, weight column) pairs that together select the rows of ``query``.
+
+    WEIGHT_SPECTRUM is read on the rows where its cell is defined and WEIGHT
+    on the others. A concat of MSs with and without WEIGHT_SPECTRUM defines it
+    on the rows of some inputs only (the earliest input decides whether the
+    column exists), and reading an undefined cell aborts CASA 6.5.1
+    ("TiledStMan: calcCacheSize: invalid arguments"): a presence check on the
+    first row of a data description is not enough (convention audit
+    2026-10-16, weights item 2; ASEBI SPEC 9 item 3, D38 d). TaQL ``ISDEFINED``
+    splits the rows; tclean likewise uses WEIGHT_SPECTRUM where it is
+    defined.
+    """
+    if "WEIGHT_SPECTRUM" not in list(colnames):
+        return [(query, "WEIGHT")]
+    return [(f"({query}) && ISDEFINED(WEIGHT_SPECTRUM)", "WEIGHT_SPECTRUM"),
+            (f"({query}) && !ISDEFINED(WEIGHT_SPECTRUM)", "WEIGHT")]
+
+
+def stokes_i_weight_sum(vis: str, field: Optional[str] = None,
+                        chunk_samples: int = _CHUNK_SAMPLES) -> Dict[str, Any]:
+    """The sumwt a natural-weighted Stokes I image of the field must have.
+
+    ASEBI SPEC 10.3 (D38 h: sumwt is compared with the value expected from the
+    data's Stokes I weights; the formula pinned by casa tests). tclean's
+    natural-weighting sumwt (mfs, and tt0 of mtmfs, with or without reffreq)
+    is the sum, over the cross-correlation rows without FLAG_ROW and the
+    channels where both parallel hands are unflagged, of ``w_p + w_q``
+    (with a single parallel hand, ``w_p``), WEIGHT_SPECTRUM on the rows where
+    it is defined and WEIGHT elsewhere (:func:`weight_column_queries`); a
+    zero weight is not a flag, autocorrelations do not count. The same rule
+    as ASEBI's ``engines.common.stokes_i_weight_sum`` (ASEBI d38b 1e6e80b;
+    AJISAI selects the imaged field). CASA 6.5.1: equal to < 1e-8 with
+    unequal hand weights, one-hand and channel flags, per-channel weights
+    (``tests/test_casa_imaging_checks.py``). Returns ``expected_sumwt``, the
+    sum per spw, ``n_rows``, ``n_samples`` and ``weight_column``.
+    """
+    _require_casa()
+    from .solint import PARALLEL_HANDS
+
+    fid = _field_id_for(vis, field)
+    dd_spw = _casa_column_reader(vis + "/DATA_DESCRIPTION", "SPECTRAL_WINDOW_ID")
+    dd_pol = _casa_column_reader(vis + "/DATA_DESCRIPTION", "POLARIZATION_ID")
+    tb = casatools.table()
+    tb.open(vis + "/POLARIZATION")
+    try:
+        corr = [np.asarray(tb.getcell("CORR_TYPE", i)).ravel() for i in range(tb.nrows())]
+    finally:
+        tb.close()
+    total = 0.0
+    per_spw: Dict[int, float] = {}
+    n_rows = n_samples = 0
+    used = set()
+    tb.open(vis)
+    try:
+        cols = tb.colnames()
+        for dd in range(len(dd_spw)):
+            par = [i for i, c in enumerate(corr[int(dd_pol[dd])]) if int(c) in PARALLEL_HANDS][:2]
+            if not par:                         # no parallel hand: no Stokes I sample
+                continue
+            query = f"DATA_DESC_ID=={dd} && ANTENNA1!=ANTENNA2 && !FLAG_ROW"
+            if fid is not None:
+                query += f" && FIELD_ID=={fid}"
+            spw = int(dd_spw[dd])
+            for q, wcol in weight_column_queries(cols, query):
+                sub = tb.query(q, columns=f"FLAG,{wcol}")
+                try:
+                    nrow = sub.nrows()
+                    if nrow == 0:
+                        continue
+                    used.add(wcol)
+                    npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
+                    chunk = max(1, chunk_samples // max(1, npol * nchan))
+                    for start in range(0, nrow, chunk):
+                        nr = min(chunk, nrow - start)
+                        f = np.asarray(sub.getcol("FLAG", start, nr), dtype=bool)
+                        ok = ~f[par[0]] & ~f[par[-1]]           # (nchan, nrow): both hands unflagged
+                        w = np.asarray(sub.getcol(wcol, start, nr), dtype=np.float64)
+                        ww = w[par[0]] + w[par[1]] if len(par) == 2 else w[par[0]]
+                        if ww.ndim == 1:                        # WEIGHT: the same for every channel
+                            s_chunk = float(np.sum(ww * ok.sum(axis=0)))
+                        else:
+                            s_chunk = float(np.sum(ww[ok]))
+                        total += s_chunk
+                        per_spw[spw] = per_spw.get(spw, 0.0) + s_chunk
+                        n_rows += nr
+                        n_samples += int(ok.sum())
+                finally:
+                    sub.close()
+    finally:
+        tb.close()
+    return {"expected_sumwt": total, "per_spw": {str(k): v for k, v in sorted(per_spw.items())},
+            "n_rows": n_rows, "n_samples": n_samples,
+            "weight_column": (" and ".join(sorted(used)) + (" (per row)" if len(used) > 1 else "")
+                              if used else None),
+            "rule": ("sum over the cross-correlation rows without FLAG_ROW and the channels where "
+                     "both parallel hands are unflagged of w_p + w_q (WEIGHT_SPECTRUM where "
+                     "defined, else WEIGHT) = tclean's natural-weighting Stokes I sumwt")}
+
+
+def read_vis_summary(vis: str, field: Optional[str] = None, band_halves: bool = False,
+                     chunk_samples: int = _CHUNK_SAMPLES):
+    """Read DATA, MODEL_DATA, WEIGHT and FLAG of a field once into an ``ajisai.solint.VisSummary``.
+
+    Spec (ASEBI v0.3): 10.2 item 14 (the held-out evaluation reads the four
+    columns once and solves in numpy), C.2.
+
+    Cross-correlations of the field only; per row the sums of
+    :func:`ajisai.solint.reduce_visibilities` over the parallel hands
+    (WEIGHT_SPECTRUM on the rows where it is defined, else WEIGHT:
+    :func:`weight_column_queries`), the UV
+    distance (m), the INTERVAL, the row's weight in gaincal's solution time
+    (``W`` of the reduction) and, with ``band_halves=True``, the sums over
+    the lower and upper half of each spw's channels. Rows without any valid
+    sample are dropped; the first and last TIME of every (observation, scan)
+    are taken over all its rows before that, fully flagged rows included
+    (``VisSummary.scan_bounds``: gaincal's time grid starts at the first
+    row of the scan; ASEBI SPEC 4 item 4, D38 e). The table is opened
+    read-only.
+    """
+    _require_casa()
+    from .solint import VisSummary, reduce_visibilities
+
+    fid = _field_id_for(vis, field)
+    dd_spw = _casa_column_reader(vis + "/DATA_DESCRIPTION", "SPECTRAL_WINDOW_ID")
+    dd_pol = _casa_column_reader(vis + "/DATA_DESCRIPTION", "POLARIZATION_ID")
+    names = [str(n) for n in _casa_column_reader(vis + "/ANTENNA", "NAME")]
+    tb = casatools.table()
+    tb.open(vis + "/POLARIZATION")
+    try:
+        corr = [np.asarray(tb.getcell("CORR_TYPE", i)).ravel() for i in range(tb.nrows())]
+    finally:
+        tb.close()
+    parts: Dict[str, List[np.ndarray]] = {k: [] for k in (
+        "time", "obs", "scan", "spw", "a1", "a2", "y", "P", "S", "uv", "yh", "Ph", "iv", "w")}
+    bounds: Dict[Tuple[int, int], Tuple[float, float]] = {}
+    tb.open(vis)
+    try:
+        cols = tb.colnames()
+        if "MODEL_DATA" not in cols:
+            raise RuntimeError(f"{vis} has no MODEL_DATA column; predict the model first")
+        queries = []
+        for dd in range(len(dd_spw)):
+            query = f"DATA_DESC_ID=={dd} && ANTENNA1!=ANTENNA2"
+            if fid is not None:
+                query += f" && FIELD_ID=={fid}"
+            queries += [(dd, q, wcol) for q, wcol in weight_column_queries(cols, query)]
+        for dd, query, wcol in queries:
+            sub = tb.query(query)
+            try:
+                nrow = sub.nrows()
+                if nrow == 0:
+                    continue
+                npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
+                chunk = max(1, chunk_samples // max(1, npol * nchan))
+                ctypes = corr[int(dd_pol[dd])]
+                for start in range(0, nrow, chunk):
+                    nr = min(chunk, nrow - start)
+                    red = reduce_visibilities(
+                        sub.getcol("DATA", start, nr), sub.getcol("MODEL_DATA", start, nr),
+                        sub.getcol("FLAG", start, nr), sub.getcol(wcol, start, nr),
+                        sub.getcol("FLAG_ROW", start, nr), ctypes,
+                        halves=band_halves and nchan >= 2)
+                    keep = red["n_valid"] > 0
+                    uvw = sub.getcol("UVW", start, nr)
+                    t_all = sub.getcol("TIME", start, nr)
+                    o_all = sub.getcol("OBSERVATION_ID", start, nr)
+                    s_all = sub.getcol("SCAN_NUMBER", start, nr)
+                    _update_scan_bounds(bounds, o_all, s_all, t_all)
+                    parts["time"].append(t_all[keep])
+                    parts["obs"].append(o_all[keep])
+                    parts["scan"].append(s_all[keep])
+                    parts["iv"].append(sub.getcol("INTERVAL", start, nr)[keep])
+                    parts["w"].append(red["W"][keep])
+                    parts["spw"].append(np.full(int(keep.sum()), int(dd_spw[dd])))
+                    parts["a1"].append(sub.getcol("ANTENNA1", start, nr)[keep])
+                    parts["a2"].append(sub.getcol("ANTENNA2", start, nr)[keep])
+                    parts["y"].append(red["y"][keep])
+                    parts["P"].append(red["P"][keep])
+                    parts["S"].append(red["S"][keep])
+                    parts["uv"].append(np.hypot(uvw[0], uvw[1])[keep])
+                    if band_halves:
+                        if "y_half" not in red:
+                            raise RuntimeError(f"spw {int(dd_spw[dd])} of {vis} has one channel; "
+                                               f"the band cannot be split into halves")
+                        parts["yh"].append(red["y_half"][:, keep])
+                        parts["Ph"].append(red["P_half"][:, keep])
+            finally:
+                sub.close()
+    finally:
+        tb.close()
+    cat = {k: (np.concatenate(v, axis=-1) if v else np.zeros(0)) for k, v in parts.items()}
+    order = np.lexsort((cat["time"], cat["a2"], cat["a1"], cat["spw"], cat["obs"]))
+
+    def pick(x):
+        return x[..., order] if x.ndim == 2 else x[order]
+
+    return VisSummary(
+        time=cat["time"][order], obs=cat["obs"][order], scan=cat["scan"][order],
+        spw=cat["spw"][order], a1=cat["a1"][order], a2=cat["a2"][order], y=cat["y"][order],
+        P=cat["P"][order], antenna_names=names, S=cat["S"][order], uvdist_m=cat["uv"][order],
+        y_half=pick(cat["yh"]) if band_halves else None,
+        P_half=pick(cat["Ph"]) if band_halves else None, source=str(vis),
+        interval=cat["iv"][order], w=cat["w"][order], scan_bounds=bounds)
+
+
+def _update_scan_bounds(bounds: Dict[Tuple[int, int], Tuple[float, float]], obs, scan, time) -> None:
+    """Widen the (first, last) TIME of every (observation, scan) by the given rows."""
+    obs = np.asarray(obs)
+    scan = np.asarray(scan)
+    time = np.asarray(time, dtype=float)
+    if time.size == 0:
+        return
+    keys = np.stack([obs, scan])
+    uk, inv = np.unique(keys, axis=1, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    lo = np.full(uk.shape[1], np.inf)
+    hi = np.full(uk.shape[1], -np.inf)
+    np.minimum.at(lo, inv, time)
+    np.maximum.at(hi, inv, time)
+    for j in range(uk.shape[1]):
+        k = (int(uk[0, j]), int(uk[1, j]))
+        if k in bounds:
+            lo_j, hi_j = bounds[k]
+            bounds[k] = (min(lo_j, float(lo[j])), max(hi_j, float(hi[j])))
+        else:
+            bounds[k] = (float(lo[j]), float(hi[j]))
+
+
 def get_antenna_positions(vis: str) -> Dict[str, np.ndarray]:
     """Return ``{antenna_name: np.array([x, y, z])}`` from the ANTENNA table."""
     _require_casa()
@@ -961,7 +1197,444 @@ def pick_cell_imsize(
 
 
 # ============================================================================
-# Coordinate utilities (replace rad2radec and ICRSToJ2000 via astropy)
+# Sky directions: parsing, formatting, frame conversion, FIELD/SOURCE writes
+# ============================================================================
+# CASA reads a ':'-separated declination as a time: '-24:12:23.0' becomes
+# -363.1 deg, i.e. Dec -3.1 deg, without any message. AJISAI therefore parses
+# every user coordinate itself (RA in hours, Dec in degrees, whatever the
+# separators) and passes CASA only radian strings ('ICRS 4.25rad -0.42rad').
+# Frames are converted with casatools.measures, never with astropy: astropy's
+# FK5 uses other frame-tie constants (USNO Circular 179) and differs from
+# CASA's J2000 (the IAU 2000 frame bias) by 20-25 mas.
+
+#: Frames in which AJISAI converts and writes directions. ICRS <-> J2000 is a
+#: fixed rotation (the frame bias, at most about 23 mas); frames that need an
+#: epoch or an observatory position are refused rather than guessed.
+SKY_FRAMES = ("ICRS", "J2000")
+
+_TWO_PI = 2.0 * math.pi
+_MAS_PER_RAD = ARCSEC_PER_RAD * 1e3
+
+_RA_PATTERNS = (
+    re.compile(r"^(\d{1,2}):(\d{1,2}):(\d{1,2}(?:\.\d*)?)$"),
+    re.compile(r"^(\d{1,2})h\s*(\d{1,2})m\s*(\d{1,2}(?:\.\d*)?)s?$", re.IGNORECASE),
+    re.compile(r"^(\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d*)?)$"),
+)
+_DEC_PATTERNS = (
+    re.compile(r"^(\d{1,3}):(\d{1,2}):(\d{1,2}(?:\.\d*)?)$"),
+    re.compile(r"^(\d{1,3})\.(\d{1,2})\.(\d{1,2}(?:\.\d*)?)$"),
+    re.compile(r"^(\d{1,3})d\s*(\d{1,2})m\s*(\d{1,2}(?:\.\d*)?)s?$", re.IGNORECASE),
+    re.compile(r"^(\d{1,3})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d*)?)$"),
+)
+_UNIT_ANGLE = re.compile(r"^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(rad|deg)$",
+                         re.IGNORECASE)
+
+
+def _angle_with_unit(text: str) -> Optional[float]:
+    """Radians of an angle written with an explicit unit ('4.21rad', '241.4deg'); else None."""
+    m = _UNIT_ANGLE.match(text)
+    if m is None:
+        return None
+    value = float(m.group(1))
+    return math.radians(value) if m.group(2).lower() == "deg" else value
+
+
+def parse_ra(text: str) -> float:
+    """Right ascension string -> radians in [0, 2 pi).
+
+    Sexagesimal RA is in hours: ``'HH:MM:SS.s'``, ``'HHhMMmSS.ss'`` or
+    ``'HH MM SS.s'``. An angle with a unit (``'241.4deg'``, ``'4.21rad'``) is
+    also accepted. ``'.'``-separated RA is refused (CASA would read it as
+    degrees).
+    """
+    s = str(text).strip()
+    value = _angle_with_unit(s)
+    if value is not None:
+        return value % _TWO_PI
+    body = s[1:].strip() if s.startswith("+") else s
+    for pattern in _RA_PATTERNS:
+        m = pattern.match(body)
+        if m is None:
+            continue
+        h, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if h >= 24 or mi >= 60 or sec >= 60.0:
+            raise ValueError(f"right ascension {text!r} out of range (HH < 24, MM < 60, SS < 60)")
+        return math.radians(15.0 * (h + mi / 60.0 + sec / 3600.0))
+    raise ValueError(
+        f"cannot parse right ascension {text!r}; give hours as 'HH:MM:SS.s', "
+        f"'HHhMMmSS.ss' or 'HH MM SS.s', or an angle with a unit ('241.4deg', '4.21rad')"
+    )
+
+
+def parse_dec(text: str) -> float:
+    """Declination string -> radians in [-pi/2, pi/2].
+
+    Sexagesimal Dec is always in degrees, whichever separators are used:
+    ``'-24:12:23.0'``, ``'-24.12.23.0'`` (CASA's form), ``'-24d12m23.0s'`` or
+    ``'-24 12 23.0'``. An angle with a unit (``'-24.2064deg'``,
+    ``'-0.4225rad'``) is also accepted; a bare decimal number is refused
+    (its unit would be a guess).
+    """
+    s = str(text).strip()
+    value = _angle_with_unit(s)
+    if value is not None:
+        if abs(value) > math.pi / 2.0:
+            raise ValueError(f"declination {text!r} out of range (|Dec| <= 90 deg)")
+        return value
+    sign = 1.0
+    body = s
+    if body[:1] in ("+", "-"):
+        sign = -1.0 if body[0] == "-" else 1.0
+        body = body[1:].strip()
+    for pattern in _DEC_PATTERNS:
+        m = pattern.match(body)
+        if m is None:
+            continue
+        d, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        deg = d + mi / 60.0 + sec / 3600.0
+        if mi >= 60 or sec >= 60.0 or deg > 90.0:
+            raise ValueError(f"declination {text!r} out of range (|Dec| <= 90, MM < 60, SS < 60)")
+        return sign * math.radians(deg)
+    raise ValueError(
+        f"cannot parse declination {text!r}; give degrees as 'DD:MM:SS.s', 'DD.MM.SS.s', "
+        f"'DDdMMmSS.ss' or 'DD MM SS.s', or an angle with a unit ('-24.2deg', '-0.42rad')"
+    )
+
+
+def parse_ra_dec(ra: str, dec: str) -> Tuple[float, float]:
+    """(RA, Dec) strings -> radians: RA in hours, Dec in degrees.
+
+    See :func:`parse_ra` and :func:`parse_dec` for the accepted forms.
+    """
+    return parse_ra(ra), parse_dec(dec)
+
+
+def _sexagesimal_fields(value: float, precision: int) -> Tuple[int, int, int, int]:
+    """Whole units, minutes, seconds and the ``precision``-digit fraction of a value >= 0.
+
+    The value is rounded once, at the last printed digit, so that a carry
+    (59.9999996 s) propagates into the minutes and units.
+    """
+    scale = 10 ** int(precision)
+    total = int(round(value * 3600.0 * scale))
+    units, rem = divmod(total, 3600 * scale)
+    minutes, rem = divmod(rem, 60 * scale)
+    seconds, frac = divmod(rem, scale)
+    return units, minutes, seconds, frac
+
+
+def _seconds_text(seconds: int, frac: int, precision: int) -> str:
+    return f"{seconds:02d}" + (f".{frac:0{precision}d}" if precision > 0 else "")
+
+
+def format_ra(ra_rad: float, precision: int = 5, sep: str = ":") -> str:
+    """RA in radians -> ``'HH:MM:SS.sssss'`` (hours; ``precision`` decimals of seconds)."""
+    hours = (math.degrees(float(ra_rad)) % 360.0) / 15.0
+    h, m, s, f = _sexagesimal_fields(hours, precision)
+    return f"{h % 24:02d}{sep}{m:02d}{sep}{_seconds_text(s, f, precision)}"
+
+
+def format_dec(dec_rad: float, precision: int = 5, sep: str = ".") -> str:
+    """Dec in radians -> ``'+DD.MM.SS.sssss'`` (degrees; ``precision`` decimals of seconds).
+
+    The default ``'.'`` separators are the form CASA reads as an angle; with
+    ``':'`` CASA would read the declination as a time (hours).
+    """
+    deg = math.degrees(float(dec_rad))
+    sign = "-" if deg < 0 else "+"
+    d, m, s, f = _sexagesimal_fields(abs(deg), precision)
+    return f"{sign}{d:02d}{sep}{m:02d}{sep}{_seconds_text(s, f, precision)}"
+
+
+def casa_direction_string(frame: str, ra_rad: float, dec_rad: float) -> str:
+    """``'<frame> <ra>rad <dec>rad'`` with single spaces: the form AJISAI passes to CASA.
+
+    Radians with 15 decimals (1e-15 rad, far below a micro-arcsecond) leave
+    nothing to CASA's sexagesimal parser.
+    """
+    return f"{frame} {float(ra_rad):.15f}rad {float(dec_rad):.15f}rad"
+
+
+def _check_frame(frame: str) -> str:
+    f = str(frame).strip().upper()
+    if f not in SKY_FRAMES:
+        raise ValueError(f"direction frame {frame!r} is not supported; AJISAI converts and "
+                         f"writes directions only in {SKY_FRAMES}")
+    return f
+
+
+def convert_direction(ra_rad: float, dec_rad: float, frame_from: str,
+                      frame_to: str) -> Tuple[float, float]:
+    """The same physical direction in another frame (casatools.measures).
+
+    Frames are those of :data:`SKY_FRAMES`. Returns ``(ra, dec)`` in radians
+    with RA in [0, 2 pi). With equal frames the input is returned (RA
+    wrapped) without calling CASA.
+    """
+    f_in, f_out = _check_frame(frame_from), _check_frame(frame_to)
+    if f_in == f_out:
+        return float(ra_rad) % _TWO_PI, float(dec_rad)
+    _require_casa()
+    me = casatools.measures()
+    qa = casatools.quanta()
+    try:
+        m = me.measure(me.direction(f_in, qa.quantity(float(ra_rad), "rad"),
+                                    qa.quantity(float(dec_rad), "rad")), f_out)
+    finally:
+        me.done()
+    return float(m["m0"]["value"]) % _TWO_PI, float(m["m1"]["value"])
+
+
+def angular_offset_mas(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Great-circle distance between two directions in the same frame, in mas (haversine)."""
+    s = (math.sin((dec2 - dec1) / 2.0) ** 2
+         + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2.0) ** 2)
+    return 2.0 * math.asin(min(1.0, math.sqrt(s))) * _MAS_PER_RAD
+
+
+# --- Reference frames of MS direction columns ---------------------------------
+# A direction column carries a MEASINFO keyword. A fixed reference has
+# MEASINFO['Ref'] for the whole column; a variable reference (ALMA's FIELD
+# table) names an integer column in MEASINFO['VarRefCol'] whose codes map to
+# frame names through MEASINFO['TabRefTypes'] / ['TabRefCodes']. The codes are
+# read from that table, never assumed (0 = J2000 and 21 = ICRS in current
+# casacore, but the mapping belongs to the table).
+
+def frame_of_code(measinfo: Dict[str, Any], code: int) -> str:
+    """Frame name of a reference code through MEASINFO TabRefTypes/TabRefCodes.
+
+    A code listed twice (AZEL and AZELNE share one) maps to its first name.
+    """
+    types = [str(t) for t in measinfo.get("TabRefTypes", [])]
+    codes = [int(c) for c in measinfo.get("TabRefCodes", [])]
+    for t, c in zip(types, codes):
+        if c == int(code):
+            return t
+    raise ValueError(f"reference code {int(code)} is not in MEASINFO TabRefCodes")
+
+
+def code_of_frame(measinfo: Dict[str, Any], frame: str) -> int:
+    """Reference code of a frame name through MEASINFO TabRefTypes/TabRefCodes."""
+    types = [str(t) for t in measinfo.get("TabRefTypes", [])]
+    codes = [int(c) for c in measinfo.get("TabRefCodes", [])]
+    if frame not in types or len(codes) != len(types):
+        raise ValueError(f"frame {frame!r} is not in MEASINFO TabRefTypes")
+    return codes[types.index(frame)]
+
+
+def direction_frames(measinfo: Dict[str, Any], ref_codes=None,
+                     nrow: Optional[int] = None) -> List[str]:
+    """Per-row frame names of a direction column.
+
+    ``measinfo`` is the column's MEASINFO keyword. For a variable reference
+    (``'VarRefCol'`` present) ``ref_codes`` are the values of that column;
+    for a fixed reference every one of ``nrow`` rows has ``MEASINFO['Ref']``
+    (J2000 when absent, casacore's default).
+    """
+    if "VarRefCol" in measinfo:
+        if ref_codes is None:
+            raise ValueError(f"variable-reference column {measinfo['VarRefCol']!r}: "
+                             f"its codes are needed")
+        return [frame_of_code(measinfo, c) for c in np.asarray(ref_codes).ravel()]
+    if nrow is None:
+        raise ValueError("nrow is needed for a fixed-reference column")
+    return [str(measinfo.get("Ref", "J2000"))] * int(nrow)
+
+
+def _column_measinfo(tb, column: str) -> Dict[str, Any]:
+    keywords = tb.getcolkeywords(column) or {}
+    return dict(keywords.get("MEASINFO", {}))
+
+
+def _column_frames(tb, column: str) -> List[str]:
+    """Per-row frames of a direction column of an open casatools table."""
+    mi = _column_measinfo(tb, column)
+    if "VarRefCol" in mi:
+        return direction_frames(mi, ref_codes=tb.getcol(str(mi["VarRefCol"])))
+    return direction_frames(mi, nrow=tb.nrows())
+
+
+def field_direction_frame(vis: str, field_id: int, column: str = "PHASE_DIR") -> str:
+    """Frame of one FIELD row's direction column (per row for a variable reference)."""
+    _require_casa()
+    tb = casatools.table()
+    tb.open(vis + "/FIELD")
+    try:
+        return _column_frames(tb, column)[int(field_id)]
+    finally:
+        tb.close()
+
+
+def field_id_by_name(vis: str, name: str) -> int:
+    """FIELD_ID of the field called ``name``.
+
+    When several FIELD rows carry the name, the one with rows in MAIN is
+    returned; anything still ambiguous (or no match) raises ``ValueError``.
+    Used after tasks that may reindex FIELD (CASA 6.5 ``phaseshift`` with a
+    field selection renumbers the selected field from 0).
+    """
+    names = [str(n) for n in _casa_column_reader(vis + "/FIELD", "NAME")]
+    matches = [i for i, n in enumerate(names) if n == str(name)]
+    if len(matches) > 1:
+        present = set(int(x) for x in np.unique(_casa_column_reader(vis, "FIELD_ID")))
+        matches = [i for i in matches if i in present]
+    if len(matches) != 1:
+        raise ValueError(f"field {name!r} matches FIELD rows {matches} of {vis}; "
+                         f"expected exactly one")
+    return matches[0]
+
+
+_FIELD_DIRECTION_COLUMNS = ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR")
+
+
+def write_field_direction(ms: str, field_ids, ra_rad: float, dec_rad: float,
+                          frame: str) -> Dict[str, Any]:
+    """Write one direction into FIELD PHASE_DIR, DELAY_DIR, REFERENCE_DIR and SOURCE.DIRECTION.
+
+    The direction ``(ra_rad, dec_rad)`` in ``frame`` is converted with
+    casatools.measures into the frame of every cell it is written to: per row
+    for a variable-reference column (ALMA's ``PhaseDir_Ref`` etc., codes
+    mapped through MEASINFO TabRefTypes/TabRefCodes), the column's
+    ``MEASINFO['Ref']`` for a fixed one. No reference code or label is
+    changed, so the physical direction is exact in whatever frames the MS
+    uses. Higher-order polynomial terms (``NUM_POLY > 0``) are set to zero.
+
+    SOURCE rows are those of the SOURCE_IDs of ``field_ids``; a SOURCE_ID
+    that other FIELD rows (not rewritten) also use is left unchanged and
+    reported. Fields with an ephemeris (``EPHEMERIS_ID >= 0``) are refused.
+    UVW and the visibilities are not touched (this is the step after
+    ``phaseshift``, which shifts the data and computes UVW itself).
+
+    Returns a record of what was written (for the run's justification).
+    """
+    _require_casa()
+    target_frame = _check_frame(frame)
+    fids = [int(f) for f in field_ids]
+    record: Dict[str, Any] = {
+        "method": "ajisai.ms_utils.write_field_direction",
+        "field_ids": fids,
+        "target": {"frame": target_frame, "ra_rad": float(ra_rad), "dec_rad": float(dec_rad)},
+        "field": {},
+        "source": {"source_ids": [], "rows": [], "left_unchanged": {}},
+    }
+    cache: Dict[str, Tuple[float, float]] = {}
+
+    def in_frame(f: str) -> Tuple[float, float]:
+        if f not in cache:
+            cache[f] = convert_direction(ra_rad, dec_rad, target_frame, f)
+        return cache[f]
+
+    tb = casatools.table()
+    tb.open(ms + "/FIELD", nomodify=False)
+    try:
+        nrow = tb.nrows()
+        bad = [f for f in fids if not 0 <= f < nrow]
+        if bad:
+            raise ValueError(f"FIELD rows {bad} not in {ms}/FIELD ({nrow} rows)")
+        cols = tb.colnames()
+        if "EPHEMERIS_ID" in cols:
+            eph = tb.getcol("EPHEMERIS_ID")
+            moving = [f for f in fids if int(eph[f]) >= 0]
+            if moving:
+                raise ValueError(f"FIELD rows {moving} of {ms} use an ephemeris; a fixed "
+                                 f"direction cannot be written for them")
+        src_ids = [int(x) for x in tb.getcol("SOURCE_ID")]
+        num_poly = [int(x) for x in tb.getcol("NUM_POLY")] if "NUM_POLY" in cols else [0] * nrow
+        for col in _FIELD_DIRECTION_COLUMNS:
+            if col not in cols:
+                continue
+            frames = _column_frames(tb, col)
+            written: Dict[str, Any] = {}
+            for f in fids:
+                ra_f, dec_f = in_frame(frames[f])
+                cell = np.array(tb.getcell(col, f), dtype=float)
+                cell[:, :] = 0.0
+                cell[0, 0] = ra_f
+                cell[1, 0] = dec_f
+                tb.putcell(col, f, cell)
+                written[str(f)] = {"frame": frames[f], "ra_rad": ra_f, "dec_rad": dec_f}
+            record["field"][col] = written
+        record["num_poly_zeroed"] = [f for f in fids if num_poly[f] > 0]
+    finally:
+        tb.close()
+
+    wanted = sorted({src_ids[f] for f in fids if src_ids[f] >= 0})
+    others = {src_ids[g] for g in range(len(src_ids)) if g not in fids}
+    for sid in wanted:
+        if sid in others:
+            record["source"]["left_unchanged"][str(sid)] = (
+                "SOURCE_ID also used by FIELD rows that were not rewritten")
+    sids = [s for s in wanted if s not in others]
+    if not sids:
+        return record
+    if not os.path.isdir(ms + "/SOURCE"):
+        record["source"]["left_unchanged"]["all"] = "no SOURCE table"
+        return record
+    tb.open(ms + "/SOURCE", nomodify=False)
+    try:
+        if tb.nrows() == 0 or "DIRECTION" not in tb.colnames():
+            record["source"]["left_unchanged"]["all"] = "SOURCE has no rows or no DIRECTION"
+            return record
+        frames = _column_frames(tb, "DIRECTION")
+        sid_col = [int(x) for x in tb.getcol("SOURCE_ID")]
+        rows = [r for r, s in enumerate(sid_col) if s in sids]
+        for r in rows:
+            ra_s, dec_s = in_frame(frames[r])
+            cell = np.array(tb.getcell("DIRECTION", r), dtype=float)
+            cell[0] = ra_s
+            cell[1] = dec_s
+            tb.putcell("DIRECTION", r, cell)
+        record["source"]["source_ids"] = sids
+        record["source"]["rows"] = rows
+        record["source"]["frames"] = sorted({frames[r] for r in rows})
+    finally:
+        tb.close()
+    return record
+
+
+def field_direction_offsets(ms: str, field_id: int, ra_rad: float, dec_rad: float,
+                            frame: str) -> Dict[str, Any]:
+    """Offsets (mas) of a FIELD row's three directions and its SOURCE rows from a direction.
+
+    Every stored direction is converted from its own frame into ``frame``
+    with casatools.measures before the offset is taken. Read-only.
+    """
+    _require_casa()
+    target_frame = _check_frame(frame)
+    out: Dict[str, Any] = {"field": {}, "source": {}}
+    tb = casatools.table()
+    tb.open(ms + "/FIELD")
+    try:
+        sid = int(tb.getcell("SOURCE_ID", int(field_id)))
+        for col in _FIELD_DIRECTION_COLUMNS:
+            if col not in tb.colnames():
+                continue
+            fr = _column_frames(tb, col)[int(field_id)]
+            cell = np.asarray(tb.getcell(col, int(field_id)), dtype=float)
+            a, d = convert_direction(cell[0, 0], cell[1, 0], fr, target_frame)
+            out["field"][col] = angular_offset_mas(a, d, ra_rad, dec_rad)
+    finally:
+        tb.close()
+    if sid >= 0 and os.path.isdir(ms + "/SOURCE"):
+        tb.open(ms + "/SOURCE")
+        try:
+            if tb.nrows() and "DIRECTION" in tb.colnames():
+                frames = _column_frames(tb, "DIRECTION")
+                for r, s in enumerate(int(x) for x in tb.getcol("SOURCE_ID")):
+                    if s != sid:
+                        continue
+                    cell = np.asarray(tb.getcell("DIRECTION", r), dtype=float)
+                    a, d = convert_direction(cell[0], cell[1], frames[r], target_frame)
+                    out["source"][str(r)] = angular_offset_mas(a, d, ra_rad, dec_rad)
+        finally:
+            tb.close()
+    values = list(out["field"].values()) + list(out["source"].values())
+    out["max_mas"] = max(values) if values else None
+    return out
+
+
+# ============================================================================
+# Coordinate strings (replace rad2radec and ICRSToJ2000)
 # ============================================================================
 def rad_to_radec(
     ra_rad: float,
@@ -973,26 +1646,21 @@ def rad_to_radec(
     """Convert RA/Dec from radians to a sexagesimal string.
 
     Replaces analysisUtils.rad2radec when called with explicit ra/dec values.
-    Uses astropy for portable, well-tested coordinate formatting.
 
     Parameters
     ----------
     ra_rad, dec_rad : radians
-    hms_dms         : if True, output like 'HH:MM:SS.ss DD:MM:SS.ss';
-                      if False, output decimal degrees.
+    hms_dms         : if True, output like ``'HH:MM:SS.sssss +DD.MM.SS.sssss'``
+                      (RA in hours with ':' separators, Dec in degrees with
+                      '.' separators: CASA reads a ':'-separated declination
+                      as hours); if False, decimal degrees.
     delimiter       : separator between RA and Dec.
-    precision       : decimal places on seconds field.
+    precision       : decimal places on the seconds field (or on the degrees).
     """
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-
-    c = SkyCoord(ra=ra_rad * u.rad, dec=dec_rad * u.rad, frame="icrs")
     if hms_dms:
-        ra_str = c.ra.to_string(unit=u.hour, sep=":", precision=precision, pad=True)
-        dec_str = c.dec.to_string(unit=u.deg, sep=":", precision=precision,
-                                  pad=True, alwayssign=True)
-        return f"{ra_str}{delimiter}{dec_str}"
-    return f"{c.ra.deg:.{precision}f}{delimiter}{c.dec.deg:.{precision}f}"
+        return f"{format_ra(ra_rad, precision)}{delimiter}{format_dec(dec_rad, precision)}"
+    ra_deg = math.degrees(float(ra_rad)) % 360.0
+    return f"{ra_deg:.{precision}f}{delimiter}{math.degrees(float(dec_rad)):.{precision}f}"
 
 
 def rad_to_radec_from_imfit(
@@ -1007,7 +1675,8 @@ def rad_to_radec_from_imfit(
     Replaces ``analysisUtils.rad2radec(imfitdict=...)`` usage in the
     original AJISAI script. The imfit dict structure is
     ``imfitdict['deconvolved']['component0']['shape']['direction']``
-    with ``m0`` = RA (radians) and ``m1`` = Dec (radians).
+    with ``m0`` = RA (radians) and ``m1`` = Dec (radians). The string has
+    the layout of :func:`rad_to_radec` (Dec with '.' separators).
     """
     comp = imfitdict["deconvolved"][f"component{component}"]
     direction = comp["shape"]["direction"]
@@ -1021,10 +1690,9 @@ def _sexagesimal_to_colon(token: str) -> str:
     """Normalise a single sexagesimal token to ':'-separated form.
 
     CASA / analysisUtils declination strings use '.' as the *field*
-    separator, e.g. ``-34.17.38.348`` (= -34d 17m 38.348s). astropy cannot
-    parse that directly, so convert the field separators to ':' while
-    preserving the fractional seconds. RA tokens (already ':'-separated) and
-    unrecognised tokens are returned unchanged for astropy to handle.
+    separator, e.g. ``-34.17.38.348`` (= -34d 17m 38.348s). Convert the field
+    separators to ':' while preserving the fractional seconds. RA tokens
+    (already ':'-separated) and unrecognised tokens are returned unchanged.
     """
     if ":" in token:
         return token
@@ -1037,7 +1705,7 @@ def _sexagesimal_to_colon(token: str) -> str:
     elif len(fields) == 4:        # DD.MM.SS.ffff  -> seconds = SS.ffff
         d, m, s = fields[0], fields[1], f"{fields[2]}.{fields[3]}"
     else:
-        return token             # unknown layout; let astropy try as-is
+        return token             # unknown layout; left to the caller's parser
     return f"{sign}{d}:{m}:{s}"
 
 
@@ -1048,10 +1716,11 @@ def _split_radec(coord_str: str) -> tuple:
 
     * CASA / analysisUtils form ``'HH:MM:SS.s DD.MM.SS.s'`` -- RA uses ':'
       separators, Dec uses '.' separators. This is what ``imstat`` /
-      ``au.rad2radec`` emit and is the layout AJISAI actually feeds in.
+      ``au.rad2radec`` emit.
     * Space-separated form ``'HH MM SS.s DD MM SS.s'`` (6 whitespace tokens).
 
-    Both are returned with ':'-separated RA and Dec so astropy can parse them.
+    Both are returned ':'-separated; :func:`parse_dec` reads the
+    declination as degrees.
     """
     tokens = coord_str.split()
     if len(tokens) == 2:
@@ -1064,35 +1733,32 @@ def _split_radec(coord_str: str) -> tuple:
     )
 
 
-def icrs_to_j2000(coord_str: str) -> str:
-    """Convert an ICRS sexagesimal coordinate string to J2000 (FK5).
+def icrs_to_j2000(coord_str: str, precision: int = 7) -> str:
+    """Convert an ICRS sexagesimal coordinate string to J2000 as CASA defines it.
 
-    Replaces analysisUtils.ICRSToJ2000. Uses astropy. The two frames share
-    the same origin at epoch J2000.0, so the on-sky position is unchanged and
-    the returned coordinate label is numerically almost identical to the
-    input; AJISAI uses this for CASA's ``fixplanets`` / ``phasecenter``
-    arguments, which need an explicit J2000 label.
+    Replaces analysisUtils.ICRSToJ2000. The conversion is
+    ``casatools.measures`` ICRS -> J2000, i.e. the IAU 2000 frame bias that
+    CASA applies whenever it relates the two frames: a fixed rotation, so the
+    returned numbers differ from the input by up to about 23 mas while the
+    direction is the same. astropy's FK5 is not used: its frame-tie
+    constants (USNO Circular 179) differ from CASA's J2000 by 20-25 mas.
 
     Input may be either the CASA / analysisUtils layout
     ``'HH:MM:SS.s DD.MM.SS.s'`` (RA ':'-separated, Dec '.'-separated -- the
     format emitted by ``imstat``'s ``maxposf`` and ``au.rad2radec``) or the
-    space-separated ``'HH MM SS.s DD MM SS.s'`` layout.
+    space-separated ``'HH MM SS.s DD MM SS.s'`` layout; the declination is
+    read as degrees in either case.
 
-    The output preserves the CASA convention: RA with ':' separators and Dec
-    with '.' separators (e.g. ``'15:45:06.32 -34.17.38.34'``). This matters
-    because CASA interprets ':' in a declination as a time (hours) value, so
-    Dec must use '.' separators to be parsed as an angle downstream.
+    The output keeps the CASA convention: RA with ':' separators and Dec
+    with '.' separators (e.g. ``'15:45:06.3210123 -34.17.38.3341234'``), with
+    ``precision`` decimals of seconds (the default 7 keeps the string within
+    2 micro-arcseconds of the conversion). The '.' matters because CASA
+    interprets ':' in a declination as a time (hours). Requires CASA.
     """
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-
     ra_str, dec_str = _split_radec(coord_str)
-    c_icrs = SkyCoord(ra=ra_str, dec=dec_str, unit=(u.hourangle, u.deg), frame="icrs")
-    c_j2000 = c_icrs.transform_to("fk5")  # FK5 J2000.0
-    ra_out = c_j2000.ra.to_string(unit=u.hour, sep=":", precision=5, pad=True)
-    dec_out = c_j2000.dec.to_string(unit=u.deg, sep=".", precision=5,
-                                    pad=True, alwayssign=True)
-    return f"{ra_out} {dec_out}"
+    ra, dec = parse_ra_dec(ra_str, dec_str)
+    ja, jd = convert_direction(ra, dec, "ICRS", "J2000")
+    return f"{format_ra(ja, precision)} {format_dec(jd, precision)}"
 
 
 # ============================================================================

@@ -95,15 +95,20 @@ and rationale in the commit body when the summary is not enough.
 
 ## Design policy
 
-AJISAI's first principles are a **deterministic, fixed self-calibration
-schedule** and **explainability through `justification.json`**. Every
+AJISAI's first principles are **deterministic decisions from measured
+quantities** and **explainability through `justification.json`**. Every
 parameter choice is recorded with its rationale, and the same input must
-produce the same sequence of steps, independent of run order.
+produce the same sequence of steps, independent of run order. Since v0.3
+the self-calibration stages are decided by fixed rules (ASEBI specification
+v0.3, section 10.2) applied to quantities measured in the data, and every
+decision is checked on data the gains were not solved from.
 
-For this reason, **we do not accept proposals that add adaptive rollback or
-heuristic decision-making** (for example, reverting an iteration or changing
-the schedule based on intermediate results). Pull requests and feature
-requests of this kind will be closed.
+For this reason, **we do not accept proposals that add heuristic
+decision-making**: thresholds without a derivation from the data or from
+AJISAI's own precision, or decisions taken on the data the gains were solved
+from (peak SNR or dynamic range of the self-calibrated image, for example).
+Changes to the rules themselves are made together with the specification
+they come from.
 
 Contributions that fit the design are welcome, for example:
 
@@ -111,7 +116,7 @@ Contributions that fit the design are welcome, for example:
 - Better data-derived defaults, provided the derivation is deterministic and
   recorded in `justification.json`.
 - Additional diagnostics, documentation, tests, and tutorials.
-- Support for additional data layouts that the fixed schedule can handle.
+- Support for additional data layouts that the rules can handle.
 
 AI-assisted contributions are welcome, provided the contributor has reviewed
 and tested the code and discloses the assistance in the PR description. The

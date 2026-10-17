@@ -5,6 +5,16 @@ public ALMA dataset of the protoplanetary disk TW Hya, observed at Band 7
 (~372 GHz) with the ALMA 12 m array under
 [Project 2011.0.00340.S](https://almascience.eso.org/aq/?result_view=observation).
 
+```{note}
+The run log, figures and numbers on this page were made with AJISAI v0.2.1,
+whose default was the fixed schedule (three phase + one amplitude
+iterations, best by dynamic range). In v0.3 that schedule is
+`SelfcalSchedule(mode="fixed")`; the default `mode="data"` decides the
+phase stages and their solution intervals from the data (see
+[Design](../design.md)), so a v0.3 run prints a different log. The page will
+be regenerated with v0.3.
+```
+
 By the end of this tutorial you will have:
 
 - Downloaded and pre-processed the calibrated MS,

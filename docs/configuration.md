@@ -2,8 +2,9 @@
 
 AJISAI's behavior is controlled by a hierarchy of frozen dataclasses. The
 top-level container is [`AJISAIConfig`](#ajisaiconfig), which composes
-sub-configs for imaging, gain calibration, the self-cal schedule, and the
-diagnostic figures.
+sub-configs for imaging, gain calibration, the self-cal stages
+(data-driven by default, a fixed ladder as an option), and the diagnostic
+figures.
 
 Pattern:
 
@@ -68,17 +69,32 @@ the lines you need.
 :   Manual phase-center override. When provided alongside
     `phase_shift=True`, AJISAI uses these coordinates instead of
     auto-detecting from the dirty image. Form: `(ra, dec, frame)`,
-    where `frame` is `"ICRS"` or `"J2000"`. Example:
+    where `frame` is `"ICRS"` or `"J2000"`. RA is read as hours and Dec
+    as degrees, whichever separators are used (`:`, `.`, `h m s` /
+    `d m s`, or spaces); an angle with a unit (`"241.4deg"`, `"-0.42rad"`)
+    is also accepted. Examples:
 
     ```python
     phase_center=("16:25:45.0", "-24:12:23.0", "ICRS")
+    phase_center=("16h25m45.0s", "-24d12m23.0s", "J2000")
     ```
 
+    The strings are converted to radians when the configuration is
+    validated, and CASA receives only radians: CASA itself would read a
+    `:`-separated declination as a time (`-24:12:23.0` as -363.1 deg, i.e.
+    Dec -3.1 deg).
+
     :::{note}
-    `casatasks.fixplanets` only supports `"J2000"`, so AJISAI converts
-    `"ICRS"` inputs to J2000 via astropy before calling fixplanets and
-    restores the MS frame label to ICRS afterwards. This is transparent
-    to the user.
+    How the shift is done: the target is converted (with
+    `casatools.measures`) into the frame of the field's `PHASE_DIR` in the
+    working MS, `phaseshift` shifts the data and computes UVW, and then
+    FIELD `PHASE_DIR`, `DELAY_DIR`, `REFERENCE_DIR` and `SOURCE.DIRECTION`
+    are written with the target, each converted into its own frame
+    (`ajisai.ms_utils.write_field_direction`). `fixplanets` is not used
+    and no frame label is changed, so the result is exact (well below
+    0.01 mas) for ICRS data and for genuine J2000 data alike. The
+    read-back offsets are recorded in `justification.json`
+    (`derived.phase_shift.readback_offset_mas`).
     :::
 
 ### Strategy switches
@@ -120,15 +136,17 @@ the lines you need.
     is recorded in `justification.json` with the RMS of every image.
 
 `quality_metric: str = "dynamic_range"`
-:   How AJISAI picks the best iteration at the end. Default is
-    `dynamic_range = peak / RMS_offsource`, which is more robust than
-    peak SNR for detecting over-cleaning.
+:   How AJISAI picks the best iteration with `SelfcalSchedule(mode="fixed")`:
+    `"dynamic_range"` (peak / RMS_offsource) or `"peak_snr"`. With the
+    default `mode="data"` the best stage is the last accepted one and these
+    image statistics are recorded as diagnostics only: they are measured on
+    the data the gains were solved from, which always favours the shortest
+    solution interval.
 
 `on_iter_anomaly: str = "log_only"`
 :   What to do when an iteration looks anomalous (e.g. DR drop > 50%).
     Currently only `"log_only"` is implemented: anomalies are recorded
-    in the justification log but do NOT alter pipeline flow. This
-    preserves AJISAI's deterministic-fixed-schedule identity.
+    in the justification log but do NOT alter pipeline flow.
 
 ### Data hygiene
 
@@ -136,8 +154,14 @@ the lines you need.
 :   AJISAI never writes to the input MS. When this is `True` and the input
     carries J2000 frame codes, a copy (`intermediate/input_icrs.ms`) is
     relabelled J2000 -> ICRS (the frame code only; coordinates are not
-    converted) and used as the working MS, as v0.2 did in place. `False`
-    keeps the input frame (the input is then read directly).
+    converted) and used as the working MS, but only for ALMA data observed
+    before Cycle 3 (2015-10-01), whose J2000 label sits on ICRS numbers
+    (ALMA knowledgebase). Any other J2000 label (not ALMA, observed on or
+    after 2015-10-01, or with an unknown start) is genuine J2000: it is
+    kept, the input is read directly, and AJISAI warns and records why
+    (`derived.working_vis.relabel_caveat`); relabelling genuine J2000
+    numbers as ICRS would move them by the frame bias (up to about 23 mas).
+    `False` never relabels. Same rule as ASEBI (SPEC 4.1 item 10).
 
 `caller: str = "user"`
 :   Who drives the run: `"user"` (standalone) or `"asebi"` (the ASEBI
@@ -195,7 +219,9 @@ the lines you need.
     is made once, from the best iteration's data (`final_selfcal.ms`), and
     its CLEAN continues step by step (no new PSF) until the flux in the
     aperture has converged: after each step, `F_corr = F_model + F_unc` with
-    `F_unc = sum(residual)/Omega_R`; the CLEAN stops when
+    `F_unc = sum(residual)/Omega_R` (Omega_R: the dirty beam over the
+    aperture's shape) and `sigma_F = sigma sqrt(N_pix Omega_beam)/Omega_R`
+    (sigma: the residual rms outside the aperture); the CLEAN stops when
     `|F_unc| <= max(3 sigma_F, 0.01 F_corr)` or when `F_corr` changed by no
     more than that width since the previous step. A warning is issued if
     the last step is reached without convergence, and if the restored image
@@ -237,8 +263,11 @@ the lines you need.
 
 `reffreq: Optional[str] = None`
 :   Reference frequency of the Taylor expansion, e.g. `"227.0GHz"`, passed
-    to every tclean. `None` uses CASA's default (the middle of the
-    frequency range); the value used is recorded with each solve.
+    to every mtmfs tclean (`nterms > 1`); nterms = 1 images and the dirty
+    image are made without it, so that their frequency axis is the data's
+    band (tclean centres the axis on reffreq). `None` uses CASA's default
+    (the middle of the frequency range); the value used is recorded with
+    each solve.
 
 ### Image geometry
 
@@ -267,11 +296,17 @@ the lines you need.
 
 `scales: Optional[Tuple[int, ...]] = None`
 :   Multiscale scales in pixels for every multiscale/mtmfs tclean. `None`:
-    `0, b, 3b, 9b, ...` with `b` the dirty-image beam FWHM in pixels, up to
-    the largest scale whose support (radius = scale) fits inside the user
-    mask region (`mask_mode="user"`), i.e. half the region size for a round
-    region; without a user mask, `0, b, 3b`. Larger scales would be ignored
-    by CASA ("too large to fit within the mask").
+    `[0, 1, 3] x b` with `b` the dirty-image beam FWHM in pixels. Which
+    scales serve a source best depends on its structure; a caller that knows
+    the source gives its own (e.g. `ajisai.core.multiscale_scales`, the ladder
+    `0, b, 3b, 9b, ...` up to the largest scale that fits a mask region; CASA
+    ignores scales too large for the mask). Then, given or derived,
+    every scale whose scale-PSF (the dirty PSF convolved twice with CASA's
+    component) does not peak at the component's own position is dropped:
+    the uv coverage has no baseline short enough to see it, and when its
+    largest sidelobe is negative CASA's multiscale minor cycle refuses to
+    start and the CLEAN leaves no component. Dropped scales are recorded
+    (`derived.scales.psf_check`); a dropped given scale is warned about.
 
 ### Masking
 
@@ -327,15 +362,29 @@ the lines you need.
     are discarded; the corresponding visibilities are preserved unflagged
     because AJISAI uses `applymode="calonly"`. (v0.2: 1.5.) The fraction of
     flagged solutions per observation and spw is recorded for every
-    iteration.
+    iteration. With `SelfcalSchedule(mode="data")` this is only the floor:
+    the gate is G1, a predicted true SNR of 5 per antenna and solution, and
+    the solutions below it are flagged in the table after gaincal. Do not
+    raise `minsnr` to 5: gaincal's SNR column scatters, so near the gate it
+    would flag about half of the solutions, and with linear interpolation a
+    flagged solution removes the correction from the whole span between its
+    good neighbours.
 
 `gaintype: str = "T"`
 :   gaincal gain type. `"T"` averages parallel-hand polarizations for
-    improved SNR; `"G"` solves them independently.
+    improved SNR; `"G"` solves them independently. `mode="data"` requires
+    `"T"`.
 
 `combine: str = "scan"`
-:   Solutions are combined across scan boundaries (within a solution
-    interval).
+:   With `mode="fixed"`: passed to gaincal (solutions are combined across
+    scan boundaries within a solution interval). With `mode="data"` the time
+    combination is chosen per stage (`"scan"` for one solution per EB, none
+    for the scan and shorter intervals); only `"spw"` is taken from here:
+    `combine="scan,spw"` solves all spws together, and AJISAI derives the
+    applycal spwmap from the spw labels gaincal wrote in the table, per
+    observation (all rows, flagged solutions included); when no single map
+    serves every observation, applycal runs per observation (ASEBI SPEC 9
+    item 3, D38 d).
 
 `gaincal_interp: str = "linear,linear"`
 :   Interpolation in time and frequency for the gain table.
@@ -344,12 +393,21 @@ the lines you need.
 :   Interpolation for applycal. `"linearPD"` preserves phase unwrapping;
     `perobs` keeps the time interpolation from crossing an observation
     (execution block) boundary of a concatenated MS. CASA ignores `perobs`
-    (with a log warning) when the table has one observation.
+    (with a log warning) when the table has one observation. `mode="data"`
+    requires a linear interpolation: its predictions and held-out
+    evaluation model applycal's linear interpolation between solutions. A
+    stage switches to the nearest form of this string (`nearestPDperobs`)
+    only when adjacent solutions differ by more than 1 rad rms
+    (`2 D_eff > 1 rad^2`) and nearest interpolation beats linear at the
+    chosen interval on held-out integrations by more than 2 sigma.
 
 `applymode: str = "calonly"`
 :   applycal mode. `"calonly"` ensures that flagged solutions do NOT
     propagate to flagging the visibilities themselves — important for
-    preserving data on low-SNR antennas.
+    preserving data on low-SNR antennas. Required by `mode="data"`: the
+    solutions below the G1 gate are flagged so that those antennas keep the
+    previous stage's correction (a flagged solution is not interpolated:
+    the span between its good neighbours passes uncorrected).
 
 `calwt: bool = False`
 :   Calibrate the weights when applying. `False` (v0.3 default; v0.2:
@@ -357,27 +415,61 @@ the lines you need.
     amplitude step cannot rescale the weights by |g|².
 
 `spwmap: Tuple[int, ...] = ()`
-:   spwmap passed to applycal for every gain table, e.g. `(0, 0, 0, 0)` when
-    the schedule's `combine` includes `"spw"`. `()`: identity.
+:   spwmap passed to applycal for every gain table with `mode="fixed"`, e.g.
+    `(0, 0, 0, 0)` when `combine` includes `"spw"`. `()`: identity. With
+    `mode="data"` the map comes from the table's spw labels; a configured map
+    that disagrees with them is warned about and not used.
 
 ## `SelfcalSchedule`
 
-By default the schedule is:
+`mode: str = "data"`
+:   How the self-calibration stages are chosen.
 
-```python
-SelfcalSchedule(steps=(
-    SelfcalStep("p", "inf",  label="phase_inf"),
-    SelfcalStep("p", "6*IT", label="phase_6IT"),
-    SelfcalStep("p", "3*IT", label="phase_3IT"),
-    SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
-))
-```
+    `"data"` (default, v0.3)
+    :   Phase stages whose solution intervals are decided from the data, with
+        the rules of the ASEBI specification v0.3 (section 10.2; see
+        [Design](design.md)): stage 1 is one solution per execution block;
+        each later stage measures the noise scale, the solution-SNR rate of
+        every antenna and the phase structure function, predicts the
+        residual phase variance of candidate intervals (divisors of the
+        median scan length, the scan, the EB), gates them on the predicted
+        solution SNR (G1: 5), and chooses and accepts one on held-out
+        integrations (G2: corrected improvement > max(1 sigma, 0.001)). At
+        most three phase stages; the run stops at the first stage that is
+        not accepted, and the best stage is the last accepted one.
+        Solution intervals are integer multiples of the integration time,
+        in seconds; there is no `"N*IT"` schedule.
 
-The string `"N*IT"` in a `solint` means "N times the average
-integration (dump) time" of the MS — AJISAI resolves it at runtime.
+    `"fixed"` (v0.2)
+    :   Every step of `steps` runs, and the best iteration is chosen by
+        `AJISAIConfig.quality_metric`.
+
+`steps: Tuple[SelfcalStep, ...]`
+:   The steps of `mode="fixed"` (ignored, and refused if changed, with
+    `mode="data"`). Default, the v0.2 ladder `ajisai.FIXED_SCHEDULE_STEPS`:
+
+    ```python
+    SelfcalSchedule(mode="fixed", steps=(
+        SelfcalStep("p", "inf",  label="phase_inf"),
+        SelfcalStep("p", "6*IT", label="phase_6IT"),
+        SelfcalStep("p", "3*IT", label="phase_3IT"),
+        SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
+    ))
+    ```
+
+    The string `"N*IT"` in a `solint` means "N times the average
+    integration (dump) time" of the MS — AJISAI resolves it at runtime.
+
+`amplitude: str = "never"`
+:   The amplitude stage of `mode="data"`. Only `"never"` in this version;
+    the conditional amplitude stage of the specification (antenna amplitude
+    scatter times the EB SNR > 2, EB SNR >= 10, held-out and short-baseline
+    flux checks; `'ap'` on top of the phase tables, normalised per
+    observation) will be added later. For an unconditional amplitude step
+    use `mode="fixed"`.
 
 `SelfcalStep`
-:   A single self-cal step. Fields:
+:   A single step of `mode="fixed"`. Fields:
 
     - `calmode`: `"p"` for phase, `"a"` for amplitude (which also
       preserves phase). Passed straight through to `gaincal`.
@@ -388,12 +480,12 @@ integration (dump) time" of the MS — AJISAI resolves it at runtime.
     - `label`: human-readable name used in the justification log and
       output filenames.
 
-To customize the schedule:
+To run a custom fixed schedule:
 
 ```python
 from ajisai import SelfcalSchedule, SelfcalStep
 
-custom_schedule = SelfcalSchedule(steps=(
+custom_schedule = SelfcalSchedule(mode="fixed", steps=(
     SelfcalStep("p", "inf",  label="phase_inf"),
     SelfcalStep("p", "30s",  label="phase_30s"),
     SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
@@ -401,6 +493,17 @@ custom_schedule = SelfcalSchedule(steps=(
 
 cfg = AJISAIConfig(vis="...", schedule=custom_schedule)
 ```
+
+### Measurement self-calibration for a calling pipeline
+
+`ajisai.selfcal_measurement(vis, results_dir=..., imaging=..., gaincal=...,
+refant=None, **options)` runs `mode="data"` without an amplitude stage on
+one execution block, with defaults for a calling pipeline such as ASEBI
+(`caller="asebi"`, `relabel_j2000_to_icrs=False`, no banner, and
+`ImagingConfig(final_depth=())` unless an `ImagingConfig` is given), and
+returns the finished `AJISAI`; `AJISAI.selfcal_summary()` gives the stage
+decisions, gain tables, stage MSs, the best stage's image and model and
+`final_selfcal.ms`.
 
 ## `PlotConfig`
 

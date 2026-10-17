@@ -271,7 +271,6 @@ def test_arcsec_per_rad_constant():
 from ajisai.ms_utils import (  # noqa: E402
     _sexagesimal_to_colon,
     _split_radec,
-    icrs_to_j2000,
 )
 
 
@@ -306,42 +305,151 @@ def test_split_radec_rejects_garbage():
         _split_radec("not a coordinate")
 
 
-def test_icrs_to_j2000_casa_format_regression():
-    """The exact string that crashed the phase-shift step must now convert.
-
-    ICRS and FK5 (J2000.0) share an origin, so the label is essentially
-    unchanged; we assert the on-sky position is preserved to < 1 mas and the
-    output keeps the CASA convention (RA ':'-sep, Dec '.'-sep).
-    """
-    pytest.importorskip("astropy")
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-
-    crash_input = "15:45:06.322 -34.17.38.348"
-    out = icrs_to_j2000(crash_input)
-
-    # Output layout: RA uses ':', Dec uses '.' (CASA-parseable declination)
-    ra_out, dec_out = out.split()
-    assert ra_out.count(":") == 2
-    assert ":" not in dec_out
-    assert dec_out.startswith("-34.17.38")
-
-    # On-sky position is preserved (frame relabel, not a physical move)
-    c_in = SkyCoord(ra="15:45:06.322", dec="-34:17:38.348",
-                    unit=(u.hourangle, u.deg), frame="icrs")
-    c_out = SkyCoord(ra=ra_out.replace(":", " "),
-                     dec=dec_out.replace(".", " ", 2),
-                     unit=(u.hourangle, u.deg), frame="fk5")
-    assert c_in.separation(c_out).arcsec < 1e-3
+# icrs_to_j2000 converts with casatools.measures (CASA's J2000, not astropy's
+# FK5, which differs by 20-25 mas); its accuracy and output layout are tested
+# against me.measure in tests/test_casa_frames.py.
 
 
-def test_icrs_to_j2000_accepts_space_form():
-    """The legacy 6-token layout still works."""
-    pytest.importorskip("astropy")
-    out = icrs_to_j2000("15 45 06.322 -34 17 38.348")
-    ra_out, dec_out = out.split()
-    assert ra_out.count(":") == 2
-    assert dec_out.startswith("-34.17.38")
+# ---------------------------------------------------------------------------
+# Coordinate strings: RA in hours, Dec in degrees whatever the separators
+# (CASA reads a ':'-separated Dec as hours, so AJISAI parses them itself)
+# ---------------------------------------------------------------------------
+from ajisai.ms_utils import (  # noqa: E402
+    SKY_FRAMES,
+    angular_offset_mas,
+    casa_direction_string,
+    code_of_frame,
+    convert_direction,
+    direction_frames,
+    format_dec,
+    format_ra,
+    frame_of_code,
+    parse_dec,
+    parse_ra,
+    parse_ra_dec,
+    rad_to_radec,
+)
+
+_DEG = math.pi / 180.0
+_MAS = _DEG / 3600e3
+
+
+@pytest.mark.parametrize("text", ["16:25:45.0", "16h25m45.0s", "16h 25m 45.0s", "16 25 45.0",
+                                  "+16:25:45.0", "246.4375deg", "4.301145775383526rad"])
+def test_parse_ra_forms(text):
+    assert parse_ra(text) == pytest.approx(246.4375 * _DEG, abs=1e-12)
+
+
+@pytest.mark.parametrize("text", ["-24:12:23.0", "-24.12.23.0", "-24d12m23.0s", "-24 12 23.0",
+                                  "-024.12.23.0", "-24d 12m 23s", "-24.20638888888889deg"])
+def test_parse_dec_forms_are_degrees(text):
+    """'-24:12:23.0' is -24.2064 deg (CASA alone would read -363.1 deg -> Dec -3.1 deg)."""
+    assert parse_dec(text) == pytest.approx(-(24 + 12 / 60 + 23 / 3600) * _DEG, abs=1e-12)
+
+
+def test_parse_dec_sign_of_small_negative_values():
+    assert parse_dec("-00:05:30.5") == pytest.approx(-(5 / 60 + 30.5 / 3600) * _DEG)
+    assert parse_dec("+00.05.30.5") == pytest.approx((5 / 60 + 30.5 / 3600) * _DEG)
+    assert parse_dec("00 05 30.5") > 0
+
+
+def test_parse_ra_dec_pair():
+    ra, dec = parse_ra_dec("16:25:45.0", "-24:12:23.0")
+    assert math.degrees(ra) == pytest.approx(246.4375)
+    assert math.degrees(dec) == pytest.approx(-24.2063888889)
+
+
+@pytest.mark.parametrize("bad", ["24:00:00", "12:60:00", "12:00:60", "16.25.45.0",
+                                 "246.4375", "-1:00:00", "nonsense", ""])
+def test_parse_ra_rejects(bad):
+    with pytest.raises(ValueError):
+        parse_ra(bad)
+
+
+@pytest.mark.parametrize("bad", ["-91:00:00", "90:00:01", "-24:60:00", "-24.2063",
+                                 "-24:12", "2rad", "-95deg", "nonsense"])
+def test_parse_dec_rejects(bad):
+    with pytest.raises(ValueError):
+        parse_dec(bad)
+
+
+def test_format_ra_dec_round_trip_and_carry():
+    for ra, dec in ((4.301145775, -0.422481186), (0.0, 0.0), (6.283185, 1.5707), (1.0, -1e-9)):
+        r, d = format_ra(ra, 7), format_dec(dec, 7)
+        assert ":" not in d and d.count(".") == 3 and d[0] in "+-"
+        assert angular_offset_mas(parse_ra(r), parse_dec(d), ra % (2 * math.pi), dec) < 0.005
+    # 59.99999996 s rounds up into the next minute and hour
+    assert format_ra((15.0 * (23 + 59 / 60 + 59.99999996 / 3600)) * _DEG, 7) == "00:00:00.0000000"
+    assert format_dec(-(29 + 59 / 60 + 59.99999996 / 3600) * _DEG, 7) == "-30.00.00.0000000"
+    assert format_dec(0.5 * _DEG, 0, sep=":") == "+00:30:00"
+
+
+def test_rad_to_radec_writes_dec_with_dots():
+    s = rad_to_radec(246.4375 * _DEG, -24.2063888889 * _DEG)
+    ra, dec = s.split()
+    assert ra == "16:25:45.00000"
+    assert dec == "-24.12.23.00000"
+    deg = rad_to_radec(-0.5 * _DEG, 10 * _DEG, hms_dms=False, precision=3)
+    assert deg == "359.500 10.000"
+
+
+def test_casa_direction_string_is_radians_with_single_spaces():
+    s = casa_direction_string("ICRS", 4.301145775383526, -1e-9)
+    assert s == "ICRS 4.301145775383526rad -0.000000001000000rad"
+    assert len(s.split(" ")) == 3 and "e" not in s.split(" ")[2]
+
+
+def test_convert_direction_same_frame_needs_no_casa_and_wraps_ra():
+    assert convert_direction(-2.0, 0.3, "J2000", "j2000") == (pytest.approx(2 * math.pi - 2.0), 0.3)
+    assert SKY_FRAMES == ("ICRS", "J2000")
+    with pytest.raises(ValueError):
+        convert_direction(1.0, 0.3, "B1950", "ICRS")
+    with pytest.raises(ValueError):
+        convert_direction(1.0, 0.3, "ICRS", "GALACTIC")
+
+
+def test_angular_offset_mas():
+    assert angular_offset_mas(1.0, 0.0, 1.0 + _MAS, 0.0) == pytest.approx(1.0, rel=1e-6)
+    assert angular_offset_mas(1.0, math.radians(60), 1.0 + 2 * _MAS, math.radians(60)) == \
+        pytest.approx(1.0, rel=1e-6)
+    assert angular_offset_mas(0.0, 0.0, 2 * math.pi - _MAS, 0.0) == pytest.approx(1.0, rel=1e-6)
+
+
+# MEASINFO of the FIELD direction columns of a real ALMA MS (variable reference)
+_ALMA_MEASINFO = {
+    "type": "direction", "VarRefCol": "PhaseDir_Ref",
+    "TabRefTypes": ["J2000", "JMEAN", "JTRUE", "APP", "B1950", "B1950_VLA", "BMEAN", "BTRUE",
+                    "GALACTIC", "HADEC", "AZEL", "AZELSW", "AZELNE", "AZELGEO", "AZELSWGEO",
+                    "AZELNEGEO", "JNAT", "ECLIPTIC", "MECLIPTIC", "TECLIPTIC", "SUPERGAL",
+                    "ITRF", "TOPO", "ICRS", "MERCURY", "VENUS", "MARS", "JUPITER", "SATURN",
+                    "URANUS", "NEPTUNE", "PLUTO", "SUN", "MOON", "COMET"],
+    "TabRefCodes": np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 10, 12, 13, 12, 14, 15, 16,
+                             17, 18, 19, 20, 21, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42],
+                            dtype=np.uint64),
+}
+
+
+def test_frame_codes_come_from_the_measinfo():
+    assert frame_of_code(_ALMA_MEASINFO, 21) == "ICRS"
+    assert frame_of_code(_ALMA_MEASINFO, 0) == "J2000"
+    assert frame_of_code(_ALMA_MEASINFO, 10) == "AZEL"      # shared with AZELNE: first name
+    assert code_of_frame(_ALMA_MEASINFO, "ICRS") == 21
+    assert code_of_frame(_ALMA_MEASINFO, "J2000") == 0
+    other = dict(_ALMA_MEASINFO, TabRefTypes=["ICRS", "J2000"], TabRefCodes=[0, 21])
+    assert frame_of_code(other, 0) == "ICRS" and code_of_frame(other, "J2000") == 21
+    with pytest.raises(ValueError):
+        frame_of_code(_ALMA_MEASINFO, 99)
+    with pytest.raises(ValueError):
+        code_of_frame({"type": "direction", "Ref": "ICRS"}, "ICRS")
+
+
+def test_direction_frames_variable_and_fixed():
+    assert direction_frames(_ALMA_MEASINFO, ref_codes=np.array([21, 0, 21])) == \
+        ["ICRS", "J2000", "ICRS"]
+    assert direction_frames({"type": "direction", "Ref": "ICRS"}, nrow=2) == ["ICRS", "ICRS"]
+    assert direction_frames({"type": "direction"}, nrow=1) == ["J2000"]
+    with pytest.raises(ValueError):
+        direction_frames(_ALMA_MEASINFO)
 
 
 # ---------------------------------------------------------------------------

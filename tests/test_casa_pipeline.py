@@ -3,7 +3,8 @@ End-to-end run of AJISAI on a tiny simulated MS (CASA required).
 
 Marked ``casa``: skipped automatically when casatools/casatasks are absent.
 Run with ``python -m pytest -m casa`` in a CASA Python (e.g. CASA 6.5.1).
-Checks the v0.3 data hygiene and products:
+Checks the v0.3 data hygiene and products (with a one-step ``mode="fixed"``
+schedule; the data-driven stages are tested in ``test_casa_solint.py``):
 
 * the input MS is byte-for-byte unchanged after the run;
 * each stage MS holds DATA + MODEL only (no CORRECTED), the final
@@ -53,7 +54,7 @@ def run(tmp_path_factory):
         vis=ms,
         results_dir=str(work / "out"),
         imaging=ImagingConfig(nterms=2, mask_mode="user", user_mask=str(crtf), niter=2000),
-        schedule=SelfcalSchedule(steps=(SelfcalStep("p", "inf", label="p_inf"),)),
+        schedule=SelfcalSchedule(mode="fixed", steps=(SelfcalStep("p", "inf", label="p_inf"),)),
         # Read the input directly (no relabelled copy), so that the dirty,
         # noise and initial images and the first copy all touch the input MS.
         relabel_j2000_to_icrs=False,
@@ -81,24 +82,57 @@ def test_input_ms_is_not_modified(run):
     assert _digest(run["ms"]) == run["before"]
 
 
-def test_relabelling_works_on_a_copy(run, tmp_path):
-    """J2000 codes in the input: the relabelled copy is used, the input is untouched."""
+def test_relabelling_works_on_a_copy(tmp_path):
+    """ALMA data observed before Cycle 3 with J2000 codes (ICRS numbers, ALMA knowledgebase): the relabelled copy
+    is used, label only, and the input is untouched (ASEBI SPEC 4.1 item 10, D37)."""
     import casatools
     from ajisai import AJISAI, AJISAIConfig
+    from tests.casa_sim import simulate_ms
 
-    ms = run["ms"]
-    aj = AJISAI(AJISAIConfig(vis=ms, results_dir=str(tmp_path), verbose=False))
-    aj.workdir = tmp_path
-    (tmp_path / "intermediate").mkdir()
+    ms = simulate_ms(str(tmp_path / "c2.ms"), freq_ghz=(230.0,), nchan=(2,), chan_mhz=(500.0,),
+                     date="2015/06/01/00:00:00")
+    before = _digest(ms)
+    work = tmp_path / "work"
+    aj = AJISAI(AJISAIConfig(vis=ms, results_dir=str(work), verbose=False))
+    aj.workdir = work
+    (work / "intermediate").mkdir(parents=True)
     aj._prepare_working_vis()
     copy = aj._derived["working_vis"]
-    assert copy == str(tmp_path / "intermediate" / "input_icrs.ms")
+    assert copy == str(work / "intermediate" / "input_icrs.ms")
+    assert "relabel_caveat" not in aj.justification["derived"]["working_vis"]
     tb = casatools.table()
     tb.open(copy + "/SOURCE")
     try:
         assert tb.getcolkeywords("DIRECTION")["MEASINFO"]["Ref"] == "ICRS"
     finally:
         tb.close()
+    tb.open(ms + "/FIELD")
+    a = tb.getcol("PHASE_DIR")
+    tb.close()
+    tb.open(copy + "/FIELD")
+    b = tb.getcol("PHASE_DIR")
+    tb.close()
+    assert (a == b).all()                                              # numbers unchanged
+    assert _digest(ms) == before
+
+
+def test_genuine_j2000_label_is_kept(run, tmp_path):
+    """J2000 codes on data observed from Cycle 3 on (the 2017 simulation): genuine J2000, kept; the input is read
+    directly and the reason is recorded and warned about (ASEBI SPEC 4.1 item 10, D37)."""
+    import warnings
+    from ajisai import AJISAI, AJISAIConfig
+
+    ms = run["ms"]
+    aj = AJISAI(AJISAIConfig(vis=ms, results_dir=str(tmp_path), verbose=False))
+    aj.workdir = tmp_path
+    (tmp_path / "intermediate").mkdir()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        aj._prepare_working_vis()
+    assert aj._derived["working_vis"] == ms
+    caveat = aj.justification["derived"]["working_vis"]["relabel_caveat"]
+    assert "kept" in caveat and "Cycle 3" in caveat
+    assert any("Cycle 3" in str(w.message) for w in caught)
     assert _digest(ms) == run["before"]
 
 
@@ -117,8 +151,17 @@ def test_mtmfs_names_and_checks(run):
     assert all(st["image"].endswith(".image.tt0") for st in aj.stages)
     assert all(os.path.isdir(st["image"]) for st in aj.stages)
     checks = aj.justification["checks"]
-    assert {c["kind"] for c in checks} == {"tclean", "model_prediction"}
+    assert {c["kind"] for c in checks} == {"tclean", "clean_model", "model_prediction",
+                                           "reference"}
     assert all(c["ok"] for c in checks)
+    # the reffreq-free natural-weighted reference image grids the data's whole Stokes I weight
+    # (ASEBI SPEC 10.3, D38 h); every image's axis is checked exactly
+    ref = [c for c in checks if c["kind"] == "reference"]
+    assert len(ref) == 1 and abs(ref[0]["sumwt_ratio"] - 1.0) < 1e-5
+    assert all(c["axis_check"].startswith("exact") for c in checks if c["kind"] == "tclean")
+    # the initial CLEAN (mtmfs) left a model: checked once, on its Taylor terms
+    model_check = [c for c in checks if c["kind"] == "clean_model"]
+    assert len(model_check) == 1 and model_check[0]["n_model_pixels"] > 0
 
 
 def test_solve_information(run):

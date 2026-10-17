@@ -21,10 +21,14 @@ That's it. AJISAI takes care of everything else:
   and the image size from the primary beam of the smallest dish.
 - Measures the thermal noise on a signal-free (XX-YY)/2 dirty image and
   CLEANs every self-cal image to the same absolute 3-sigma threshold.
-- Iterates three rounds of phase self-cal then one round of amplitude
-  self-cal (the deterministic schedule from the AJISAI design paper), each
-  on a copy of the previous round's data: your MS is never modified.
-- Picks the best round by dynamic range, writes its data to
+- Self-calibrates the phases in at most three stages, each on a copy of the
+  previous stage's data (your MS is never modified): one solution per
+  execution block first, then solution intervals chosen from the measured
+  solution SNR and phase structure function and accepted only when they
+  improve integrations the gains were not solved from. Every quantity and
+  decision is recorded. (`SelfcalSchedule(mode="fixed")` runs the v0.2
+  ladder of three phase and one amplitude rounds instead.)
+- Takes the last accepted stage as the best, writes its data to
   `<workdir>/final_selfcal.ms` (DATA only), makes a deeper final image from
   it, and copies that image to `<workdir>/final.image` and
   `<workdir>/final.fits`.
@@ -36,9 +40,9 @@ measured:
 
 ```python
 print(aj.workdir)               # output directory (./ajisai_<projname>/)
-print(aj.best_image)            # path to the best CLEAN image
-print(aj.best_fits)             # path to the best FITS
-print(aj.best_metric_value)     # achieved dynamic range
+print(aj.best_image)            # CLEAN image of the best (last accepted) stage
+print(aj.best_fits)             # its FITS
+print(aj.best_metric_value)     # its dynamic range (a diagnostic)
 print(aj.metrics)               # list of per-iteration dicts
 print(aj.stages)                # per-stage MS, image, model and solve information
 print(aj.final_image)           # the final (deeper) image

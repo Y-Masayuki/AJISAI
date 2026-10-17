@@ -74,10 +74,10 @@ imaging = ImagingConfig(
 
 # --- Gain calibration (gaincal / applycal) ----------------------------------
 gaincal = GainCalConfig(
-    gaintype="T",              # "T" averages the parallel hands for SNR | "G" solves them separately
-    minsnr=3.0,                # solutions below this SNR are dropped (data stay unflagged: calonly)
+    gaintype="T",              # "T" averages the parallel hands for SNR | "G" (mode="fixed" only)
+    minsnr=3.0,                # floor; mode="data" gates on a predicted SNR of 5 (never raise to 5)
     minblperant=4,
-    combine="scan",
+    combine="scan",            # mode="data": only "spw" is used ("scan,spw" combines the spws)
     gaincal_interp="linear,linear",
     applycal_interp="linearPDperobs",  # "perobs": never interpolate across observations
     applymode="calonly",       # flagged solutions never flag the visibilities
@@ -85,16 +85,25 @@ gaincal = GainCalConfig(
     spwmap=(),                 # e.g. (0, 0, 0, 0) when combine includes "spw"
 )
 
-# --- Self-calibration schedule (fixed; every step always runs) --------------
-# calmode: "p" (phase) | "a" (amplitude; phase is preserved)
-# solint:  any CASA solint ("inf", "60s", ...) or "N*IT" = N x average integration time
-# solnorm: True for amplitude steps, to preserve the flux scale
-schedule = SelfcalSchedule(steps=(
-    SelfcalStep("p", "inf",  label="phase_inf"),
-    SelfcalStep("p", "6*IT", label="phase_6IT"),
-    SelfcalStep("p", "3*IT", label="phase_3IT"),
-    SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
-))
+# --- Self-calibration stages -------------------------------------------------
+# mode="data" (default): phase stages decided from the data (ASEBI SPEC v0.3 10.2):
+#   one solution per EB, then intervals chosen from the measured solution SNR and phase
+#   structure function and accepted on held-out integrations; at most three stages.
+#   steps are not used. amplitude: "never" (the conditional amplitude stage comes later).
+# mode="fixed" (v0.2): every step of steps runs; best by quality_metric.
+#   calmode: "p" (phase) | "a" (amplitude; phase is preserved)
+#   solint:  any CASA solint ("inf", "60s", ...) or "N*IT" = N x average integration time
+#   solnorm: True for amplitude steps, to preserve the flux scale
+schedule = SelfcalSchedule(
+    mode="data",
+    amplitude="never",
+    steps=(                    # mode="fixed" only (this is the v0.2 ladder)
+        SelfcalStep("p", "inf",  label="phase_inf"),
+        SelfcalStep("p", "6*IT", label="phase_6IT"),
+        SelfcalStep("p", "3*IT", label="phase_3IT"),
+        SelfcalStep("a", "inf",  solnorm=True, label="amp_inf"),
+    ),
+)
 
 # --- Diagnostic figures (selfcal_images.png) --------------------------------
 plots = PlotConfig(
@@ -117,7 +126,10 @@ cfg = AJISAIConfig(
     plots=plots,
     # Phase shift (off by default). With phase_center=None the brightest pixel of the
     # dirty image becomes the phase center; or give (ra, dec, frame), frame "ICRS" or
-    # "J2000", e.g. ("16:25:45.0", "-24:12:23.0", "ICRS").
+    # "J2000", e.g. ("16:25:45.0", "-24:12:23.0", "ICRS") or
+    # ("16h25m45.0s", "-24d12m23.0s", "ICRS"): RA in hours, Dec in degrees whatever
+    # the separators (AJISAI converts them to radians; CASA alone would read a
+    # ':'-separated Dec as hours).
     phase_shift=False,
     phase_center=None,
     # Reference antenna: "hybrid" (default) | "geometric_center" | "flag_stats"
@@ -132,7 +144,8 @@ cfg = AJISAIConfig(
     rms_target_radius_arcsec=None,  # annulus: inner radius in arcsec (must enclose the source)
     rms_sigma=3.0,
     rms_maxiters=5,
-    # Best image: "dynamic_range" (default) | "peak_snr"
+    # Best iteration of mode="fixed": "dynamic_range" (default) | "peak_snr"
+    # (mode="data": the last accepted stage; image statistics are diagnostics)
     quality_metric="dynamic_range",
     on_iter_anomaly="log_only",     # anomalies are logged and never change the schedule
     # The input MS is never written. With J2000 frame codes in the input, a relabelled
