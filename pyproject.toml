@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ajisai"
-version = "0.2.1"
+version = "0.3.0.dev0"
 description = "Automated Justification-based Imaging and Self-calibration for ALMA continuum data"
 readme = "README.md"
 requires-python = ">=3.8"

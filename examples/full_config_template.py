@@ -27,22 +27,41 @@ projname = None                # None = derived from the basename of vis
 results_dir = None             # None = ./ajisai_<projname>/
 
 # --- Imaging (tclean) -------------------------------------------------------
+# Every tclean of a run (dirty, initial CLEAN, each iteration, final image) uses
+# the same cell, imsize, nterms, reffreq, scales and mask.
 imaging = ImagingConfig(
     weighting="briggs",
     robust=0.5,
     uvtaper=(),                # e.g. ("1arcsec",), ("100klambda",), ("2arcsec", "0.5arcsec", "30deg")
-    cellpix=10,                # pixels per synthesized beam; sets the cell size
-    deconvolver="multiscale",  # scales [0, 1, 3] x beam are derived from the data
-    nterms=1,
+    # Image geometry: None = derived from the data.
+    cell=None,                 # e.g. "0.0062arcsec" or "6.2mas"
+    imsize=None,               # N or (Nx, Ny); None = primary beam (smallest dish) down to 20%
+    cell_rule="umax",          # "umax": 1/(5 u_max), longest unflagged baseline at the highest
+                               # frequency | "percentile" (legacy v0.2: 90th-percentile beam / cellpix)
+    cellpix=10,                # pixels per beam; cell_rule="percentile" only
+    deconvolver="multiscale",  # "mtmfs" is used automatically when nterms > 1
+    nterms=1,                  # > 1: mtmfs; statistics on .image.tt0
+    reffreq=None,              # e.g. "227.0GHz"; None = middle of the frequency range
+    scales=None,               # pixels; None = 0, b, 3b, 9b, ... (b = beam) up to the largest
+                               # that fits the user mask region (0, b, 3b without one)
     gridder="standard",
     pbcor=False,
     parallel=False,            # mpicasa
     niter=50000,
     gain=0.05,
     cyclefactor=1.5,
-    threshold_factor=1.0,      # CLEAN threshold = threshold_factor x off-source RMS
-    # Mask: "auto-multithresh" (default, any CASA) | "interactive" (CASA <= 6.6 only)
-    #       | "user" (pre-made mask, set user_mask) | "none"
+    # CLEAN depth of the self-cal images:
+    #   "pure_noise": threshold_nsigma x sigma_th (absolute; sigma_th from the (XX-YY)/2 dirty image)
+    #   "image_rms" (legacy v0.2): threshold_factor x off-source RMS of the previous image
+    threshold_mode="pure_noise",
+    threshold_nsigma=3.0,
+    threshold_factor=1.0,
+    # Final image of the best iteration: CLEAN 3 -> 2 -> 1 -> 0.5 sigma_th until the aperture
+    # flux converges; () = no final image (final.* = best iteration's image, as in v0.2).
+    final_depth=(3.0, 2.0, 1.0, 0.5),
+    final_aperture_arcsec=None,     # None = the CLEAN mask region (5 beams without a mask)
+    # Mask: "auto-multithresh" (default, any CASA) | "interactive" (CASA <= 6.6 only; refused
+    #       when caller="asebi") | "user" (CRTF region file or mask image, set user_mask) | "none"
     mask_mode="auto-multithresh",
     user_mask=None,
     # auto-multithresh tunables (ALMA pipeline values for continuum)
@@ -56,13 +75,14 @@ imaging = ImagingConfig(
 # --- Gain calibration (gaincal / applycal) ----------------------------------
 gaincal = GainCalConfig(
     gaintype="T",              # "T" averages the parallel hands for SNR | "G" solves them separately
-    minsnr=1.5,                # solutions below this SNR are dropped (data stay unflagged: calonly)
+    minsnr=3.0,                # solutions below this SNR are dropped (data stay unflagged: calonly)
     minblperant=4,
     combine="scan",
     gaincal_interp="linear,linear",
-    applycal_interp="linearPD",
+    applycal_interp="linearPDperobs",  # "perobs": never interpolate across observations
     applymode="calonly",       # flagged solutions never flag the visibilities
-    calwt=True,
+    calwt=False,               # self-cal tables never change WEIGHT
+    spwmap=(),                 # e.g. (0, 0, 0, 0) when combine includes "spw"
 )
 
 # --- Self-calibration schedule (fixed; every step always runs) --------------
@@ -115,9 +135,14 @@ cfg = AJISAIConfig(
     # Best image: "dynamic_range" (default) | "peak_snr"
     quality_metric="dynamic_range",
     on_iter_anomaly="log_only",     # anomalies are logged and never change the schedule
+    # The input MS is never written. With J2000 frame codes in the input, a relabelled
+    # (J2000 -> ICRS, frame code only) copy is used when this is True.
+    relabel_j2000_to_icrs=True,
+    caller="user",                  # "user" | "asebi" (refuses interactive masking)
     verbose=True,
     show_banner=True,
 )
 
 aj = AJISAI(cfg).run()
 print(aj.best_image, aj.best_metric_value)
+print(aj.final_image, aj.final_ms)

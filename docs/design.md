@@ -85,32 +85,37 @@ AJISAI(cfg).run() pipeline order:
 
  1. validate inputs
  2. set up working directory
- 3. inspect MS
+ 3. inspect MS (read-only)
     - choose refant (hybrid strategy)
     - average integration time
     - on-source time, median frequency
-    - resolve target field
-    - relabel J2000 frames to ICRS (CASA hygiene)
- 4. compute imaging parameters
-    - synthesized beam from 90-percentile baseline
-    - cell size = (effective) beam / cellpix
-    - imsize covers down to 20% primary-beam attenuation
+    - resolve target field; frequency range and correlations
+    - relabel J2000 frames to ICRS on a copy, if needed (CASA hygiene)
+ 4. compute imaging parameters (or take cell/imsize from ImagingConfig)
+    - cell = 1/(5 u_max), u_max from the longest unflagged baseline
+      at the highest frequency (legacy: beam from 90-percentile baseline / cellpix)
+    - imsize covers down to 20% primary-beam attenuation of the
+      smallest dish in ANTENNA/DISH_DIAMETER
  5. make dirty image (niter=0)
-    - measure initial off-source RMS
+    - measure dirty-image peak, off-source RMS and beam
     - verify actual vs predicted beam (uvtaper check)
  6. apply phase shift if requested (off by default)
- 7. make initial CLEAN (iteration 0)
-    - save model column for the first gaincal
-    - save the mask file for reuse
- 8. for each iteration in the schedule:
-    - gaincal -> caltable
-    - applycal (calonly mode)
-    - split out corrected data -> new MS
-    - tclean with saved mask -> new image
-    - compute peak/RMS/SNR/DR
+ 7. measure sigma_th on the (XX-YY)/2 dirty image (signal-free noise)
+ 8. multiscale scales: 0, b, 3b, ... up to the largest that fits the mask
+ 9. make initial CLEAN (iteration 0) to 3 sigma_th; no model is saved
+10. for each iteration in the schedule:
+    - copy the previous stage's MS to a temporary MS
+    - predict the previous model into it if needed (ft, Taylor terms)
+    - gaincal -> caltable; applycal (calonly, calwt=False) on the copy
+    - split out corrected data -> selfcal_<N>.ms; delete the copy
+    - tclean of selfcal_<N>.ms to 3 sigma_th; predict its model into it
+    - compute peak/RMS/SNR/DR on the tt0 image
     - detect anomalies (log only)
- 9. select best iteration by DR
-10. write summary CSV, PNG, and justification.json
+    (every tclean and prediction is followed by a consistency check)
+11. select best iteration by DR
+12. split its DATA -> final_selfcal.ms; final image from it, CLEANed
+    3 -> 2 -> 1 -> 0.5 sigma_th until the aperture flux converges
+13. write summary CSV, PNG, and justification.json
 ```
 
 ## At a glance

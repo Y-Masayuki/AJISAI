@@ -6,8 +6,9 @@ otherwise `./ajisai_<projname>/`.
 
 ```
 ajisai_<projname>/
-├── final.image                    ← best self-cal image (CASA format)
-├── final.fits                     ← best self-cal image (FITS export)
+├── final.image                    ← final image (CASA format; Taylor term 0 if nterms > 1)
+├── final.fits                     ← final image (FITS export)
+├── final_selfcal.ms               ← self-calibrated visibilities of the best iteration (DATA only)
 ├── metrics.csv                    ← one row per iteration
 ├── selfcal_summary.png            ← 4-panel diagnostic plot
 ├── selfcal_images.png             ← CLEAN image of every iteration, side by side
@@ -15,12 +16,15 @@ ajisai_<projname>/
 ├── ajisai_refant_selection.png    ← refant choice visualization
 ├── intermediate/                  ← all intermediate MS and image products
 │   ├── dirty.image,  dirty.fits
-│   ├── clean_iter0.image / .fits  ← pre-selfcal CLEAN
+│   ├── noise_Q.image / .fits      ← signal-free (XX-YY)/2 dirty image (sigma_th)
+│   ├── clean_iter0.image / .fits  ← pre-selfcal CLEAN (.image.tt0, .tt1, .alpha... if nterms > 1)
 │   ├── clean_sc1.image / .fits    ← after iteration 1
 │   ├── clean_sc2.image / .fits    ← after iteration 2
-│   ├── selfcal_1.ms, selfcal_2.ms, ...
-│   ├── selfcal_1_avg.ms, ...      ← channel-averaged copies (1 ch/spw)
+│   ├── selfcal_1.ms, selfcal_2.ms, ...  ← stage MSs: DATA + MODEL, never modified
 │   ├── sc1.pcal, sc2.pcal, ...    ← gain tables
+│   ├── final_clean.*              ← the final image and all its products
+│   ├── input_icrs.ms              ← relabelled copy of the input, only if it had J2000 codes
+│   ├── user_mask_on_grid.mask     ← the user CRTF on the image grid (for the scales)
 │   └── phaseshifted.ms            ← if phase_shift=True
 └── diagnostics/
     ├── iter1_phase_inf_phasegain.png
@@ -28,14 +32,37 @@ ajisai_<projname>/
     └── iter4_amp_inf_ampgain.png
 ```
 
+The input measurement set is only read. AJISAI never writes MODEL or
+CORRECTED columns into it and never relabels it: each iteration copies the
+previous stage's MS to a temporary MS (`selfcal_<N>_applycal.tmp.ms`), solves
+and applies the gains on the copy, splits the corrected data into
+`selfcal_<N>.ms`, and deletes the copy.
+
 ## `final.image` / `final.fits`
 
-The best CLEAN image AJISAI produced, copied from
-`intermediate/clean_iter<N>` where `N` is the iteration that achieved the
-highest dynamic range.
+The final image: the data of the best iteration (highest dynamic range),
+written to `final_selfcal.ms`, imaged once more with the same cell, image
+size, nterms, reffreq, scales and mask, and CLEANed deeper than the
+self-calibration images. The threshold steps through
+`ImagingConfig.final_depth` × sigma_th (default 3, 2, 1, 0.5) and stops when
+the aperture flux has converged (see `final_image` below). With
+`nterms > 1` these are copies of Taylor term 0 (`.image.tt0`); the other
+products (`.image.tt1`, `.alpha`, `.alpha.error`, `.residual.tt0`,
+`.model.tt*`, `.pb.tt0`, `.mask`) are in `intermediate/final_clean.*` and
+listed in `justification.json`.
+
+With `ImagingConfig(final_depth=())` no final image is made and `final.*`
+is the best iteration's image, as in v0.2.
 
 This is the primary deliverable. Use as you would any CASA image: open in
 CARTA, run `imstat` on it, etc.
+
+## `final_selfcal.ms`
+
+The self-calibrated visibilities of the best iteration, split from its stage
+MS with `datacolumn="data"`: a DATA column only (no MODEL, no CORRECTED), so
+it can be imaged or combined without carrying self-calibration scratch
+columns.
 
 ## `metrics.csv`
 
@@ -52,11 +79,16 @@ Per-iteration metrics in CSV form. Columns:
 | `snr`                 | peak / rms                                         |
 | `dynamic_range`       | also peak / rms (same numerator/denominator)      |
 | `bmaj_arcsec` / `bmin_arcsec` | synthesized beam axes                     |
+| `solint_s`            | solint in seconds (empty for `"inf"`)             |
+| `threshold_jy`        | absolute CLEAN threshold of that image            |
 | `n_gaincal_solutions` | number of un-flagged solutions returned by gaincal |
 | `status`              | `"ok"`, `"anomaly"`, or `"skipped"`                |
 | `anomaly_reason`      | text reason when status is not `"ok"`             |
-| `image_path`          | absolute path to that iteration's image           |
+| `image_path`          | absolute path to that iteration's image (`.image.tt0` if nterms > 1) |
+| `image_base`          | image name without the product suffix             |
 | `fits_path`           | absolute path to that iteration's FITS           |
+| `caltable`            | gain table of that iteration                       |
+| `selfcal_ms`          | the iteration's stage MS (`selfcal_<N>.ms`)       |
 
 Useful for plotting your own trends or comparing AJISAI runs across data
 sets.
@@ -146,8 +178,14 @@ decision AJISAI made. Top-level keys:
 
     - `refant`: chosen antenna, strategy, flag thresholds, full candidate
       list with positions and flag fractions.
-    - `cellsize`, `imsize`: cell size and image size with the formula
-      used.
+    - `working_vis`: the MS the pipeline read (the input, or its relabelled
+      copy) and why.
+    - `cellsize`, `imsize`, `dish_diameter`: cell size (rule, u_max) and
+      image size with the formula used; the dish diameter read from
+      `ANTENNA/DISH_DIAMETER`.
+    - `spectral_setup`: spws, frequency range and correlations of the field.
+    - `sigma_th`: thermal noise from the signal-free dirty image.
+    - `scales`: multiscale scales and how they were bounded.
     - `mrs_arcsec`: maximum recoverable scale.
     - `avg_int_time_sec`, `onsource_time_sec`, `median_freq_hz`: MS
       properties relevant to imaging and self-cal.
@@ -164,9 +202,45 @@ decision AJISAI made. Top-level keys:
     `sigma_clip_excl` or the inner radius `rms_target_radius_arcsec` and
     the outer radius of `annulus`, and the number of pixels used).
 
+`stages`
+:   One record per stage (0 = no self-cal): `data_ms` (the MS imaged),
+    `stage_ms` (`selfcal_<N>.ms`, DATA + MODEL), `image`, `image_base`,
+    `nterms`, `model_image` (the model stored in the stage MS),
+    `threshold_jy`, and for self-cal stages `solve`: the gain `table`,
+    `solint` and `solint_s`, `combine`, `refant`, `calmode`, `gaintype`,
+    `minsnr`, `minblperant`, `solnorm`, `applycal` (`interp`, `applymode`,
+    `calwt`, `spwmap`), `model_image` / `model_nterms` / `model_reffreq_hz`
+    (the model the solve used), `solved_on`, `stage_ms`, `n_solutions`, and
+    `flagged_solution_fraction` per observation and spw. The same list is
+    `AJISAI.stages`; the keys of `solve` are `ajisai.SOLVE_INFO_KEYS`.
+
+`checks`
+:   The consistency check after every `tclean` (the image's frequency band
+    covers the data's frequency range; `sumwt > 0`) and every model
+    prediction (`MODEL_DATA` non-zero on every unflagged channel). A failed
+    check stops the run with `RuntimeError`.
+
 `best`
 :   `{"iteration": int, "metric_key": "dynamic_range", "value": float,
-       "image": "/path/to/final.image"}`
+       "image": "/path/to/clean_sc<N>.image"}`
+
+`final_ms`
+:   Path, stage and source of `final_selfcal.ms`.
+
+`final_image`
+:   The final image: `vis`, `image`, `products`, `sigma_th_jy`, the
+    `depth_schedule` and one entry per CLEAN depth step in `steps`
+    (`nsigma`, `threshold_jy`, `f_model_jy`, `f_unc_jy`, `f_corr_jy`,
+    `sigma_f_jy`, `width_jy`, `omega_r_pix`, `omega_clean_pix`,
+    `restored_bias_jy`, `stop`, `reason`), `converged`, `stop_nsigma`, the
+    `aperture` used, and `warnings`. Here `F_model` is the CLEAN model flux
+    in the aperture, `F_unc = sum(residual)/Omega_R` the flux left in the
+    residual (Omega_R = dirty-beam volume in pixels), `F_corr = F_model +
+    F_unc`, `sigma_F` the noise of `F_unc`, and `restored_bias_jy =
+    F_unc (Omega_R/Omega_clean - 1)` the amount by which the restored image
+    over-counts the residual flux. The CLEAN stops when `|F_unc| <=
+    max(3 sigma_F, 0.01 F_corr)` or when `F_corr` changed by no more than
+    that since the previous step; quote `F_corr` as the flux.
 
 This file is designed to be **citable in publications**: it records
 exactly what AJISAI did to your data, so the reduction is reproducible by
@@ -194,9 +268,12 @@ material in publications.
 ## `intermediate/` — keep or delete
 
 The intermediate directory contains every MS and image AJISAI generated.
-It is preserved by default so you can debug or re-image. If disk space is
-tight, you can safely delete it after taking note of any path you might
-want from `metrics.csv`.
+The stage MSs `selfcal_<N>.ms` (DATA + MODEL) together with the gain tables
+and the `solve` records in `justification.json` are enough to re-solve or
+re-apply any stage later without re-running the self-calibration. It is
+preserved by default so you can debug or re-image. If disk space is tight,
+you can delete it; `final_selfcal.ms` and `final.*` at the top level do not
+depend on it.
 
 ## `diagnostics/` — per-iteration gain plots
 

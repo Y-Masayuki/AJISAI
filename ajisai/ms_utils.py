@@ -20,7 +20,7 @@ Replaced analysisUtils functions:
     2. timeOnSource              -> get_on_source_time()
     3. medianFrequencyOfIntent   -> get_median_frequency()
     4. getBaselineStats          -> get_baseline_at_percentile()
-    5. pickCellSize              -> pick_cell_imsize()
+    5. pickCellSize              -> pick_cell_imsize(rule="percentile")
     6. rad2radec                 -> rad_to_radec()
     7. ICRSToJ2000               -> icrs_to_j2000()
 
@@ -55,10 +55,20 @@ except ImportError:
 SPEED_OF_LIGHT_M_S = 2.99792458e8
 ARCSEC_PER_RAD = 180.0 * 3600.0 / math.pi  # ~= 206264.806
 
-# ALMA antenna parameters (12 m dish, central obscuration 0.75 m)
+# ALMA antenna parameters (12 m dish, central obscuration 0.75 m).
+# The dish diameter is read from ANTENNA/DISH_DIAMETER (smallest dish = largest
+# primary beam); ALMA_DISH_DIAMETER_M is only the fallback for an MS without
+# usable values in that column.
 ALMA_DISH_DIAMETER_M = 12.0
 ALMA_DISH_OBSCURATION_M = 0.75
 ALMA_DEFAULT_TAPER_DB = 10.0
+
+# Default cell rule: cell = 1 / (CELL_SAMPLES_PER_UMAX * u_max), with u_max (in
+# wavelengths) from the longest unflagged baseline at the highest frequency.
+CELL_SAMPLES_PER_UMAX = 5.0
+
+# Cell rules accepted by pick_cell_imsize / ImagingConfig.cell_rule.
+CELL_RULES = ("umax", "percentile")
 
 
 # ============================================================================
@@ -84,6 +94,23 @@ def _round_to_sig_figs(value: float, n_sig_figs: int = 2) -> float:
     exponent = math.floor(math.log10(abs(value)))
     factor = 10 ** (n_sig_figs - 1 - exponent)
     return round(value * factor) / factor
+
+
+def _floor_to_sig_figs(value: float, n_sig_figs: int = 4) -> float:
+    """Round a positive value DOWN to N significant figures.
+
+    Used for the u_max cell rule: rounding must never make the cell larger
+    than 1/(5 u_max), so the value is truncated rather than rounded.
+
+    Example: _floor_to_sig_figs(0.0035579, 4) -> 0.003557
+    """
+    if value <= 0.0 or not math.isfinite(value):
+        return value
+    exponent = math.floor(math.log10(value))
+    factor = 10 ** (n_sig_figs - 1 - exponent)
+    # The small epsilon keeps exact decimal values (e.g. 0.0062) from being
+    # truncated one step down by binary floating-point representation.
+    return math.floor(value * factor * (1.0 + 1e-12)) / factor
 
 
 def _smallest_5_smooth_at_least(n: int) -> int:
@@ -273,6 +300,114 @@ def _parse_uvtaper_to_image_fwhm(uvtaper, wavelength_m: float) -> float:
 
 
 # ============================================================================
+# Dish diameter and u_max: pure parts (the CASA readers are in the public API)
+# ============================================================================
+def smallest_dish_diameter(
+    diameters,
+    fallback_m: float = ALMA_DISH_DIAMETER_M,
+) -> Dict[str, Any]:
+    """Smallest dish diameter (= largest primary beam) from DISH_DIAMETER values.
+
+    Non-finite and non-positive entries are ignored. When nothing usable is
+    left (column missing, empty, or all zero), ``fallback_m`` is returned with
+    ``source='fallback'``.
+
+    Returns
+    -------
+    dict
+        ``diameter_m``, ``source`` (``'ANTENNA/DISH_DIAMETER'`` or
+        ``'fallback'``), ``n_antennas``, ``unique_diameters_m``, ``reason``.
+    """
+    vals = np.asarray(diameters if diameters is not None else [], dtype=float).ravel()
+    good = vals[np.isfinite(vals) & (vals > 0.0)]
+    if good.size == 0:
+        return {
+            "diameter_m": float(fallback_m),
+            "source": "fallback",
+            "n_antennas": int(vals.size),
+            "unique_diameters_m": [],
+            "reason": (f"ANTENNA/DISH_DIAMETER missing or not positive; "
+                       f"fallback {fallback_m:g} m"),
+        }
+    unique = sorted(set(float(x) for x in np.round(good, 3)))
+    return {
+        "diameter_m": float(good.min()),
+        "source": "ANTENNA/DISH_DIAMETER",
+        "n_antennas": int(vals.size),
+        "unique_diameters_m": unique,
+        "reason": (f"smallest dish of {unique} m in ANTENNA/DISH_DIAMETER "
+                   f"(largest primary beam)"),
+    }
+
+
+def max_uv_of_unflagged_rows(uvw_m, flag, flag_row=None):
+    """Longest projected baseline among rows that carry unflagged data.
+
+    ``uvw_m`` is the UVW column in metres, shape ``(3, nrow)``; ``flag`` the
+    FLAG column, shape ``(npol, nchan, nrow)``; ``flag_row`` (optional) the
+    FLAG_ROW column. A row counts when it is not FLAG_ROW-flagged and has at
+    least one unflagged sample.
+
+    Returns a pair: the ``sqrt(u**2 + v**2)`` of the longest counted row in
+    metres (0.0 if none), and a boolean array over channels that is True
+    where any counted row has an unflagged sample.
+    """
+    flag = np.asarray(flag, dtype=bool)
+    row_ok = ~flag.all(axis=(0, 1))
+    if flag_row is not None:
+        row_ok &= ~np.asarray(flag_row, dtype=bool)
+    if not row_ok.any():
+        return 0.0, np.zeros(flag.shape[1], dtype=bool)
+    chan_ok = (~flag[:, :, row_ok]).any(axis=(0, 2))
+    uvw_m = np.asarray(uvw_m, dtype=float)
+    uv = np.hypot(uvw_m[0, row_ok], uvw_m[1, row_ok])
+    return float(uv.max()), chan_ok
+
+
+def uv_max_from_maxima(
+    max_uv_m_by_spw: Dict[int, float],
+    fmax_hz_by_spw: Dict[int, float],
+) -> Dict[str, Any]:
+    """u_max in wavelengths from per-spw maxima.
+
+    ``u_max = max over spw of (longest unflagged |uv| in m) * f_max / c``, where
+    ``f_max`` is the highest frequency with unflagged data in that spw.
+
+    Raises
+    ------
+    ValueError
+        If no spw has a positive baseline and frequency (all data flagged).
+    """
+    best: Optional[Dict[str, Any]] = None
+    for spw, uv_m in max_uv_m_by_spw.items():
+        f_hz = fmax_hz_by_spw.get(spw)
+        if f_hz is None or not (math.isfinite(uv_m) and uv_m > 0.0):
+            continue
+        if not (math.isfinite(f_hz) and f_hz > 0.0):
+            continue
+        u = uv_m * f_hz / SPEED_OF_LIGHT_M_S
+        if best is None or u > best["u_max_lambda"]:
+            best = {"u_max_lambda": float(u), "baseline_m": float(uv_m),
+                    "freq_hz": float(f_hz), "spw": int(spw)}
+    if best is None:
+        raise ValueError("no unflagged baseline: u_max cannot be determined")
+    return best
+
+
+def cell_from_umax(u_max_lambda: float, samples: float = CELL_SAMPLES_PER_UMAX) -> float:
+    """Cell size in arcsec, ``1 / (samples * u_max)`` radians.
+
+    ``u_max`` is in wavelengths. With the default ``samples = 5`` the longest
+    baseline's fringe is sampled by five pixels.
+    """
+    if not (u_max_lambda > 0.0 and math.isfinite(u_max_lambda)):
+        raise ValueError(f"u_max must be positive and finite; got {u_max_lambda!r}")
+    if not samples > 0.0:
+        raise ValueError(f"samples must be positive; got {samples!r}")
+    return ARCSEC_PER_RAD / (samples * u_max_lambda)
+
+
+# ============================================================================
 # Public API
 # ============================================================================
 def get_array_info(vis: str) -> Dict[str, Any]:
@@ -282,6 +417,8 @@ def get_array_info(vis: str) -> Dict[str, Any]:
     -------
     dict with keys:
         n_antennas              : int
+        dish_diameters_m        : list of float (ANTENNA/DISH_DIAMETER; [] if absent)
+        min_dish_diameter_m     : float (smallest dish; 12 m fallback if absent)
         n_polarizations         : int (number of correlation products in DATA)
         spw_bandwidths_hz       : list of float (TOTAL_BANDWIDTH per SPW)
         spw_total_bandwidth_hz  : float
@@ -294,8 +431,11 @@ def get_array_info(vis: str) -> Dict[str, Any]:
     tb.open(vis + "/ANTENNA")
     try:
         info["n_antennas"] = int(len(tb.getcol("NAME")))
+        diam = tb.getcol("DISH_DIAMETER") if "DISH_DIAMETER" in tb.colnames() else []
+        info["dish_diameters_m"] = [float(x) for x in diam]
     finally:
         tb.close()
+    info["min_dish_diameter_m"] = smallest_dish_diameter(info["dish_diameters_m"])["diameter_m"]
 
     tb.open(vis + "/POLARIZATION")
     try:
@@ -400,6 +540,133 @@ def get_median_frequency(
         return float(np.median(freqs))
     finally:
         msmd.close()
+
+
+def _casa_column_reader(table_path: str, column: str) -> np.ndarray:
+    """Read one column of a CASA table (raises KeyError if the column is absent)."""
+    _require_casa()
+    tb = casatools.table()
+    tb.open(table_path)
+    try:
+        if column not in tb.colnames():
+            raise KeyError(f"{table_path} has no column {column!r}")
+        return np.asarray(tb.getcol(column))
+    finally:
+        tb.close()
+
+
+def get_dish_diameter_m(
+    vis: str,
+    fallback_m: float = ALMA_DISH_DIAMETER_M,
+    table_reader=None,
+) -> Dict[str, Any]:
+    """Smallest dish diameter of the array, read from ``ANTENNA/DISH_DIAMETER``.
+
+    The smallest dish has the largest primary beam, so it sets the field of
+    view that must be imaged. ``fallback_m`` (12 m) is used only when the
+    column is missing or holds no positive value.
+
+    ``table_reader(table_path, column)`` returns the column as an array; the
+    default reads it with casatools (tests pass a fake reader). The result is
+    the dict of :func:`smallest_dish_diameter`.
+    """
+    reader = table_reader if table_reader is not None else _casa_column_reader
+    try:
+        diameters = reader(vis + "/ANTENNA", "DISH_DIAMETER")
+    except Exception:  # column absent or table unreadable -> fallback
+        diameters = None
+    return smallest_dish_diameter(diameters, fallback_m=fallback_m)
+
+
+def _field_id_for(vis: str, field: Optional[str]) -> Optional[int]:
+    """FIELD_ID for a field given as an ID string or a NAME (None stays None)."""
+    if field is None or str(field).strip() == "":
+        return None
+    try:
+        return int(field)
+    except ValueError:
+        pass
+    names = list(_casa_column_reader(vis + "/FIELD", "NAME"))
+    matches = [i for i, n in enumerate(names) if n == field]
+    if not matches:
+        raise ValueError(f"Field name {field!r} not found in {vis}/FIELD")
+    return matches[0]
+
+
+# Number of visibility samples (npol * nchan * nrow) read per chunk when
+# scanning the MAIN table, so that large MSs are never loaded at once.
+_CHUNK_SAMPLES = 20_000_000
+
+
+def get_uv_max(vis: str, field: Optional[str] = None) -> Dict[str, Any]:
+    """Longest unflagged baseline at the highest frequency, in wavelengths.
+
+    For every data description the MAIN rows of the field are scanned in
+    chunks; a row counts when it has at least one unflagged sample. The
+    result is ``u_max = max over spw of max|uv| (m) * f_max / c`` with
+    ``f_max`` the highest channel frequency that has unflagged data in the
+    counted rows.
+
+    Returns
+    -------
+    dict
+        ``u_max_lambda``, ``baseline_m`` (``|uv|`` of the longest counted row),
+        ``freq_hz`` (f_max of the spw giving u_max), ``spw``, ``fmin_hz``
+        (lowest unflagged channel frequency over all spws), ``fmax_hz``.
+    """
+    _require_casa()
+    fid = _field_id_for(vis, field)
+    dd_spw = _casa_column_reader(vis + "/DATA_DESCRIPTION", "SPECTRAL_WINDOW_ID")
+    tb = casatools.table()
+    tb.open(vis + "/SPECTRAL_WINDOW")
+    try:
+        chan_freq = {i: np.asarray(tb.getcell("CHAN_FREQ", i), dtype=float)
+                     for i in range(tb.nrows())}
+    finally:
+        tb.close()
+
+    max_uv: Dict[int, float] = {}
+    chan_any: Dict[int, np.ndarray] = {}
+    tb.open(vis)
+    try:
+        for dd in range(len(dd_spw)):
+            query = f"DATA_DESC_ID=={dd}"
+            if fid is not None:
+                query += f" && FIELD_ID=={fid}"
+            sub = tb.query(query, columns="UVW,FLAG,FLAG_ROW")
+            try:
+                nrow = sub.nrows()
+                if nrow == 0:
+                    continue
+                spw = int(dd_spw[dd])
+                npol, nchan = np.asarray(sub.getcell("FLAG", 0)).shape
+                chunk = max(1, _CHUNK_SAMPLES // max(1, npol * nchan))
+                for start in range(0, nrow, chunk):
+                    nr = min(chunk, nrow - start)
+                    m, ok = max_uv_of_unflagged_rows(
+                        sub.getcol("UVW", start, nr),
+                        sub.getcol("FLAG", start, nr),
+                        sub.getcol("FLAG_ROW", start, nr),
+                    )
+                    max_uv[spw] = max(max_uv.get(spw, 0.0), m)
+                    prev = chan_any.get(spw)
+                    chan_any[spw] = ok if prev is None else (prev | ok)
+            finally:
+                sub.close()
+    finally:
+        tb.close()
+
+    fmax: Dict[int, float] = {}
+    fmin_all: List[float] = []
+    for spw, ok in chan_any.items():
+        if ok.any():
+            freqs = chan_freq[spw][ok]
+            fmax[spw] = float(freqs.max())
+            fmin_all.append(float(freqs.min()))
+    best = uv_max_from_maxima(max_uv, fmax)
+    best["fmin_hz"] = float(min(fmin_all))
+    best["fmax_hz"] = float(max(fmax.values()))
+    return best
 
 
 def get_antenna_positions(vis: str) -> Dict[str, np.ndarray]:
@@ -531,68 +798,115 @@ def pick_cell_imsize(
     max_baseline_percentile: float = 90.0,
     pb_level: float = 0.2,
     intent: str = "OBSERVE_TARGET#ON_SOURCE",
-    diameter_m: float = ALMA_DISH_DIAMETER_M,
+    diameter_m: Optional[float] = None,
     obscuration_m: float = ALMA_DISH_OBSCURATION_M,
     taper_db: float = ALMA_DEFAULT_TAPER_DB,
     uvtaper=(),
+    rule: str = "umax",
+    field: Optional[str] = None,
+    samples_per_umax: float = CELL_SAMPLES_PER_UMAX,
 ) -> Dict[str, Any]:
-    """Pick cell size and image size from MS baseline statistics.
+    """Pick cell size and image size from the MS.
 
-    Replaces ``analysisUtils.pickCellSize``. Optionally accounts for
-    ``uvtaper`` by computing the expected post-taper effective beam.
+    Two cell rules are available (``rule``):
 
-    Algorithm
-        1. Compute the maximum-percentile baseline length.
-        2. Compute the (untapered) synthesized beam FWHM as
-           ``wavelength / baseline``.
-        3. If ``uvtaper`` is non-empty, compute its image-domain Gaussian
-           FWHM and take the effective beam as the quadrature sum
-           ``effective_beam = sqrt(untapered_beam**2 + taper_image_fwhm**2)``.
-           This is an empirical approximation; the actual post-taper beam
-           depends on the visibility distribution and is accurate to roughly
-           10-20 percent for moderate tapers.
-        4. cellsize = effective_beam / npix_per_beam, rounded to 2 sig figs.
-        5. Compute ALMA primary beam FWHM using the Baars taper formula
-           (primary beam does NOT depend on uvtaper).
-        6. Compute Gaussian offset radius at which the PB drops to pb_level.
-        7. imsize_raw = ceil(2 * offset / cellsize).
-        8. Round imsize up to the smallest 5-smooth integer at least
-           imsize_raw (5-smooth means only prime factors 2, 3, 5;
-           FFT-friendly).
+    ``"umax"`` (default)
+        ``cell = 1 / (samples_per_umax * u_max)`` with ``u_max`` (wavelengths)
+        from the longest unflagged baseline at the highest frequency
+        (:func:`get_uv_max`), truncated to 4 significant figures so that it
+        never exceeds the rule. The image covers the primary beam down to
+        ``pb_level`` at the lowest unflagged frequency.
+    ``"percentile"`` (legacy, the v0.2 rule)
+        Replaces ``analysisUtils.pickCellSize``: the synthesized beam is
+        ``wavelength / B`` with ``B`` the ``max_baseline_percentile``-th
+        percentile baseline at the median frequency; with ``uvtaper`` the
+        effective beam is ``sqrt(beam**2 + taper_fwhm**2)`` (an approximation
+        accurate to roughly 10-20 percent for moderate tapers);
+        ``cell = effective_beam / npix_per_beam`` rounded to 2 significant
+        figures. The image covers the primary beam down to ``pb_level`` at
+        the median frequency. Validated against ``analysisUtils`` (no
+        uvtaper): at 232.994 GHz with 90-percentile baseline = 3293.48 m,
+        cellsize = 0.0081 arcsec and imsize = [4800, 4800].
 
-    Validated against ``analysisUtils`` (with no uvtaper): at 232.994 GHz
-    with 90-percentile baseline = 3293.48 m, returns cellsize=0.0081 arcsec
-    and imsize=[4800, 4800].
+    In both rules the primary beam uses ``diameter_m``; when it is ``None``
+    the smallest dish in ``ANTENNA/DISH_DIAMETER`` is used (largest primary
+    beam), with 12 m only as a fallback. The image size is rounded up to the
+    smallest 5-smooth integer (FFT-friendly). The predicted (tapered) beam
+    from the percentile baseline is returned by both rules for the
+    actual-vs-predicted beam check of the dirty image.
 
     Returns
     -------
     dict
         Keys include ``cell_arcsec``, ``cell`` (tclean-ready string),
-        ``imsize_xy``, ``beam_fwhm_arcsec`` (untapered),
+        ``imsize_xy``, ``rule``, ``beam_fwhm_arcsec`` (untapered),
         ``taper_image_fwhm_arcsec`` (0.0 if no uvtaper),
         ``predicted_effective_beam_arcsec``, ``primary_beam_arcsec``,
-        ``fov_arcsec``, ``baseline_m``, ``freq_hz``, and ``justification``.
+        ``pb_freq_hz``, ``dish_diameter_m``, ``dish``, ``fov_arcsec``,
+        ``baseline_m``, ``freq_hz``, ``uv_max`` (None for the percentile
+        rule), and ``justification``.
     """
     _require_casa()
+    if rule not in CELL_RULES:
+        raise ValueError(f"rule must be one of {CELL_RULES}; got {rule!r}")
 
     freq_hz = get_median_frequency(vis, intent=intent)
     wavelength_m = SPEED_OF_LIGHT_M_S / freq_hz
     baseline_m = get_baseline_at_percentile(vis, percentile=max_baseline_percentile)
 
-    # 1-2. Untapered synthesized beam from wavelength/baseline.
+    # Predicted (untapered and tapered) synthesized beam from the percentile
+    # baseline. It sets the legacy cell and is kept for the beam check.
     beam_fwhm_arcsec = wavelength_m / baseline_m * ARCSEC_PER_RAD
-
-    # 3. Effective beam after applying uvtaper (if any).
     taper_image_fwhm = _parse_uvtaper_to_image_fwhm(uvtaper, wavelength_m)
-    effective_beam_arcsec = math.sqrt(
-        beam_fwhm_arcsec ** 2 + taper_image_fwhm ** 2
-    )
+    effective_beam_arcsec = math.sqrt(beam_fwhm_arcsec ** 2 + taper_image_fwhm ** 2)
 
-    # 4. Cell size from effective beam.
-    cell_arcsec_raw = effective_beam_arcsec / npix_per_beam
-    cell_arcsec = _round_to_sig_figs(cell_arcsec_raw, n_sig_figs=2)
+    # Dish diameter: smallest dish in ANTENNA (largest primary beam).
+    if diameter_m is None:
+        dish = get_dish_diameter_m(vis)
+    else:
+        dish = {"diameter_m": float(diameter_m), "source": "argument",
+                "n_antennas": None, "unique_diameters_m": [float(diameter_m)],
+                "reason": f"diameter_m={diameter_m:g} given by the caller"}
+    dish_m = dish["diameter_m"]
 
-    # 5-8. imsize from ALMA primary beam at pb_level.
+    uvmax: Optional[Dict[str, Any]] = None
+    if rule == "umax":
+        uvmax = get_uv_max(vis, field=field)
+        cell_arcsec_raw = cell_from_umax(uvmax["u_max_lambda"], samples=samples_per_umax)
+        cell_arcsec = _floor_to_sig_figs(cell_arcsec_raw, n_sig_figs=4)
+        pb_freq_hz = uvmax["fmin_hz"]
+        cell_reason = (
+            f"cell = 1/({samples_per_umax:g} u_max) = {cell_arcsec_raw:.6g} arcsec "
+            f"(truncated to {cell_arcsec:.4g}); u_max = {uvmax['u_max_lambda']:.6g} lambda "
+            f"from the longest unflagged baseline ({uvmax['baseline_m']:.1f} m) at the "
+            f"highest unflagged frequency ({uvmax['freq_hz'] / 1e9:.4f} GHz, spw "
+            f"{uvmax['spw']})"
+        )
+        if taper_image_fwhm > 0.0:
+            cell_reason += ("; uvtaper widens the beam but the cell still samples the "
+                            "untapered u_max (use rule='percentile' or an explicit cell "
+                            "for heavily tapered images)")
+    else:
+        cell_arcsec_raw = effective_beam_arcsec / npix_per_beam
+        cell_arcsec = _round_to_sig_figs(cell_arcsec_raw, n_sig_figs=2)
+        pb_freq_hz = freq_hz
+        if taper_image_fwhm > 0.0:
+            cell_reason = (
+                f"legacy percentile rule: effective_beam = sqrt(beam^2 + taper^2) = "
+                f"sqrt({beam_fwhm_arcsec:.4f}^2 + {taper_image_fwhm:.4f}^2) "
+                f"= {effective_beam_arcsec:.4f} arcsec; "
+                f"cellsize = effective_beam / {npix_per_beam}; "
+                f"verify against actual dirty-image beam (approximation accurate "
+                f"to ~10-20% for moderate tapers)"
+            )
+        else:
+            cell_reason = (
+                f"legacy percentile rule: cellsize = beam/{npix_per_beam} from the "
+                f"{max_baseline_percentile:.0f}-percentile baseline "
+                f"({baseline_m:.1f} m); no uvtaper applied"
+            )
+
+    # imsize from the primary beam at pb_level.
     # Note: analysisUtils.pickCellSize has two code paths -- the 'asdm path'
     # which does int(ceil(2*offset)/cell) and the 'vis path' which goes via
     # plotmosaic and effectively does ceil(2*offset/cell). For single-field
@@ -600,46 +914,39 @@ def pick_cell_imsize(
     # [0.0081, [4800,4800]] was produced by it. So we replicate the vis-path
     # behaviour (no inner ceil) here.
     pb_fwhm_arcsec = _primary_beam_fwhm_arcsec(
-        freq_hz, diameter_m=diameter_m, obscuration_m=obscuration_m, taper_db=taper_db,
+        pb_freq_hz, diameter_m=dish_m, obscuration_m=obscuration_m, taper_db=taper_db,
     )
     offset_arcsec = _gaussian_offset_for_pb_level(pb_fwhm_arcsec, pb_level)
     raw_size = int(math.ceil(2 * offset_arcsec / cell_arcsec))
     optimum_size = _smallest_5_smooth_at_least(raw_size)
     imsize_xy = [optimum_size, optimum_size]
 
-    has_taper = taper_image_fwhm > 0.0
-    if has_taper:
-        cell_reason = (
-            f"effective_beam = sqrt(beam^2 + taper^2) = "
-            f"sqrt({beam_fwhm_arcsec:.4f}^2 + {taper_image_fwhm:.4f}^2) "
-            f"= {effective_beam_arcsec:.4f} arcsec; "
-            f"cellsize = effective_beam / {npix_per_beam}; "
-            f"verify against actual dirty-image beam (approximation accurate "
-            f"to ~10-20% for moderate tapers)"
-        )
-    else:
-        cell_reason = (
-            f"cellsize = beam/{npix_per_beam} from the "
-            f"{max_baseline_percentile:.0f}-percentile baseline "
-            f"({baseline_m:.1f} m); no uvtaper applied"
-        )
-
     return {
         "cell_arcsec": cell_arcsec,
         "cell": f"{cell_arcsec}arcsec",
         "imsize_xy": imsize_xy,
+        "rule": rule,
         "beam_fwhm_arcsec": beam_fwhm_arcsec,
         "taper_image_fwhm_arcsec": taper_image_fwhm,
         "predicted_effective_beam_arcsec": effective_beam_arcsec,
         "primary_beam_arcsec": pb_fwhm_arcsec,
+        "pb_freq_hz": pb_freq_hz,
+        "dish_diameter_m": dish_m,
+        "dish": dish,
         "fov_arcsec": optimum_size * cell_arcsec,
         "baseline_m": baseline_m,
         "freq_hz": freq_hz,
+        "uv_max": uvmax,
         "justification": {
-            "method": "ajisai_ms_utils.pick_cell_imsize",
+            "method": "ajisai.ms_utils.pick_cell_imsize",
+            "rule": rule,
+            "samples_per_umax": samples_per_umax if rule == "umax" else None,
+            "uv_max": uvmax,
             "max_baseline_percentile": max_baseline_percentile,
-            "npix_per_beam": npix_per_beam,
+            "npix_per_beam": npix_per_beam if rule == "percentile" else None,
             "pb_level": pb_level,
+            "pb_freq_hz": pb_freq_hz,
+            "dish": dish,
             "untapered_beam_fwhm_arcsec": beam_fwhm_arcsec,
             "uvtaper_input": list(uvtaper) if uvtaper else [],
             "taper_image_fwhm_arcsec": taper_image_fwhm,
@@ -806,6 +1113,7 @@ def test_pick_cell_imsize(vis: str, verbose: bool = True) -> Dict[str, Any]:
         vis,
         npix_per_beam=10,
         max_baseline_percentile=90,
+        rule="percentile",   # the analysisUtils-equivalent legacy rule
     )
     if verbose:
         print("=" * 60)

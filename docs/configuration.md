@@ -130,6 +130,20 @@ the lines you need.
     in the justification log but do NOT alter pipeline flow. This
     preserves AJISAI's deterministic-fixed-schedule identity.
 
+### Data hygiene
+
+`relabel_j2000_to_icrs: bool = True`
+:   AJISAI never writes to the input MS. When this is `True` and the input
+    carries J2000 frame codes, a copy (`intermediate/input_icrs.ms`) is
+    relabelled J2000 -> ICRS (the frame code only; coordinates are not
+    converted) and used as the working MS, as v0.2 did in place. `False`
+    keeps the input frame (the input is then read directly).
+
+`caller: str = "user"`
+:   Who drives the run: `"user"` (standalone) or `"asebi"` (the ASEBI
+    pipeline). With `"asebi"`, `mask_mode="interactive"` and any
+    `tclean(interactive=True)` are refused (viewer-free operation).
+
 ### Misc
 
 `verbose: bool = True`
@@ -158,12 +172,45 @@ the lines you need.
 `cyclefactor: float = 1.5`
 :   tclean cycle factor.
 
+`threshold_mode: str = "pure_noise"`
+:   CLEAN depth of the self-calibration images (initial CLEAN and every
+    iteration). `"pure_noise"` (default): an absolute threshold
+    `threshold_nsigma × sigma_th`, the same in every iteration, where
+    sigma_th is the off-source RMS of the dirty image of `(XX-YY)/2`
+    (Stokes Q; `(RR-LL)/2` for circular feeds), measured once. That image
+    has the noise of the Stokes I image but no source signal or sidelobes.
+    `"image_rms"` (legacy, v0.2): `threshold_factor ×` the off-source RMS of
+    the previous image.
+
+`threshold_nsigma: float = 3.0`
+:   Multiple of sigma_th for `threshold_mode="pure_noise"`. CLEANing the
+    self-calibration models deeper puts noise into the model, which the next
+    gain solve then fits.
+
 `threshold_factor: float = 1.0`
-:   Threshold for CLEAN is `threshold_factor * RMS_offsource`. Set higher
-    for cleaner stops, lower for deeper cleaning.
+:   Multiple of the previous image's RMS for `threshold_mode="image_rms"`.
+
+`final_depth: Tuple[float, ...] = (3.0, 2.0, 1.0, 0.5)`
+:   Depth schedule of the final image, in units of sigma_th. The final image
+    is made once, from the best iteration's data (`final_selfcal.ms`), and
+    its CLEAN continues step by step (no new PSF) until the flux in the
+    aperture has converged: after each step, `F_corr = F_model + F_unc` with
+    `F_unc = sum(residual)/Omega_R`; the CLEAN stops when
+    `|F_unc| <= max(3 sigma_F, 0.01 F_corr)` or when `F_corr` changed by no
+    more than that width since the previous step. A warning is issued if
+    the last step is reached without convergence, and if the restored image
+    over-counts the residual flux (`F_unc (Omega_R/Omega_clean - 1)`) by more
+    than the width. `()` disables the final image (`final.*` is then the best
+    iteration's image, as in v0.2).
+
+`final_aperture_arcsec: Optional[float] = None`
+:   Radius (arcsec, about the phase center) of the aperture for the final
+    image's flux test. `None`: the CLEAN mask region, or a circle of
+    `rms_exclude_beam_factor` beams when there is no mask.
 
 `deconvolver: str = "multiscale"`
-:   tclean deconvolver. Multiscale recommended for extended sources.
+:   tclean deconvolver. Multiscale recommended for extended sources. With
+    `nterms > 1`, `"mtmfs"` is used (with the multiscale scales).
 
 `gridder: str = "standard"`
 :   tclean gridder.
@@ -182,11 +229,49 @@ the lines you need.
     actual-vs-predicted beam check.
 
 `nterms: int = 1`
-:   tclean nterms (number of Taylor terms).
+:   tclean nterms (number of Taylor terms). With `nterms > 1` every tclean
+    uses `deconvolver="mtmfs"`, the products are named `.image.tt0`,
+    `.image.tt1`, ..., statistics are taken on `.image.tt0`, and the model is
+    predicted from all Taylor terms (`ft` with `nterms` and the model's
+    reference frequency).
+
+`reffreq: Optional[str] = None`
+:   Reference frequency of the Taylor expansion, e.g. `"227.0GHz"`, passed
+    to every tclean. `None` uses CASA's default (the middle of the
+    frequency range); the value used is recorded with each solve.
+
+### Image geometry
+
+`cell: Optional[str] = None`
+:   Cell size for every tclean, e.g. `"0.0062arcsec"` or `"6.2mas"`.
+    `None`: derived with `cell_rule`.
+
+`imsize: Optional[Tuple[int, ...]] = None`
+:   Image size, `N` or `(Nx, Ny)` pixels. `None`: the primary beam down to
+    20 % attenuation, for the smallest dish in `ANTENNA/DISH_DIAMETER` (12 m
+    only as a fallback), rounded up to a 5-smooth size.
+
+`cell_rule: str = "umax"`
+:   Rule for the derived cell. `"umax"` (default): `cell = 1/(5 u_max)`,
+    with `u_max` (wavelengths) from the longest unflagged baseline at the
+    highest frequency, truncated to 4 significant figures; the image then
+    covers the primary beam at the lowest frequency. `"percentile"` (legacy,
+    v0.2): the synthesized beam from the 90th-percentile baseline at the
+    median frequency (tapered by `uvtaper`), divided by `cellpix` and rounded
+    to 2 significant figures. With a strong `uvtaper` the `"umax"` cell
+    still samples the untapered `u_max`; use `"percentile"` or an explicit
+    `cell` for heavily tapered images.
 
 `cellpix: int = 10`
-:   Number of pixels per synthesized beam used to set the cell size.
-    Larger values give finer pixel sampling but larger images.
+:   Number of pixels per synthesized beam for `cell_rule="percentile"`.
+
+`scales: Optional[Tuple[int, ...]] = None`
+:   Multiscale scales in pixels for every multiscale/mtmfs tclean. `None`:
+    `0, b, 3b, 9b, ...` with `b` the dirty-image beam FWHM in pixels, up to
+    the largest scale whose support (radius = scale) fits inside the user
+    mask region (`mask_mode="user"`), i.e. half the region size for a round
+    region; without a user mask, `0, b, 3b`. Larger scales would be ignored
+    by CASA ("too large to fit within the mask").
 
 ### Masking
 
@@ -205,18 +290,22 @@ the lines you need.
         **Requires CASA <= 6.6.** The casaviewer GUI was removed in CASA
         6.7+, so interactive tclean is non-functional there. AJISAI will
         warn (but not fail) if you request interactive mode on CASA 6.7+.
+        Refused (`ValueError`) when `AJISAIConfig.caller="asebi"`.
 
     `"user"`
-    :   Use a pre-made mask file supplied via `user_mask`. This is the
-        portable option for CASA 6.7+ users: prepare a mask externally
-        (e.g. with CARTA, an older CASA installation, or any FITS-aware
-        tool) and point AJISAI at it.
+    :   Use a pre-made mask supplied via `user_mask`: a CRTF region file
+        (text whose first line starts with `#CRTF`) or a CASA mask image. It
+        is passed to every tclean (initial CLEAN, each iteration, final
+        image). This is the portable, viewer-free option for CASA 6.7+
+        users: prepare a region with CARTA or a text editor and point
+        AJISAI at it.
 
     `"none"`
     :   No mask at all. Rarely useful.
 
 `user_mask: Optional[str] = None`
-:   Path to a pre-made mask file. Required when `mask_mode="user"`.
+:   Path to a CRTF region file or a CASA mask image. Required when
+    `mask_mode="user"`.
 
 ### auto-multithresh tunables
 
@@ -233,10 +322,12 @@ the lines you need.
 `minblperant: int = 4`
 :   Minimum number of baselines required per antenna for a gain solution.
 
-`minsnr: float = 1.5`
+`minsnr: float = 3.0`
 :   Minimum SNR for a gain solution to be accepted. Solutions below this
     are discarded; the corresponding visibilities are preserved unflagged
-    because AJISAI uses `applymode="calonly"`.
+    because AJISAI uses `applymode="calonly"`. (v0.2: 1.5.) The fraction of
+    flagged solutions per observation and spw is recorded for every
+    iteration.
 
 `gaintype: str = "T"`
 :   gaincal gain type. `"T"` averages parallel-hand polarizations for
@@ -249,16 +340,25 @@ the lines you need.
 `gaincal_interp: str = "linear,linear"`
 :   Interpolation in time and frequency for the gain table.
 
-`applycal_interp: str = "linearPD"`
-:   Interpolation for applycal. `"linearPD"` preserves phase unwrapping.
+`applycal_interp: str = "linearPDperobs"`
+:   Interpolation for applycal. `"linearPD"` preserves phase unwrapping;
+    `perobs` keeps the time interpolation from crossing an observation
+    (execution block) boundary of a concatenated MS. CASA ignores `perobs`
+    (with a log warning) when the table has one observation.
 
 `applymode: str = "calonly"`
 :   applycal mode. `"calonly"` ensures that flagged solutions do NOT
     propagate to flagging the visibilities themselves — important for
     preserving data on low-SNR antennas.
 
-`calwt: bool = True`
-:   Calibrate the weights when applying.
+`calwt: bool = False`
+:   Calibrate the weights when applying. `False` (v0.3 default; v0.2:
+    `True`): the self-calibration tables never change WEIGHT, so an
+    amplitude step cannot rescale the weights by |g|².
+
+`spwmap: Tuple[int, ...] = ()`
+:   spwmap passed to applycal for every gain table, e.g. `(0, 0, 0, 0)` when
+    the schedule's `combine` includes `"spw"`. `()`: identity.
 
 ## `SelfcalSchedule`
 

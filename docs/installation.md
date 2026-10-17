@@ -32,7 +32,18 @@ from the `main` branch of the GitHub repository:
 pip install "git+https://github.com/Y-Masayuki/AJISAI.git@main"
 ```
 
-Run the same command again to update to the latest version.
+To update an existing installation to the latest commit of `main`, force
+the reinstall. The version string does not change between commits on
+`main`, so a plain `pip install` reports "Requirement already satisfied"
+and keeps the old code:
+
+```bash
+pip install --upgrade --force-reinstall --no-deps "git+https://github.com/Y-Masayuki/AJISAI.git@main"
+pip freeze | grep -i ajisai     # ajisai @ git+https://...@<commit hash>
+```
+
+The https URL needs no SSH key, which makes it the convenient form on shared
+compute servers. Use the `pip` of the Python that runs CASA.
 
 If you are using a monolithic CASA distribution, you may need to point at
 its internal `pip`:
@@ -109,5 +120,7 @@ real ALMA data. Until then, please use the GitHub install method above.
 **Warning: `actual dirty-image beam differs from predicted ... by N%`**
 :   When `uvtaper` is set, AJISAI's predicted effective beam is based on an
     empirical approximation. Mismatches up to 20-30% are normal for strong
-    tapers. For tighter pixel sampling, override `ImagingConfig.cellpix` or
-    set `cell` manually. See [Configuration reference](configuration.md).
+    tapers. The default cell rule (`cell_rule="umax"`, 1/(5 u_max)) does not
+    depend on the prediction; with the legacy `cell_rule="percentile"`,
+    override `ImagingConfig.cellpix` or set `ImagingConfig.cell` for tighter
+    pixel sampling. See [Configuration reference](configuration.md).

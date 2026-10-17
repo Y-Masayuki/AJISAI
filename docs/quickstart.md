@@ -17,13 +17,17 @@ aj  = AJISAI(cfg).run()
 That's it. AJISAI takes care of everything else:
 
 - Selects a reference antenna using flag statistics + geometric center.
-- Computes the appropriate cell size and image size from the baseline
-  distribution.
-- Runs an initial CLEAN to set the noise threshold.
+- Computes the cell size from the longest unflagged baseline (1/(5 u_max))
+  and the image size from the primary beam of the smallest dish.
+- Measures the thermal noise on a signal-free (XX-YY)/2 dirty image and
+  CLEANs every self-cal image to the same absolute 3-sigma threshold.
 - Iterates three rounds of phase self-cal then one round of amplitude
-  self-cal (the deterministic schedule from the AJISAI design paper).
-- Picks the best image by dynamic range and copies it to
-  `<workdir>/final.image` and `<workdir>/final.fits`.
+  self-cal (the deterministic schedule from the AJISAI design paper), each
+  on a copy of the previous round's data: your MS is never modified.
+- Picks the best round by dynamic range, writes its data to
+  `<workdir>/final_selfcal.ms` (DATA only), makes a deeper final image from
+  it, and copies that image to `<workdir>/final.image` and
+  `<workdir>/final.fits`.
 
 ## What you get back
 
@@ -36,6 +40,9 @@ print(aj.best_image)            # path to the best CLEAN image
 print(aj.best_fits)             # path to the best FITS
 print(aj.best_metric_value)     # achieved dynamic range
 print(aj.metrics)               # list of per-iteration dicts
+print(aj.stages)                # per-stage MS, image, model and solve information
+print(aj.final_image)           # the final (deeper) image
+print(aj.final_ms)              # final_selfcal.ms (self-calibrated DATA only)
 print(aj.justification)         # full structured rationale
 ```
 
@@ -46,7 +53,8 @@ The same information is also written to disk:
 - `<workdir>/selfcal_images.png` — CLEAN image of every iteration, side by side
 - `<workdir>/justification.json` — every parameter choice with its reason
 - `<workdir>/ajisai_refant_selection.png` — refant choice visualization
-- `<workdir>/final.{image,fits}` — the best image
+- `<workdir>/final.{image,fits}` — the final image (Taylor term 0 when `nterms > 1`)
+- `<workdir>/final_selfcal.ms` — the self-calibrated visibilities of the best round
 
 See [Output artifacts](outputs.md) for full details on each file.
 
@@ -64,11 +72,11 @@ cfg = AJISAIConfig(
     field    = "0",                  # default: auto-detect single field
     imaging  = ImagingConfig(
         robust  = 0.5,
-        cellpix = 10,                # pixels per beam
+        nterms  = 2,                 # mtmfs (Taylor terms); default 1
         uvtaper = ("1arcsec",),      # optional taper
     ),
     gaincal  = GainCalConfig(
-        minsnr      = 1.5,
+        minsnr      = 3.0,
         minblperant = 4,
     ),
 )
